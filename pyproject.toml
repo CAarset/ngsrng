@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ngsrng"
+version = "0.0.1"
+description = "Function-space random variables in NGSolve finite element spaces"
+requires-python = ">=3.11"
+dependencies = ["ngsolve>=6.2", "numpy", "scipy", "torch", "threadpoolctl"]
+
+[project.optional-dependencies]
+bench = ["pandas", "matplotlib", "tabulate"]
+test = ["pytest"]
+gpu = ["nvmath-python[cu13]"]   # cuDSS sparse direct solver on CUDA
+mkl = ["mkl"]                   # enables NGSolve's PARDISO direct solver
+examples = ["matplotlib", "jupyter", "anywidget"]  # examples/demo.ipynb (and the local ngsplot package)
+
+[tool.setuptools.packages.find]
+include = ["ngsrng*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+extend-exclude = ["results"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E731", "E741"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ngsrng"]

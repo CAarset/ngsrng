@@ -1,0 +1,382 @@
+"""Conditioned Gaussians: linear observations, known low-rank downdates, and pathwise conditioning.
+
+Linear Bayesian inverse problem: y = G f + e, e ~ N(0, Gamma), prior f ~ N(m0, C0), with G any finite set of bounded
+linear functionals (``ngsrng.observations``). The posterior covariance is C_post = (G* Gamma^-1 G + C0^-1)^-1. For
+finite-dimensional data the posterior is equivalent to the prior (Feldman-Hajek), so it is never finite-rank: the
+low-rank object is the *update*, C_post = C0 - B K^-1 B* (Woodbury: B = C0 G*, K = Gamma + G C0 G*).
+
+1. ``LinearObservations``: let Sigma0 = L L^T be the factorisation the prior sampler implements (``Gaussian.apply``
+   = L, any factor, rectangular allowed, e.g. L = K^-1 H with local mass factors H). Woodbury gives
+   Sigma_post = L (I + F^T F)^-1 L^T with F = Gamma^-1/2 G L. With the thin QR F^T = Q R (Q: nrand x l orthonormal,
+   l <= m),
+
+       (I + F^T F)^-1/2 = I + Q ((I + R R^T)^-1/2 - I) Q^T,
+
+   so a posterior sample is the prior pipeline applied to modified white noise (``form="noise"``), or equivalently
+   the prior sample plus an FE-space low-rank update (``form="fe"``, the default and the cheaper one). Both are exact.
+   Setup costs m applications of L^T (plus ``rank`` applications of L for the FE-space form and the mean).
+
+2. ``downdate``: a known C_post = C0 - B K^-1 B*, given directly. With Z = L^T Sigma0^-1 B,
+   Sigma_post = L (I - Z K^-1 Z^T) L^T. The middle matrix is PSD exactly when C_post is (Schur complement), and its
+   square root is again I + Q A Q^T.
+
+3. ``MatheronPosterior``: pathwise conditioning, an independent exact sampler for (1), for cross-checks.
+
+Finite-rank Gaussians N(m, B K^-1 B*) (truncated Karhunen-Loeve, reduced bases) live in ``ngsrng.lowrank``.
+"""
+
+import ngsolve as ngs
+import numpy as np
+import scipy.linalg as sla
+import scipy.sparse as sp
+import torch
+
+from .backend import numpy_blas_threads
+from .observations import CHUNK, observation_operator, whiten, whitener
+from .randomized import randomized_qr
+from .space import coefficient_columns, coefficient_vector
+
+# ------------------------------------------------------------------ low-rank update maps
+
+
+class NoiseSpaceMap:
+    """Symmetric map eta -> eta + Q A Q^T eta on the prior's white-noise space."""
+
+    def __init__(self, q: np.ndarray, a: np.ndarray):
+        self.q = np.ascontiguousarray(q, dtype=np.float64)
+        self.a = np.ascontiguousarray(a, dtype=np.float64)
+        self._torch = {}
+
+    @property
+    def rank(self) -> int:
+        return self.q.shape[1]
+
+    def apply_numpy(self, e: np.ndarray):
+        e += self.q @ (self.a @ (self.q.T @ e))
+
+    def apply_ngs(self, eta):
+        """In place on an NGSolve BaseVector, with NGSolve's multithreaded kernels.
+
+        NumPy's GEMV would be equally fast, but its OpenBLAS threads slow down the NGSolve solve that follows.
+        """
+        if getattr(self, "_mv", None) is None:
+            self._mv = ngs.MultiVector(eta, self.rank)
+            for k in range(self.rank):
+                self._mv[k].FV().NumPy()[:] = self.q[:, k]
+        coeff = self.a @ np.asarray(self._mv.InnerProduct(eta))
+        eta.data += self._mv * ngs.Vector(list(coeff))
+
+    def apply_torch(self, x: torch.Tensor) -> torch.Tensor:
+        key = (x.device, x.dtype)
+        if key not in self._torch:
+            self._torch[key] = (torch.from_numpy(self.q).to(*key), torch.from_numpy(self.a).to(*key))
+        q, a = self._torch[key]
+        return x + q @ (a @ (q.T @ x))
+
+
+class FESpaceUpdate:
+    """c -> c + P S (G c) applied to the output of the prior pipeline (free-dof coefficient vectors).
+
+    P: (nfree x r) dense, S: (r x m) small dense, G: (m x nfree) sparse observation rows. For the noise-space update
+    eta -> eta + Q A Q^T eta, using Q^T eta = s^-1 V^T F eta and F eta = Gamma^-1/2 G (L eta), the same posterior is
+    c -> c + (L Q) A s^-1 V^T Gamma^-1/2 G c. A sample then needs a sparse G product and one pass over L Q (nfree x r)
+    instead of two passes over Q (nrand x r). A s^-1 stays bounded as s -> 0, so this is stable.
+    """
+
+    def __init__(self, p: np.ndarray, smat: np.ndarray, g: sp.csr_matrix, free: np.ndarray, ndof: int):
+        self.p = np.ascontiguousarray(p, dtype=np.float64)
+        self.s = np.ascontiguousarray(smat, dtype=np.float64)
+        self.g = g.tocsr()
+        self.free, self.ndof = free, ndof
+        self._torch = {}
+        self._ngs = None
+
+    @property
+    def rank(self) -> int:
+        return self.p.shape[1]
+
+    def _tensors(self, device, dtype):
+        key = (device, dtype)
+        if key not in self._torch:
+            from .backend import sparse_to_torch
+
+            self._torch[key] = (
+                torch.from_numpy(self.p).to(device, dtype),
+                torch.from_numpy(self.s).to(device, dtype),
+                sparse_to_torch(self.g, device, dtype),
+                sparse_to_torch(self.g.T.tocsr(), device, dtype),
+            )
+        return self._torch[key]
+
+    def apply_torch(self, c: torch.Tensor) -> torch.Tensor:
+        p, smat, g, _ = self._tensors(c.device, c.dtype)
+        return c + p @ (smat @ (g @ c))
+
+    def apply_t_torch(self, y: torch.Tensor) -> torch.Tensor:
+        p, smat, _, gt = self._tensors(y.device, y.dtype)
+        return y + gt @ (smat.T @ (p.T @ y))
+
+    def apply_ngs(self, vec):
+        """In place on a full-dof NGSolve vector (zeros at Dirichlet dofs stay zero)."""
+        if self._ngs is None:
+            from .backend import ngs_sparse
+
+            gfull = ngs_sparse(self.g, cols=self.free, ncols=self.ndof)
+            pmv = ngs.MultiVector(vec, self.rank)
+            for k in range(self.rank):
+                col = pmv[k].FV().NumPy()
+                col[:] = 0.0
+                col[self.free] = self.p[:, k]
+            self._ngs = (gfull, pmv, gfull.CreateColVector())
+        gfull, pmv, y = self._ngs
+        y.data = gfull * vec
+        coeff = self.s @ y.FV().NumPy()
+        vec.data += pmv * ngs.Vector(list(coeff))
+
+
+# ------------------------------------------------------------------ (1) observations of a prior
+
+
+class LinearObservations:
+    """Linear observations y = G f + e, e ~ N(0, Gamma), of a Gaussian ``prior``.
+
+    Parameters
+    ----------
+    prior : ngsrng.Gaussian (any precision type, engine and device)
+    operator, functionals, averages, points, adjoint, m : the observation operator G, any finite set of bounded linear
+        functionals (see :func:`observation_operator`)
+    noise : variance (scalar), variances (m,), or covariance matrix (m, m)
+    rank : None for the exact construction (m applications of L^T; memory nrand x m). An integer k computes a
+        randomised rank-k QR of the prior-preconditioned adjoint F^T = L^T G^T Gamma^-1/2 with k + ``oversampling``
+        columns and ``power_iterations`` subspace iterations (Aarset 2024, Algorithm 2; see :mod:`ngsrng.randomized`):
+        approximate, but only (2q + 2)(k + oversampling) applications of L or L^T. ``low_rank_method="power"`` uses
+        plain power iteration instead (for comparison).
+    factorize : False builds only the observation operator (for :class:`MatheronPosterior`).
+    """
+
+    def __init__(
+        self,
+        prior,
+        operator=None,
+        *,
+        functionals=None,
+        points=None,
+        averages=None,
+        adjoint=None,
+        m=None,
+        noise=1.0,
+        rank=None,
+        oversampling=10,
+        power_iterations=1,
+        seed=0,
+        factorize=True,
+        low_rank_method="subspace",
+    ):
+        self.prior = prior
+        s = prior.space
+        self.G = observation_operator(s.fes, operator, functionals, points, averages, adjoint, m)
+        self.m = self.G.shape[0]
+        self.wkind, self.wdata = whitener(noise, self.m)
+        self.noise = noise
+        self.gf = self.G[:, s.free]  # observation of the free part
+        gh = self.gf.toarray()
+        gh = whiten(self.wkind, self.wdata, gh)  # Gamma^-1/2 G_free (m x nfree)
+        self._gh = gh
+        self._lq = None
+        if not factorize:  # observation operator only (e.g. for MatheronPosterior)
+            return
+        if rank is None:
+            ft = self._lt(gh.T)  # F^T = L^T G^T Gamma^-T/2 (nrand x m)
+            q, r = torch.linalg.qr(ft)
+            self.exact = True
+        else:
+            blas = getattr(prior, "_cpu_blas_threads", 1) if getattr(prior, "engine", "") != "torch" else None
+            with numpy_blas_threads(blas):  # see ngsrng.lowrank.karhunen_loeve
+                q, r = randomized_qr(
+                    lambda x: self._lt(gh.T @ x).cpu().numpy(),  # F^T: whitened observations -> noise
+                    lambda y: gh @ self._l(np.ascontiguousarray(y)),  # F: noise -> whitened observations
+                    self.m, int(rank), power_iterations=power_iterations, oversampling=oversampling, seed=seed,
+                    method=low_rank_method,
+                )
+            q, r = torch.from_numpy(q), torch.from_numpy(r)
+            self.exact = False
+        q = q.detach().cpu().double().numpy()
+        r = r.detach().cpu().double().numpy()
+        # Rotate to the SVD basis of R (F^T = Q R = (Q U) s V^T) and drop exactly degenerate directions: then
+        # q = Q U has orthonormal columns, r = s V^T, and the FE-space form needs s^-1 only where s > 0.
+        u, sv, vt = np.linalg.svd(r, full_matrices=False)
+        keep = sv > (np.finfo(float).eps * max(r.shape) * (sv.max() if sv.size else 0.0))
+        self.q, self.sv, self.vt = q @ u[:, keep], sv[keep], vt[keep]
+        self.r = self.sv[:, None] * self.vt
+
+    def _get_lq(self):
+        """L Q (nfree x rank): needed for the FE-space form and the posterior mean."""
+        if self._lq is None:
+            self._lq = self._l(self.q)
+        return self._lq
+
+    @property
+    def rank(self) -> int:
+        return self.q.shape[1]
+
+    def _lt(self, x: np.ndarray) -> torch.Tensor:
+        cols = [
+            self.prior.apply_t(torch.from_numpy(np.ascontiguousarray(x[:, i : i + CHUNK])))
+            for i in range(0, x.shape[1], CHUNK)
+        ]
+        return torch.cat(cols, dim=1).double()
+
+    def _l(self, eta: np.ndarray) -> np.ndarray:
+        cols = [
+            self.prior.apply(torch.from_numpy(np.ascontiguousarray(eta[:, i : i + CHUNK]))).double().cpu().numpy()
+            for i in range(0, eta.shape[1], CHUNK)
+        ]
+        return np.hstack(cols)
+
+    def posterior(self, data=None, seed=None, form="fe"):
+        """The posterior as a ``Gaussian`` (same pipeline and engine as the prior, plus the low-rank update).
+
+        ``data`` sets the posterior mean; without data the mean is the prior mean (enough for covariance studies).
+        ``form``: "fe" applies the update to the prior sample in FE space (default: a sparse G product plus one pass
+        over L Q per sample; setup adds ``rank`` applications of L). "noise" modifies the white noise before the
+        pipeline (two passes over Q per sample; no extra setup). Both are exact and give identical samples.
+        """
+        return self._posterior_from(None, data, seed, form)
+
+    def _posterior_from(self, scaling, data, seed, form):
+        """Posterior with the noise precision of observation i multiplied by ``scaling[i]`` >= 0 (None: unchanged).
+
+        Extension point: the factorisation does not depend on the scaling, so re-scaled posteriors cost only an
+        l x l eigendecomposition. The generic API never rescales.
+        """
+        sc = np.ones(self.m) if scaling is None else np.asarray(scaling, dtype=float)
+        if sc.shape != (self.m,) or (sc < 0).any():
+            raise ValueError("scaling must be a non-negative vector with one entry per observation")
+        middle = np.eye(self.rank) + (self.r * sc) @ self.r.T  # I + R S R^T
+        lam, v = np.linalg.eigh(middle)
+        a = (v * (lam**-0.5 - 1.0)) @ v.T
+        mean = self.prior.mean
+        if data is not None:
+            resid = np.asarray(data, dtype=float) - self.G @ mean
+            coeff = np.linalg.solve(middle, self.r @ (sc * whiten(self.wkind, self.wdata, resid)))
+            mean[self.prior.space.free] += self._get_lq() @ coeff
+        kind = "exact" if self.exact else "randomised"
+        if form == "noise":
+            label = f"{self.m} linear observations ({kind}, noise-space update, rank {self.rank})"
+            return self.prior._derive(label, mean, eta_map=NoiseSpaceMap(self.q, a), seed=seed)
+        if form != "fe":
+            raise ValueError(f"unknown form {form!r}")
+        whitening = np.diag(self.wdata) if self.wkind == "diag" else self.wdata
+        smat = (a / self.sv[None, :]) @ self.vt @ whitening
+        update = FESpaceUpdate(self._get_lq(), smat, self.gf, self.prior.space.free, self.prior.space.ndof)
+        label = f"{self.m} linear observations ({kind}, FE-space update, rank {self.rank})"
+        return self.prior._derive(label, mean, post_map=update, seed=seed)
+
+
+# ------------------------------------------------------------------ (2) known downdate
+
+
+def downdate(prior, b, k, mean=None, seed=None, tol=1e-8):
+    """N(mean, C0 - B K^-1 B*) as a Gaussian sharing ``prior``'s pipeline.
+
+    ``b``: (ndof x r) coefficient columns (or a list of GridFunctions) of the functions spanning the update; B* is
+    their L2 adjoint, so in coefficient form Sigma_post = Sigma0 - B K^-1 B^T. ``k``: (r x r) SPD. Raises if C_post is
+    not positive semidefinite.
+    """
+    s = prior.space
+    bmat = coefficient_columns(b, s.ndof)
+    if np.abs(np.delete(bmat, s.free, axis=0)).max(initial=0.0) > 1e-12 * max(np.abs(bmat).max(), 1e-300):
+        raise ValueError("B has nonzero Dirichlet entries; the update must leave Dirichlet values fixed")
+    k = np.asarray(k, dtype=float)
+    prec_b = prior.apply_precision(torch.from_numpy(np.ascontiguousarray(bmat[s.free]))).numpy()
+    z = (
+        torch.cat(
+            [
+                prior.apply_t(torch.from_numpy(np.ascontiguousarray(prec_b[:, i : i + CHUNK])))
+                for i in range(0, prec_b.shape[1], CHUNK)
+            ],
+            dim=1,
+        )
+        .double()
+        .cpu()
+        .numpy()
+    )
+    q, r = np.linalg.qr(z)
+    middle = np.eye(q.shape[1]) - r @ np.linalg.solve(k, r.T)
+    lam, v = np.linalg.eigh(0.5 * (middle + middle.T))
+    if lam.min() < -tol * max(1.0, np.abs(lam).max()):
+        raise ValueError(
+            f"C0 - B K^-1 B* is not positive semidefinite (eigenvalue {lam.min():.3e} of the reduced form)"
+        )
+    a = (v * (np.sqrt(np.clip(lam, 0.0, None)) - 1.0)) @ v.T
+    mean_vec = prior.mean if mean is None else coefficient_vector(mean, s)
+    return prior._derive(f"low-rank downdate (rank {bmat.shape[1]})", mean_vec, eta_map=NoiseSpaceMap(q, a), seed=seed)
+
+
+# ------------------------------------------------------------------ (3) pathwise (Matheron) conditioning
+
+
+class MatheronPosterior:
+    """Exact posterior sampler by pathwise conditioning, independent of the noise-space construction:
+
+        f_post = f0 + B K_d^-1 (y + e - G f0),   f0 ~ prior,  e ~ N(0, Gamma),
+        B = Sigma0 G^T,  K_d = Gamma + G Sigma0 G^T.
+
+    Setup: m applications of L^T and of L. Per sample: one prior sample plus O(nfree m).
+    """
+
+    def __init__(self, obs: LinearObservations, data=None, seed=None):
+        prior, s = obs.prior, obs.prior.space
+        g = obs.gf.toarray()
+        gamma = np.diag(1.0 / obs.wdata**2) if obs.wkind == "diag" else np.asarray(obs.noise, dtype=float)
+        lt = obs._lt(g.T)
+        self.bmat = obs._l(lt.cpu().numpy())  # Sigma0 G^T (nfree x m_a)
+        kd = gamma + g @ self.bmat
+        self.kd_chol = sla.cho_factor(kd)
+        self.gamma_half = np.linalg.cholesky(gamma)
+        self.g, self.prior, self.ma = g, prior, obs.m
+        self._prior = prior if getattr(prior, "_prior", None) is None else prior._prior
+        self._mean = prior.mean
+        if data is not None:
+            resid = np.asarray(data, dtype=float) - obs.G @ self._mean
+            self._mean[s.free] += self.bmat @ sla.cho_solve(self.kd_chol, resid)
+        self.rng = np.random.default_rng(seed)
+        self.space, self.device = s, torch.device("cpu")
+        self.plan = {**prior.plan, "conditioning": [f"Matheron, {self.ma} observations"]}
+
+    @property
+    def nrand(self) -> int:
+        return self.prior.nrand + self.ma
+
+    @property
+    def mean(self):
+        return self._mean.copy()
+
+    def apply(self, eta: torch.Tensor) -> torch.Tensor:
+        e = eta.detach().cpu().double()
+        e = e[:, None] if e.ndim == 1 else e
+        f0 = self.prior.apply(e[: self.prior.nrand]).double().cpu().numpy()
+        noise = self.gamma_half @ e[self.prior.nrand :].numpy()
+        corr = self.bmat @ sla.cho_solve(self.kd_chol, noise - self.g @ f0)
+        out = torch.from_numpy(f0 + corr)
+        return out[:, 0] if eta.ndim == 1 else out
+
+    def apply_t(self, y: torch.Tensor) -> torch.Tensor:
+        """Adjoint of ``apply``: y -> [L0^T (y - G^T K_d^-1 B^T y); Gamma^T/2 K_d^-1 B^T y]."""
+        v = y.detach().cpu().double()
+        v = v[:, None] if v.ndim == 1 else v
+        w = sla.cho_solve(self.kd_chol, self.bmat.T @ v.numpy())
+        top = self.prior.apply_t(torch.from_numpy(np.ascontiguousarray(v.numpy() - self.g.T @ w))).double().cpu()
+        out = torch.cat([top, torch.from_numpy(self.gamma_half.T @ w)], dim=0)
+        return out[:, 0] if y.ndim == 1 else out
+
+    def sample(self, n=None):
+        ns = 1 if n is None else int(n)
+        eta = torch.from_numpy(self.rng.standard_normal((self.nrand, ns)))
+        x = np.repeat(self._mean[:, None], ns, axis=1)
+        x[self.space.free] += self.apply(eta).numpy()
+        if n is None:
+            gf = ngs.GridFunction(self.space.fes)
+            gf.vec.FV().NumPy()[:] = x[:, 0]
+            return gf
+        return torch.from_numpy(x)

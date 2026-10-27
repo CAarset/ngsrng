@@ -1,0 +1,354 @@
+"""Benchmark grid: profiles, spaces, sizes, and every (engine, device, dtype, method, solver) to run.
+
+A *group* is one (suite, dim, kind, order, target size) and runs in one worker process, which builds the mesh and
+space once. A *task* is one configuration inside a group and produces one result record.
+"""
+
+from dataclasses import asdict, dataclass, field
+
+PROFILES = {
+    # tiny: validates the harness end to end in a few minutes
+    "smoke": dict(
+        targets=[1e3],
+        dims=[1, 2, 3],
+        orders={"H1": [1, 3], "L2": [0, 2]},
+        powers=[2, 3, 2.6],
+        method_timeout=180,
+        timeout_floor=60,
+        setup_budget=60,
+        sample_budget=5.0,
+        torch_cpu_max_ndof=1e4,
+        continuum_max_ndof=5e3,
+        continuum_orders={"H1": [1, 2], "L2": [0, 1]},
+        posterior_obs=[10, 40],
+        posterior_orders={"H1": [1], "L2": [1]},
+    ),
+    "quick": dict(
+        targets=[1e3, 1e4, 1e5],
+        dims=[1, 2, 3],
+        orders={"H1": [1, 2, 4], "L2": [0, 1, 2]},
+        powers=[2, 3, 2.6],
+        method_timeout=300,
+        timeout_floor=30,
+        setup_budget=120,
+        sample_budget=10.0,
+        torch_cpu_max_ndof=1e5,
+        continuum_max_ndof=5e4,
+        continuum_orders={"H1": [1, 2, 3], "L2": [0, 1, 2]},
+        posterior_obs=[10, 100],
+        posterior_orders={"H1": [1, 2], "L2": [0, 1]},
+    ),
+    "standard": dict(
+        targets=[1e3, 1e4, 1e5, 1e6],
+        dims=[1, 2, 3],
+        orders={"H1": [1, 2, 4, 8], "L2": [0, 1, 2, 4]},
+        powers=[2, 3, 1.6, 2.6],
+        method_timeout=1200,
+        timeout_floor=60,
+        setup_budget=300,
+        sample_budget=30.0,
+        torch_cpu_max_ndof=1e5,
+        continuum_max_ndof=3e5,
+        continuum_orders={"H1": [1, 2, 3, 4], "L2": [0, 1, 2, 3]},
+        posterior_obs=[10, 100, 1000],
+        posterior_orders={"H1": [1, 2, 4], "L2": [0, 1, 2]},
+    ),
+    "full": dict(
+        targets=[1e3, 1e4, 1e5, 1e6, 1e7],
+        dims=[1, 2, 3],
+        orders={"H1": [1, 2, 3, 4, 6, 8], "L2": [0, 1, 2, 3, 4, 6]},
+        powers=[2, 3, 4, 1.6, 2.6],
+        method_timeout=3600,
+        timeout_floor=120,
+        setup_budget=900,
+        sample_budget=60.0,
+        torch_cpu_max_ndof=1e6,
+        continuum_max_ndof=1e6,
+        continuum_orders={"H1": [1, 2, 3, 4, 6], "L2": [0, 1, 2, 3, 4]},
+        posterior_obs=[10, 100, 1000, 4000],
+        posterior_orders={"H1": [1, 2, 4, 8], "L2": [0, 1, 2, 4]},
+    ),
+}
+
+NOISE_METHODS = [
+    "diagonal",
+    "local-gram",
+    "local-gram-explicit",
+    "quadrature",
+    "chebyshev-1e-6",
+    "chebyshev-1e-10",
+    "lumped",
+    "dense-cholesky",
+]
+
+# (solver label, Gaussian method overrides); "precond" choices are NGSolve preconditioner names.
+CPU_SOLVERS = {
+    "direct-sparsecholesky": {"solver": "direct", "inverse": "sparsecholesky"},
+    "direct-umfpack": {"solver": "direct", "inverse": "umfpack"},
+    "direct-pardiso": {"solver": "direct", "inverse": "pardiso"},
+    "cg-bddc": {"solver": "cg", "precond": "bddc"},
+    "cg-h1amg": {"solver": "cg", "precond": "h1amg"},
+    "cg-multigrid": {"solver": "cg", "precond": "multigrid"},
+    "cg-local": {"solver": "cg", "precond": "local"},
+}
+GPU_SOLVERS = {"cudss": {"solver": "cudss"}, "pcg-jacobi": {"solver": "torch-pcg"}}
+# The same power-2 prior given only as the action c -> K M^-1 K c (OperatorPrecision, multi-shift PCG).
+APPLY_ONLY = {"apply-only": {}}
+
+# Posterior (linear Gaussian observations): m local averages of the prior field. The exact low-rank update applied
+# in FE space ("fe-space") or to the white noise ("noise-space"), its randomised rank-32 version by randomised
+# subspace iteration ("fe-space-rank32") or by plain power iteration ("fe-space-rank32-power"),
+# and pathwise conditioning ("matheron").
+POSTERIOR_METHODS = ["fe-space", "noise-space", "fe-space-rank32", "fe-space-rank32-power", "matheron"]
+POSTERIOR_DENSE_LIMIT = 4e8  # setup keeps G (m x ndof) and L^T G^T (nrand x m) dense
+
+# Distribution families on the default Matern prior (power 2), through ngsrng.Generator. Every algorithm variant of a
+# family is timed separately (inversion: closed form / Hermite table / scipy ppf / discrete table; constructions:
+# squares vs copula, Wishart process vs Bartlett, t-process vs t-copula), so the automatic choices can be fitted.
+# name -> (generator method, args, keyword options)
+DISTRIBUTION_CASES = {
+    "uniform": ("uniform", (), {}),
+    "lognormal": ("lognormal", (0.0, 0.5), {}),
+    "gamma-table": ("gamma", (2.0,), {"method": "table"}),
+    "gamma-ppf": ("gamma", (2.0,), {"method": "ppf"}),
+    "beta-table": ("beta", (2.0, 5.0), {"method": "table"}),
+    "beta-ppf": ("beta", (2.0, 5.0), {"method": "ppf"}),
+    "poisson-table": ("poisson", (3.0,), {"method": "discrete-table"}),
+    "poisson-ppf": ("poisson", (3.0,), {"method": "ppf"}),
+    "chisquare3-squares": ("chisquare", (3,), {"construction": "squares"}),
+    "chisquare3-copula": ("chisquare", (3,), {"construction": "copula"}),
+    "wishart2-df5-process": ("wishart", (5, "eye2"), {"construction": "process"}),
+    "wishart2-df5-bartlett": ("wishart", (5, "eye2"), {"construction": "bartlett"}),
+    "wishart3-df10-process": ("wishart", (10, "eye3"), {"construction": "process"}),
+    "wishart3-df10-bartlett": ("wishart", (10, "eye3"), {"construction": "bartlett"}),
+    "matrix-lognormal-2": ("matrix_lognormal", (2, 0.5), {}),
+    "matrix-lognormal-3": ("matrix_lognormal", (3, 0.5), {}),
+    "dirichlet-3": ("dirichlet", ((1.0, 2.0, 3.0),), {}),
+    "student-t5-process": ("standard_t", (5,), {"construction": "process"}),
+    "student-t5-copula": ("standard_t", (5,), {"construction": "copula"}),
+    "nig": ("normal_inverse_gaussian", (0.05,), {}),
+    "variance-gamma": ("variance_gamma", (0.05,), {}),
+}
+
+# Truncated Karhunen-Loeve expansions of the default Matern prior (power 2): randomised subspace iteration on the
+# factor L ("subspace") vs range finder on the covariance with Rayleigh-Ritz ("covariance"), several ranks and
+# iteration counts; accuracy against the dense eigendecomposition where it fits (LOWRANK_DENSE_LIMIT free dofs).
+LOWRANK_METHODS = ["subspace", "covariance"]
+LOWRANK_RANKS = [20, 100]
+LOWRANK_ITERATIONS = [1, 2, 4]
+LOWRANK_DENSE_LIMIT = 4000
+
+# Covariance diagnostics (ngsrng.covariance) of the default Matern prior and of its posterior under 40 point
+# observations: pointwise-variance methods (method, options) and trace estimators (probes), against the exact local
+# covariance where it is affordable (COVARIANCE_EXACT_LIMIT free dofs).
+COVARIANCE_VARIANCE = {
+    "exact": ("exact", {}),
+    "lowrank-r100-s32": ("lowrank", {"rank": 100, "samples": 32}),
+    "lowrank-r400-s64": ("lowrank", {"rank": 400, "samples": 64}),
+    "mc-400": ("mc", {"samples": 400}),
+    "mc-2000": ("mc", {"samples": 2000}),
+}
+COVARIANCE_TRACE = ["hutchinson", "hutch++", "xnystrace"]
+COVARIANCE_PROBES = [30, 120]
+COVARIANCE_SOURCES = ["prior", "posterior"]
+COVARIANCE_EXACT_LIMIT = 20000
+
+DENSE_LIMIT = 3000  # dense-cholesky noise only up to this many free dofs
+DIRECT_3D_LIMIT = 3e5  # sparse direct solvers are not attempted beyond this in 3D (fill-in)
+
+
+@dataclass
+class Task:
+    suite: str
+    dim: int
+    kind: str
+    order: int
+    target: float
+    engine: str = ""
+    device: str = ""
+    dtype: str = ""
+    method: str = ""
+    solver: str = ""
+    power: int = 0
+    options: dict = field(default_factory=dict)
+
+    @property
+    def id(self) -> str:
+        return "|".join(
+            str(v)
+            for v in (
+                self.suite,
+                self.dim,
+                self.kind,
+                self.order,
+                int(self.target),
+                self.engine,
+                self.device,
+                self.dtype,
+                self.method,
+                self.solver,
+                self.power,
+            )
+        )
+
+    @property
+    def lineage(self) -> str:
+        """Identity across sizes: a task is retired for larger sizes once it fails or blows its budget."""
+        return "|".join(
+            str(v)
+            for v in (
+                self.suite,
+                self.dim,
+                self.kind,
+                self.order,
+                self.engine,
+                self.device,
+                self.dtype,
+                self.method,
+                self.solver,
+                self.power,
+            )
+        )
+
+    def to_dict(self):
+        return asdict(self)
+
+
+@dataclass
+class Group:
+    suite: str
+    dim: int
+    kind: str
+    order: int
+    target: float
+    tasks: list
+
+    @property
+    def id(self):
+        return f"{self.suite}|{self.dim}|{self.kind}|{self.order}|{int(self.target)}"
+
+    def to_dict(self):
+        return {
+            "suite": self.suite,
+            "dim": self.dim,
+            "kind": self.kind,
+            "order": self.order,
+            "target": self.target,
+            "tasks": [t.to_dict() for t in self.tasks],
+        }
+
+
+def engines(devices, torch_cpu: bool):
+    out = [("ngsolve", "cpu", "float64")]
+    if torch_cpu:
+        out.append(("torch", "cpu", "float64"))
+    if "cuda" in devices:
+        out += [("torch", "cuda", "float64"), ("torch", "cuda", "float32")]
+    return out
+
+
+def build_groups(profile: str, suites, devices, max_ndof=None):
+    cfg = PROFILES[profile]
+    targets = [t for t in cfg["targets"] if max_ndof is None or t <= max_ndof]
+    groups = []
+    spaces = [(d, k, p) for d in cfg["dims"] for k in ("H1", "L2") for p in cfg["orders"][k]]
+    if "noise" in suites:
+        for d, k, p in spaces:
+            for t in targets:
+                tasks = []
+                for eng, dev, dt in engines(devices, torch_cpu=t <= cfg["torch_cpu_max_ndof"]):
+                    for m in NOISE_METHODS:
+                        if m == "dense-cholesky" and t > DENSE_LIMIT:
+                            continue
+                        tasks.append(Task("noise", d, k, p, t, eng, dev, dt, method=m))
+                groups.append(Group("noise", d, k, p, t, tasks))
+    if "prior" in suites:
+        for d, k, p in spaces:
+            for t in targets:
+                tasks = []
+                for power in cfg["powers"]:
+                    for name, opts in CPU_SOLVERS.items():
+                        if name.startswith("direct") and d == 3 and t > DIRECT_3D_LIMIT:
+                            continue
+                        if name in ("cg-h1amg", "cg-multigrid") and k != "H1":
+                            continue
+                        tasks.append(Task("prior", d, k, p, t, "ngsolve", "cpu", "float64", "auto", name, power, opts))
+                    if "cuda" in devices:
+                        for dt in ("float64", "float32"):
+                            for name, opts in GPU_SOLVERS.items():
+                                tasks.append(Task("prior", d, k, p, t, "torch", "cuda", dt, "auto", name, power, opts))
+                    if power == 2:
+                        tasks.append(Task("prior", d, k, p, t, "ngsolve", "cpu", "float64", "auto", "apply-only", 2))
+                        if "cuda" in devices:
+                            tasks.append(Task("prior", d, k, p, t, "torch", "cuda", "float64", "auto", "apply-only", 2))
+                groups.append(Group("prior", d, k, p, t, tasks))
+    if "posterior" in suites:
+        pspaces = [(d, k, p) for d in cfg["dims"] for k in ("H1", "L2") for p in cfg["posterior_orders"][k]]
+        for d, k, p in pspaces:
+            for t in targets:
+                tasks = []
+                for m in cfg["posterior_obs"]:
+                    if m * t > POSTERIOR_DENSE_LIMIT:
+                        continue
+                    for method in POSTERIOR_METHODS:
+                        if method.startswith("fe-space-rank32") and m <= 32:
+                            continue
+                        platforms = [("ngsolve", "cpu", "float64")]
+                        if "cuda" in devices:
+                            platforms += [("torch", "cuda", "float64"), ("torch", "cuda", "float32")]
+                        for eng, dev, dt in platforms:
+                            tasks.append(Task("posterior", d, k, p, t, eng, dev, dt, method, f"obs{m}", 2, {"m": m}))
+                groups.append(Group("posterior", d, k, p, t, tasks))
+    if "distributions" in suites:
+        nspaces = [(d, k, p) for d in cfg["dims"] for k in ("H1", "L2") for p in cfg["posterior_orders"][k]]
+        for d, k, p in nspaces:
+            for t in targets:
+                platforms = [("ngsolve", "cpu", "float64")] + (
+                    [("torch", "cuda", "float32")] if "cuda" in devices else []
+                )
+                tasks = [
+                    Task("distributions", d, k, p, t, eng, dev, dt, fam, "", 2)
+                    for fam in DISTRIBUTION_CASES
+                    for eng, dev, dt in platforms
+                ]
+                groups.append(Group("distributions", d, k, p, t, tasks))
+    if "lowrank" in suites:
+        for d, k, p in [(d, k, p) for d in cfg["dims"] for k in ("H1", "L2") for p in cfg["posterior_orders"][k]]:
+            for t in targets:
+                platforms = [("ngsolve", "cpu", "float64")] + (
+                    [("torch", "cuda", "float32")] if "cuda" in devices else []
+                )
+                tasks = [
+                    Task("lowrank", d, k, p, t, eng, dev, dt, method, f"rank{r}-q{q}", 2, {"rank": r, "q": q})
+                    for method in LOWRANK_METHODS
+                    for r in LOWRANK_RANKS
+                    for q in LOWRANK_ITERATIONS
+                    for eng, dev, dt in platforms
+                ]
+                groups.append(Group("lowrank", d, k, p, t, tasks))
+    if "covariance" in suites:
+        for d, k, p in [(d, k, p) for d in cfg["dims"] for k in ("H1", "L2") for p in cfg["posterior_orders"][k]]:
+            for t in targets:
+                tasks = [
+                    Task("covariance", d, k, p, t, "ngsolve", "cpu", "float64", f"variance:{name}", source, 2)
+                    for source in COVARIANCE_SOURCES
+                    for name in COVARIANCE_VARIANCE
+                ] + [
+                    Task("covariance", d, k, p, t, "ngsolve", "cpu", "float64", f"trace:{m}", f"{source}-p{n}", 2,
+                         {"probes": n})
+                    for source in COVARIANCE_SOURCES
+                    for m in COVARIANCE_TRACE
+                    for n in COVARIANCE_PROBES
+                ]
+                groups.append(Group("covariance", d, k, p, t, tasks))
+    if "continuum" in suites:
+        for d in cfg["dims"]:
+            for k in ("H1", "L2"):
+                for p in cfg["continuum_orders"][k]:
+                    tasks = [
+                        Task("continuum", d, k, p, cfg["continuum_max_ndof"], "ngsolve", "cpu", "float64", power=pw)
+                        for pw in cfg["powers"]
+                        if 2 * pw > d
+                    ]
+                    groups.append(Group("continuum", d, k, p, cfg["continuum_max_ndof"], tasks))
+    return groups
