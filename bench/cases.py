@@ -99,7 +99,10 @@ APPLY_ONLY = {"apply-only": {}}
 # in FE space ("fe-space") or to the white noise ("noise-space"), its randomised rank-32 version by randomised
 # subspace iteration ("fe-space-rank32") or by plain power iteration ("fe-space-rank32-power"),
 # and pathwise conditioning ("matheron").
-POSTERIOR_METHODS = ["fe-space", "noise-space", "fe-space-rank32", "fe-space-rank32-power", "matheron"]
+# fe-space-reweighted: the fe-space posterior plus the cost of re-weighting the noise (posterior(noise_scaling=...),
+# the Gaussian step of IRLS and of Gibbs samplers for heavy-tailed noise)
+POSTERIOR_METHODS = ["fe-space", "fe-space-reweighted", "noise-space", "fe-space-rank32", "fe-space-rank32-power",
+                     "matheron"]
 POSTERIOR_DENSE_LIMIT = 4e8  # setup keeps G (m x ndof) and L^T G^T (nrand x m) dense
 
 # Distribution families on the default Matern prior (power 2), through ngsrng.Generator. Every algorithm variant of a

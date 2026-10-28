@@ -12,12 +12,14 @@ import numpy as np
 import scipy.special as sps
 import torch
 
-from ..backend import sparse_to_torch
+from ..backend import ngs_sparse, sparse_to_torch
 from ..covariance import EXACT_LIMIT
 from ..observations import observation_operator
 from ..quadrature import QuadratureRule
 from ..solvers import NGSolveDirect
 from ..space import mass_form
+
+_SQRT1_2 = float(np.sqrt(0.5))
 
 
 class XP:
@@ -28,7 +30,12 @@ class XP:
         self.m = torch if torch_mode else np
 
     def ndtr(self, x):
-        return torch.special.ndtr(x) if self.torch else sps.ndtr(x)
+        if not self.torch:
+            return sps.ndtr(x)
+        # torch.special.ndtr computes (1 + erf) / 2, which cancels in the lower tail (4% relative error at x = -8,
+        # zero below -10); the erfc form keeps full relative accuracy in both tails
+        tail = 0.5 * torch.special.erfc(x.abs() * _SQRT1_2)
+        return torch.where(x < 0, tail, 1.0 - tail)
 
     def log_ndtr(self, x):
         return torch.special.log_ndtr(x) if self.torch else sps.log_ndtr(x)
@@ -217,10 +224,19 @@ class GaussianAtPoints:
         return self._t
 
     def draw(self, n, on_device=False):
-        """n samples of the point values (npoints x n): NumPy, or a device tensor if ``on_device`` and possible."""
-        full = self.gauss.sample(int(n))
+        """n samples of the point values (npoints x n): NumPy (float64), or a device tensor if ``on_device`` and
+        possible."""
+        n = int(n)
+        g = self.gauss
         if on_device and self.device_capable:
-            return self._torch_ops()[0] @ full
+            return self._torch_ops()[0] @ g.sample(n)
+        if getattr(g, "engine", None) == "ngsolve" and hasattr(g, "_ngs_rows"):
+            # CPU engine: the point values of every sample are taken in the worker thread that computes it, from
+            # the float64 coefficients (no full-size intermediate, no float32 round trip)
+            if getattr(self, "_ngs_eval", None) is None:
+                self._ngs_eval = ngs_sparse(self.eval_full)
+            return g._ngs_rows(n, np.empty((n, self.npoints)), evaluate=self._ngs_eval).T
+        full = g.sample(n)
         return self.eval_full @ full.double().cpu().numpy()
 
     def standardized(self, n, on_device=False):
@@ -229,8 +245,11 @@ class GaussianAtPoints:
             raise ValueError("standardisation needs std ('exact', 'mc' or an array)")
         if on_device and self.device_capable:
             _, center, std = self._torch_ops()
-            return (self.draw(n, True) - center[:, None]) / std[:, None]
-        return (self.draw(n) - self.center[:, None]) / self.std[:, None]
+            return self.draw(n, True).sub_(center[:, None]).div_(std[:, None])
+        z = self.draw(n)  # a fresh array: standardise in place
+        z -= self.center[:, None]
+        z /= self.std[:, None]
+        return z
 
     def _pin(self):
         """Points where the reference Gaussian is deterministic (e.g. on a Dirichlet boundary of the covariance):
@@ -288,7 +307,8 @@ class PointwiseField:
     CHUNK_VALUES = 2e7  # Gaussian point values per internal batch (bounds the transforms' intermediates)
 
     def _chunked(self, n):
-        per_sample = self.points.npoints * getattr(self, "copies", 1)
+        # the Gaussian behind a batch is ndof x n as well (and solvers keep a few such blocks): bound both
+        per_sample = max(self.points.npoints, self.space.ndof) * getattr(self, "copies", 1)
         size = max(1, int(self.CHUNK_VALUES // per_sample))
         if n <= size:
             return self._values(n)

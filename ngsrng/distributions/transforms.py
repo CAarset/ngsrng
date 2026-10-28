@@ -10,6 +10,7 @@ and conventions follow ``numpy.random.Generator``.
 
 import numpy as np
 import scipy.stats as st
+import torch
 
 from .inversion import Inversion
 from .pointwise import XP, GaussianAtPoints, PointwiseField, is_conditioned, warn_copies_of_posterior
@@ -171,7 +172,12 @@ class MarginalField(PointwiseField):
     def _values(self, n):
         dev = self.on_device
         z = self.points.standardized(n, dev) if self.standardize else self.points.draw(n, dev)
-        xp = XP(dev)
+        # closed forms run in torch also on the CPU: the same float64 formulas, multithreaded (NumPy's elementwise
+        # functions are single-threaded); quantile inversions stay in NumPy/SciPy on the CPU
+        cpu_torch = not dev and isinstance(self.transform, ClosedForm) and isinstance(z, np.ndarray)
+        if cpu_torch:
+            z = torch.from_numpy(z)
+        xp = XP(dev or cpu_torch)
         return self.clamp_open(self.transform(z, xp), getattr(self.transform, "support", None), xp)
 
     def _pull_inside(self, values, margin):

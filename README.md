@@ -22,8 +22,16 @@ O'Leary-Roseberry 2024), an adjoint-built observation operator, exact posterior 
 posterior predictive checks, the informed directions for several noise levels, low-rank updates, a comparison of
 measurement designs, and an independent cross-check. The noise level is a parameter at the top.
 
+**Advanced walkthrough II:** [examples/hydraulic_tomography_3d.ipynb](examples/hydraulic_tomography_3d.ipynb) is a
+nonlinear 3D problem with heavy-tailed noise: the log-conductivity of an aquifer block from heads measured in nine
+wells during four pumping tests, with Student-t measurement errors. It covers a Robin-tuned Matérn prior in 3D, an
+adjoint Jacobian, the MAP point by Gauss–Newton (every step an exact conditioning, with re-weighting for the outliers),
+the Laplace approximation with its exact variance map and low-rank structure, and MCMC checks of it (pCN, gpCN with
+Laplace proposals, and a Gibbs sampler for the noise scales). It runs in about four minutes.
+
 ```python
 from ngsolve import *
+import numpy as np
 import ngsrng
 
 mesh = Mesh(unit_square.GenerateMesh(maxh=0.05))
@@ -37,6 +45,10 @@ g = rng.sample("gamma", 2.0, size=10)   # same as rng.gamma(2.0, size=10); alias
 W = rng.wishart(5, S, size=4)           # (4, npoints, p, p) SPD-matrix fields
 f = rng.uniform(representation="bernstein")  # an FE function with 0 < f(x) < 1 at every point
 rng.info("beta", 2, 5)                  # the law and the algorithms chosen
+
+buf = np.empty((5000, X.ndof), np.float32)   # or a torch tensor, also on the GPU
+for _ in range(10):
+    rng.normal(out=buf)                  # large batches, filled in place (also lognormal, uniform, ...)
 ```
 
 ### Distributions and the Generator
@@ -119,7 +131,11 @@ following:
     "fields"); ngsrng warns and suggests using it as a precision instead.
 11. Values of bounded distributions always stay strictly inside their range, also in single precision (a uniform
     value is never exactly 0 or 1).
-12. The GPU code paths are implemented but have not yet been run on a GPU.
+12. The GPU code paths pass their tests on a GPU, but their speed has not been measured yet
+    (`python bench/gpu_batch.py`).
+13. **Large batches:** on the CPU, samples are computed in parallel threads (one sample per thread; set the number
+    with `method={"threads": k}`). Results do not depend on the number of threads. A batch and the same samples drawn
+    one at a time agree to rounding (about 1e-14 relative), not bit for bit.
 
 #### Distributions, algorithms, accuracy and speed
 Speed is the cost of one sample relative to one sample of the underlying Gaussian field. It comes from a preliminary
@@ -192,6 +208,12 @@ post = obs.posterior(data=y)  # exact; a Gaussian with the prior's pipeline + a 
 post.sample(100)  # costs about one prior sample each
 
 post = prior.downdate(B, K)  # a known posterior C0 - B K^-1 B*, given directly
+
+# re-weighted noise (precision of observation i times w[i]) without refactorising: an l x l eigendecomposition and
+# shared NGSolve data, a few ms per re-weighted posterior. The Gaussian step of iteratively reweighted least squares
+# and of Gibbs samplers for Student-t / Laplace noise
+post_w = obs.posterior(data=y, noise_scaling=w)
+laplace = obs.posterior(mean=m_map, noise_scaling=h)  # the same covariance centred elsewhere, e.g. at a MAP point
 ```
 Low-rank models: `ngsrng.karhunen_loeve(gaussian, rank)` gives the truncated KL expansion of any Gaussian (prior or
 posterior, L2-orthonormal modes) as a `LowRankGaussian`, which supports exact conditioning with r x r algebra. It uses
@@ -253,7 +275,7 @@ What to keep in mind:
 | `ngsrng/` | The package. `gaussian.py` (sampler and automatic selection), `noise.py` (white noise), `solvers.py`, `rational.py` (fractional powers), `observations.py`, `posterior.py`, `lowrank.py`, `randomized.py` (randomised subspace iteration), `covariance.py` (variance maps, traces, covariance functions, sample covariances), `quadrature.py`, `generator.py` (numpy-style API), `correlation.py`, `distributions/` (inversion, copula marginals, quadratic forms, scale mixtures, KL expansions), `tuning.py`, `reference.py` (dense ground truth), `space.py`, `backend.py`, `specs.py` |
 | `tests/` | One test file per module; `python -m pytest` |
 | `bench/` | One-click benchmark: `run_all.py` (orchestrator), `cases.py` (grid), `worker.py`, `report.py` |
-| `examples/` | `demo.ipynb`: the user tutorial; `stokes_inverse.ipynb`: advanced walkthrough of a Bayesian inverse problem with a Stokes forward model. Both executed (interactive `Draw` views and static panels included) |
+| `examples/` | `demo.ipynb`: the user tutorial; `stokes_inverse.ipynb`: advanced walkthrough of a linear Bayesian inverse problem with a Stokes forward model; `hydraulic_tomography_3d.ipynb`: nonlinear 3D problem with heavy-tailed noise, Laplace approximation and MCMC. All executed (interactive `Draw` views and static panels included) |
 | `results/` | `runs/` (generated, git-ignored), `prototype/` (archived early results) |
 
 ## Installation
@@ -273,6 +295,8 @@ python bench/run_all.py                       # "standard": all methods x engine
 python bench/run_all.py --profile full        # up to 1e7 dofs, more orders, power 4
 python bench/run_all.py --resume results/runs/<run>   # continue an interrupted run
 python bench/run_all.py --install             # also make the measured optimum the dispatcher's tuning
+python bench/gpu_batch.py                     # GPU: batches of 5000 normal/lognormal/uniform fields filled in place
+                                              #  (cuDSS widths, PCG, float32/64) vs the CPU engine; --quick: minutes
 ```
 - **What runs** (suites `noise prior posterior distributions lowrank covariance continuum`; the grid is defined in
   [bench/cases.py](bench/cases.py)):
@@ -280,7 +304,7 @@ python bench/run_all.py --install             # also make the measured optimum t
   - every solver configuration: NGSolve sparse Cholesky / UMFPACK / PARDISO, CG with BDDC / h1amg / multigrid /
     Jacobi, GPU cuDSS and batched PCG;
   - integer and fractional Matérn powers;
-  - posteriors (FE-space, noise-space and randomised low-rank updates, Matheron);
+  - posteriors (FE-space, noise-space and randomised low-rank updates, re-weighted noise, Matheron);
   - truncated KL expansions: randomised subspace iteration vs covariance range finder, ranks and iteration counts;
   - variance maps (exact, low rank plus sampled residual, sampling) and trace estimators (Hutchinson, Hutch++,
     XNysTrace) for a prior and a posterior;

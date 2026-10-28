@@ -1,6 +1,9 @@
 """Thin torch helpers: every sample-time kernel runs on a torch device (CPU or CUDA)."""
 
+import os
+import threading
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 
 import numpy as np
@@ -95,16 +98,27 @@ class NormalStream:
     def fill(self, out: np.ndarray):
         key, self.counter = self.counter, self.counter + 1
         nchunks = -(-len(out) // self.chunk)
-
-        def job(j):
-            ss = np.random.SeedSequence(self.entropy, spawn_key=(key, j))
-            np.random.Generator(np.random.SFC64(ss)).standard_normal(out=out[j * self.chunk : (j + 1) * self.chunk])
-
         if nchunks == 1:
-            job(0)
+            self._job(out, key, 0)
         else:
-            list(self.pool().map(job, range(nchunks)))
+            list(self.pool().map(lambda j: self._job(out, key, j), range(nchunks)))
         return out
+
+    def reserve(self, n: int) -> int:
+        """Reserve the keys of the next n calls of ``fill`` (for :meth:`fill_keyed`): returns the first."""
+        key, self.counter = self.counter, self.counter + int(n)
+        return key
+
+    def fill_keyed(self, out: np.ndarray, key: int):
+        """The numbers ``fill`` would produce as its call number ``key``, generated in the calling thread (for
+        batches spread over threads: sample k of a batch gets key first + k, as in a loop of ``fill`` calls)."""
+        for j in range(-(-len(out) // self.chunk)):
+            self._job(out, key, j)
+        return out
+
+    def _job(self, out, key, j):
+        ss = np.random.SeedSequence(self.entropy, spawn_key=(key, j))
+        np.random.Generator(np.random.SFC64(ss)).standard_normal(out=out[j * self.chunk : (j + 1) * self.chunk])
 
 
 def make_generator(seed, device) -> torch.Generator:
@@ -133,6 +147,24 @@ def numpy_blas_threads(n):
 
 
 _BLAS_SELECTION = []
+_ALL_BLAS = []
+
+
+@contextmanager
+def blas_threads(n):
+    """Limit every BLAS library in the process (NumPy's OpenBLAS, NGSolve's MKL and OpenBLAS) to n threads."""
+    if not _ALL_BLAS:
+        try:
+            from threadpoolctl import ThreadpoolController
+
+            _ALL_BLAS.append(ThreadpoolController().select(user_api="blas"))
+        except ImportError:
+            _ALL_BLAS.append(None)
+    if _ALL_BLAS[0] is None:
+        yield
+        return
+    with _ALL_BLAS[0].limit(limits=int(n)):
+        yield
 
 
 def _numpy_blas_controller():
@@ -146,3 +178,73 @@ def _numpy_blas_controller():
         except ImportError:
             _BLAS_SELECTION.append(None)
     return _BLAS_SELECTION[0]
+
+
+# ------------------------------------------------------------------ threads (CPU engine)
+
+
+def available_threads() -> int:
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return os.cpu_count() or 1
+
+
+_POOL = []
+_IN_WORKER = threading.local()
+
+
+def parallel_ranges(n: int, work, threads: int | None = None):
+    """Run ``work(lo, hi)`` on contiguous index ranges covering range(n), in a shared thread pool.
+
+    NGSolve's kernels (sparse products, direct solves) release the GIL and are thread-safe on separate vectors, so
+    independent samples or columns run in parallel; results do not depend on the number of threads. Calls from inside a
+    worker run sequentially (no nested parallelism, no pool deadlock).
+    """
+    if getattr(_IN_WORKER, "active", False):
+        work(0, n)
+        return
+    threads = min(available_threads() if threads is None else int(threads), n)
+
+    def run(lo, hi):
+        _IN_WORKER.active = True
+        try:
+            work(lo, hi)
+        finally:
+            _IN_WORKER.active = False
+
+    # every BLAS (NumPy's OpenBLAS, NGSolve's MKL and OpenBLAS) single-threaded meanwhile: the parallelism is over
+    # samples, nested BLAS threads would oversubscribe the cores, and per-call thread counts chosen at run time would
+    # make the rounding depend on the schedule
+    with blas_threads(1):
+        if threads <= 1:
+            run(0, n)
+            return
+        if not _POOL:
+            _POOL.append(ThreadPoolExecutor(available_threads(), thread_name_prefix="ngsrng"))
+        bounds = np.linspace(0, n, threads + 1).astype(int)
+        futures = [_POOL[0].submit(run, lo, hi) for lo, hi in zip(bounds[:-1], bounds[1:]) if hi > lo]
+        for f in futures:
+            f.result()  # re-raises a worker's exception
+
+
+class Scratch:
+    """Per-thread work objects (e.g. NGSolve vectors), created by ``factory`` on first use in each thread: shared
+    temporaries would make concurrent applications race."""
+
+    def __init__(self, factory):
+        self.factory = factory
+        self._tls = threading.local()
+
+    def get(self):
+        obj = getattr(self._tls, "obj", None)
+        if obj is None:
+            obj = self._tls.obj = self.factory()
+        return obj
+
+    def __getstate__(self):  # copy.copy of an owner shares the factory, not other threads' objects
+        return {"factory": self.factory}
+
+    def __setstate__(self, state):
+        self.factory = state["factory"]
+        self._tls = threading.local()

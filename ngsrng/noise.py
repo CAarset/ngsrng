@@ -18,7 +18,7 @@ import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 import torch
 
-from .backend import ngs_sparse, sparse_to_torch, spmm
+from .backend import Scratch, ngs_sparse, sparse_to_torch, spmm
 from .space import SpaceInfo, assemble, mass_form
 
 
@@ -232,12 +232,12 @@ class ChebyshevNoise(NoiseSampler):
     def ngs_setup(self, space: SpaceInfo):
         self._ngs_a = ngs_sparse(self.at)
         self._ngs_out = ngs_sparse(sp.diags(self.dsqrt).tocsr(), rows=space.free, nrows=space.ndof)
-        self._ngs_tmp = [self._ngs_a.CreateColVector() for _ in range(4)]
+        self._ngs_tmp = Scratch(lambda: [self._ngs_a.CreateColVector() for _ in range(4)])  # per thread
         return self
 
     def ngs_apply(self, eta, out):
         alpha, beta = 2.0 / (self.hi - self.lo), (self.hi + self.lo) / (self.hi - self.lo)
-        b1, b2, b0, av = self._ngs_tmp
+        b1, b2, b0, av = self._ngs_tmp.get()
         b1[:] = 0.0
         b2[:] = 0.0
         # Coefficients as Python floats: numpy scalars hijack ``scalar * BaseVector`` and break the expression.
@@ -423,11 +423,11 @@ class LocalGramNoise(NoiseSampler):
         self._ngs_hb = ngs_sparse(self.h_broken) if self.h_broken.nnz else None
         self._ngs_hg = ngs_sparse(self.h_boundary, rows=space.free, nrows=space.ndof) if self.h_boundary.nnz else None
         self._ngs_eft = ngs_sparse(self.eft, rows=space.free, nrows=space.ndof)
-        self._ngs_y = ngs.la.BaseVector(self.nbroken)
+        self._ngs_y = Scratch(lambda: ngs.la.BaseVector(self.nbroken))  # per thread
         return self
 
     def ngs_apply(self, eta, out):
-        e, y = eta.FV().NumPy(), self._ngs_y
+        e, y = eta.FV().NumPy(), self._ngs_y.get()
         y[:] = 0.0
         yn = y.FV().NumPy()
         off = 0

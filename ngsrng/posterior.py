@@ -31,7 +31,7 @@ import scipy.linalg as sla
 import scipy.sparse as sp
 import torch
 
-from .backend import numpy_blas_threads
+from .backend import Scratch, numpy_blas_threads
 from .observations import CHUNK, observation_operator, whiten, whitener
 from .randomized import randomized_qr
 from .space import coefficient_columns, coefficient_vector
@@ -42,10 +42,12 @@ from .space import coefficient_columns, coefficient_vector
 class NoiseSpaceMap:
     """Symmetric map eta -> eta + Q A Q^T eta on the prior's white-noise space."""
 
-    def __init__(self, q: np.ndarray, a: np.ndarray):
+    def __init__(self, q: np.ndarray, a: np.ndarray, shared=None):
         self.q = np.ascontiguousarray(q, dtype=np.float64)
         self.a = np.ascontiguousarray(a, dtype=np.float64)
         self._torch = {}
+        # NGSolve / torch copies of Q, reusable by every map with the same Q (re-weighted posteriors)
+        self._shared = {} if shared is None else shared
 
     @property
     def rank(self) -> int:
@@ -60,16 +62,21 @@ class NoiseSpaceMap:
         NumPy's GEMV would be equally fast, but its OpenBLAS threads slow down the NGSolve solve that follows.
         """
         if getattr(self, "_mv", None) is None:
-            self._mv = ngs.MultiVector(eta, self.rank)
-            for k in range(self.rank):
-                self._mv[k].FV().NumPy()[:] = self.q[:, k]
+            if "ngs" not in self._shared:
+                mv = ngs.MultiVector(eta, self.rank)
+                for k in range(self.rank):
+                    mv[k].FV().NumPy()[:] = self.q[:, k]
+                self._shared["ngs"] = mv
+            self._mv = self._shared["ngs"]
         coeff = self.a @ np.asarray(self._mv.InnerProduct(eta))
         eta.data += self._mv * ngs.Vector(list(coeff))
 
     def apply_torch(self, x: torch.Tensor) -> torch.Tensor:
         key = (x.device, x.dtype)
         if key not in self._torch:
-            self._torch[key] = (torch.from_numpy(self.q).to(*key), torch.from_numpy(self.a).to(*key))
+            if key not in self._shared:
+                self._shared[key] = torch.from_numpy(self.q).to(*key)
+            self._torch[key] = (self._shared[key], torch.from_numpy(self.a).to(*key))
         q, a = self._torch[key]
         return x + q @ (a @ (q.T @ x))
 
@@ -83,13 +90,16 @@ class FESpaceUpdate:
     instead of two passes over Q (nrand x r). A s^-1 stays bounded as s -> 0, so this is stable.
     """
 
-    def __init__(self, p: np.ndarray, smat: np.ndarray, g: sp.csr_matrix, free: np.ndarray, ndof: int):
+    def __init__(self, p: np.ndarray, smat: np.ndarray, g: sp.csr_matrix, free: np.ndarray, ndof: int, shared=None):
         self.p = np.ascontiguousarray(p, dtype=np.float64)
         self.s = np.ascontiguousarray(smat, dtype=np.float64)
         self.g = g.tocsr()
         self.free, self.ndof = free, ndof
         self._torch = {}
         self._ngs = None
+        # NGSolve / torch copies of P and G, reusable by every update with the same P and G (re-weighted posteriors
+        # differ only in S); converting G to NGSolve's format dominates the set-up otherwise
+        self._shared = {} if shared is None else shared
 
     @property
     def rank(self) -> int:
@@ -100,12 +110,14 @@ class FESpaceUpdate:
         if key not in self._torch:
             from .backend import sparse_to_torch
 
-            self._torch[key] = (
-                torch.from_numpy(self.p).to(device, dtype),
-                torch.from_numpy(self.s).to(device, dtype),
-                sparse_to_torch(self.g, device, dtype),
-                sparse_to_torch(self.g.T.tocsr(), device, dtype),
-            )
+            if key not in self._shared:
+                self._shared[key] = (
+                    torch.from_numpy(self.p).to(device, dtype),
+                    sparse_to_torch(self.g, device, dtype),
+                    sparse_to_torch(self.g.T.tocsr(), device, dtype),
+                )
+            p, g, gt = self._shared[key]
+            self._torch[key] = (p, torch.from_numpy(self.s).to(device, dtype), g, gt)
         return self._torch[key]
 
     def apply_torch(self, c: torch.Tensor) -> torch.Tensor:
@@ -121,14 +133,18 @@ class FESpaceUpdate:
         if self._ngs is None:
             from .backend import ngs_sparse
 
-            gfull = ngs_sparse(self.g, cols=self.free, ncols=self.ndof)
-            pmv = ngs.MultiVector(vec, self.rank)
-            for k in range(self.rank):
-                col = pmv[k].FV().NumPy()
-                col[:] = 0.0
-                col[self.free] = self.p[:, k]
-            self._ngs = (gfull, pmv, gfull.CreateColVector())
-        gfull, pmv, y = self._ngs
+            if "ngs" not in self._shared:
+                gfull = ngs_sparse(self.g, cols=self.free, ncols=self.ndof)
+                pmv = ngs.MultiVector(vec, self.rank)
+                for k in range(self.rank):
+                    col = pmv[k].FV().NumPy()
+                    col[:] = 0.0
+                    col[self.free] = self.p[:, k]
+                self._shared["ngs"] = (gfull, pmv)
+            gfull, pmv = self._shared["ngs"]
+            self._ngs = (gfull, pmv, Scratch(gfull.CreateColVector))  # work vector per thread
+        gfull, pmv, scratch = self._ngs
+        y = scratch.get()
         y.data = gfull * vec
         coeff = self.s @ y.FV().NumPy()
         vec.data += pmv * ngs.Vector(list(coeff))
@@ -233,42 +249,63 @@ class LinearObservations:
         ]
         return np.hstack(cols)
 
-    def posterior(self, data=None, seed=None, form="fe"):
+    def posterior(self, data=None, seed=None, form="fe", noise_scaling=None, mean=None):
         """The posterior as a ``Gaussian`` (same pipeline and engine as the prior, plus the low-rank update).
 
         ``data`` sets the posterior mean; without data the mean is the prior mean (enough for covariance studies).
         ``form``: "fe" applies the update to the prior sample in FE space (default: a sparse G product plus one pass
         over L Q per sample; setup adds ``rank`` applications of L). "noise" modifies the white noise before the
         pipeline (two passes over Q per sample; no extra setup). Both are exact and give identical samples.
+
+        ``noise_scaling`` (one weight w_i >= 0 per observation) multiplies the noise precision of observation i by
+        w_i, i.e. divides its variance by w_i (w_i = 0 ignores it). The factorisation does not depend on the weights,
+        so a re-weighted posterior costs only an l x l eigendecomposition: the Gaussian step of iteratively
+        reweighted least squares and of Gibbs samplers for scale-mixture noise (Student-t, Laplace).
+
+        ``mean`` (instead of ``data``) sets the mean directly: a Gaussian with this posterior covariance centred
+        elsewhere, e.g. the Laplace approximation of a nonlinear problem, centred at its MAP point, with the
+        observation operator linearised there.
         """
-        return self._posterior_from(None, data, seed, form)
+        if mean is not None and data is not None:
+            raise ValueError("give data or mean, not both")
+        post = self._posterior_from(noise_scaling, data, seed, form)
+        if mean is not None:
+            post._mean = coefficient_vector(mean, self.prior.space)
+        return post
 
     def _posterior_from(self, scaling, data, seed, form):
         """Posterior with the noise precision of observation i multiplied by ``scaling[i]`` >= 0 (None: unchanged).
 
-        Extension point: the factorisation does not depend on the scaling, so re-scaled posteriors cost only an
-        l x l eigendecomposition. The generic API never rescales.
+        The factorisation does not depend on the scaling, so re-scaled posteriors cost only an l x l
+        eigendecomposition (public as ``posterior(noise_scaling=...)``).
         """
         sc = np.ones(self.m) if scaling is None else np.asarray(scaling, dtype=float)
         if sc.shape != (self.m,) or (sc < 0).any():
             raise ValueError("scaling must be a non-negative vector with one entry per observation")
-        middle = np.eye(self.rank) + (self.r * sc) @ self.r.T  # I + R S R^T
-        lam, v = np.linalg.eigh(middle)
-        a = (v * (lam**-0.5 - 1.0)) @ v.T
-        mean = self.prior.mean
-        if data is not None:
-            resid = np.asarray(data, dtype=float) - self.G @ mean
-            coeff = np.linalg.solve(middle, self.r @ (sc * whiten(self.wkind, self.wdata, resid)))
-            mean[self.prior.space.free] += self._get_lq() @ coeff
+        # NumPy BLAS threads busy-wait against NGSolve's threads even on these small l x l problems (known issue 9)
+        prior = self.prior
+        with numpy_blas_threads(getattr(prior, "_cpu_blas_threads", 1) if getattr(prior, "engine", "") != "torch"
+                                else None):
+            middle = np.eye(self.rank) + (self.r * sc) @ self.r.T  # I + R S R^T
+            lam, v = np.linalg.eigh(middle)
+            a = (v * (lam**-0.5 - 1.0)) @ v.T
+            mean = prior.mean
+            if data is not None:
+                resid = np.asarray(data, dtype=float) - self.G @ mean
+                coeff = np.linalg.solve(middle, self.r @ (sc * whiten(self.wkind, self.wdata, resid)))
+                mean[prior.space.free] += self._get_lq() @ coeff
+            if form == "fe":
+                whitening = np.diag(self.wdata) if self.wkind == "diag" else self.wdata
+                smat = (a / self.sv[None, :]) @ self.vt @ whitening
         kind = "exact" if self.exact else "randomised"
+        shared = self.__dict__.setdefault("_shared_maps", {"noise": {}, "fe": {}})
         if form == "noise":
             label = f"{self.m} linear observations ({kind}, noise-space update, rank {self.rank})"
-            return self.prior._derive(label, mean, eta_map=NoiseSpaceMap(self.q, a), seed=seed)
+            return self.prior._derive(label, mean, eta_map=NoiseSpaceMap(self.q, a, shared["noise"]), seed=seed)
         if form != "fe":
             raise ValueError(f"unknown form {form!r}")
-        whitening = np.diag(self.wdata) if self.wkind == "diag" else self.wdata
-        smat = (a / self.sv[None, :]) @ self.vt @ whitening
-        update = FESpaceUpdate(self._get_lq(), smat, self.gf, self.prior.space.free, self.prior.space.ndof)
+        update = FESpaceUpdate(self._get_lq(), smat, self.gf, self.prior.space.free, self.prior.space.ndof,
+                               shared["fe"])
         label = f"{self.m} linear observations ({kind}, FE-space update, rank {self.rank})"
         return self.prior._derive(label, mean, post_map=update, seed=seed)
 

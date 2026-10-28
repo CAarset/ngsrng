@@ -250,13 +250,15 @@ def posterior_section(df, recs):
     out = [
         "## 3. Posteriors under linear observations (m local averages, A^-2 prior)\n",
         "fe-space / noise-space = the exact low-rank update applied to the prior sample / to the white noise; "
-        "fe-space-rank32 = randomised low-rank version; matheron = pathwise conditioning (reference implementation, "
-        "CPU dense algebra).\n",
+        "fe-space-reweighted = fe-space plus the cost of a re-weighted posterior and one sample from it "
+        "(reweight_and_sample_s); fe-space-rank32 = randomised low-rank version; matheron = pathwise conditioning "
+        "(reference implementation, CPU dense algebra).\n",
     ]
     df = df.assign(platform=platform(df))
     df["m"] = df.solver.str.replace("obs", "").astype(int)
     ok = df[df.status == "ok"].copy()
-    cols = [c for c in ("setup_s", "posterior_s", "per_sample_s", "overhead_vs_prior") if c in ok]
+    cols = [c for c in ("setup_s", "posterior_s", "per_sample_s", "overhead_vs_prior", "reweight_and_sample_s")
+            if c in ok]
     out.append("### 3.1 Cost (largest size per space)\n")
     last = ok.sort_values("ndof").groupby(["dim", "kind", "order", "platform", "method", "m"]).tail(1)
     tab = last.set_index(["dim", "kind", "order", "ndof", "platform", "method", "m"])[cols].sort_index()
@@ -274,6 +276,7 @@ def posterior_section(df, recs):
         valid = sub[
             (sub.get("pred_cov_rel_err", pd.Series(0, index=sub.index)).fillna(0) <= sub.dtype.map(TOL))
             & (~sub.method.str.startswith("fe-space-rank32"))
+            & (sub.method != "fe-space-reweighted")  # the same sampler as fe-space
         ]
         if len(valid):
             b = valid.loc[valid.per_sample_s.idxmin()]
@@ -310,6 +313,7 @@ def distributions_section(df):
         for c in (
             "setup_s",
             "per_sample_s",
+            "out_per_sample_s",
             "overhead_vs_gauss",
             "inversion",
             "standardisation",

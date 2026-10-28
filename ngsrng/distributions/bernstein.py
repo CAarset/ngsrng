@@ -26,8 +26,8 @@ import math
 import ngsolve as ngs
 import numpy as np
 import scipy.sparse as sp
-import scipy.sparse.linalg as spla
 
+from ..backend import Scratch, ngs_sparse, parallel_ranges
 from ..quadrature import QuadratureRule
 from ..space import SpaceInfo
 
@@ -89,7 +89,7 @@ class BernsteinForm:
         rows = sp.kron(sp.identity(self.ne, format="csr"), sp.csr_matrix(self.fit), format="csr")
         self.evaluation = (rows @ self.rule.evaluation_full)[self.first].tocsr()  # (npoints x ndof)
         bm = self.rule.b
-        self._mass = spla.splu((bm @ sp.diags(1.0 / self.rule.weights) @ bm.T).tocsc())  # same-rule mass, all dofs
+        self._mass = SymmetricFactor(bm @ sp.diags(1.0 / self.rule.weights) @ bm.T)  # same-rule mass, all dofs
         self._mapped = None
 
     # ---------------------------------------------------------------- reference element
@@ -178,3 +178,31 @@ class BernsteinForm:
         c = self._mass.solve(np.asarray(self.rule.b @ uq))
         resid = np.abs(self.rule.evaluation_full @ c - uq).max(axis=0)
         return c, resid
+
+
+class SymmetricFactor:
+    """Sparse Cholesky factorisation (NGSolve) of an SPD scipy matrix, applied to many right-hand sides in parallel
+    threads. SciPy's SuperLU took ~30 ms per right-hand side for the Bernstein mass matrices of a 5k-dof P2 space;
+    this takes ~1 ms single-threaded."""
+
+    def __init__(self, a):
+        self.mat = ngs_sparse(sp.csr_matrix(a))
+        everything = ngs.BitArray(a.shape[0])
+        everything.Set()
+        self.inv = self.mat.Inverse(everything, "sparsecholesky")
+        self._vectors = Scratch(lambda: (self.mat.CreateColVector(), self.mat.CreateColVector()))
+
+    def solve(self, b):
+        b = np.asarray(b, dtype=float)
+        cols = b[:, None] if b.ndim == 1 else b
+        out = np.empty((cols.shape[1], cols.shape[0]))
+
+        def work(lo, hi):
+            rhs, sol = self._vectors.get()
+            for k in range(lo, hi):
+                rhs.FV().NumPy()[:] = cols[:, k]
+                sol.data = self.inv * rhs
+                out[k] = sol.FV().NumPy()
+
+        parallel_ranges(cols.shape[1], work)
+        return out[0] if b.ndim == 1 else out.T
