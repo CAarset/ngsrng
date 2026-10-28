@@ -371,8 +371,16 @@ def run_posterior(task: Task, ctx: PosteriorContext, rec: dict):
         if form == "fe":
             obs._get_lq()  # L Q is part of the FE-space setup
         rec["setup_s"] = time.perf_counter() - t
+        weights = None
+        if task.method == "fe-space-reweighted":
+            # a re-weighted posterior and one sample from it (after the first, which builds the shared copies)
+            w = np.random.default_rng(0).gamma(2.0, 0.5, m)
+            obs.posterior(data=y, noise_scaling=w).sample(1)
+            rec["reweight_and_sample_s"], _ = timeit(lambda: obs.posterior(data=y, noise_scaling=w).sample(1), sync,
+                                                     min_time=0.3, max_reps=10)
+            weights = np.ones(m)  # unit weights: the checks below compare with the same references
         t = time.perf_counter()
-        post = obs.posterior(data=y, form=form)
+        post = obs.posterior(data=y, form=form, noise_scaling=weights)
         rec["posterior_s"] = time.perf_counter() - t  # forming the posterior (incl. mean) from the factorisation
     rec["per_sample_s"], _ = timeit(lambda: post.sample(1), sync, min_time=0.3, max_reps=5)
     batch = 4 if task.engine == "ngsolve" or task.method == "matheron" else 32
@@ -418,6 +426,7 @@ def run_posterior(task: Task, ctx: PosteriorContext, rec: dict):
 # ------------------------------------------------------------------ distributions suite
 
 DIST_SAMPLES = 400
+OUT_BATCH = 64  # batch of the in-place (out=) timing
 
 
 def _dist_args(args):
@@ -479,6 +488,11 @@ def run_distributions(task: Task, fes, rec: dict):
         rec["per_sample_s"], _ = timeit(lambda: dist.sample(8), sync, min_time=0.2, max_reps=3)
         rec["per_sample_s"] /= 8
         rec["overhead_vs_gauss"] = rec["per_sample_s"] / rec["gauss_per_sample_s"]
+        # in-place filling of a preallocated batch (out=): the path for large repeated batches
+        ref = dist.sample(2, output="torch")
+        buf = torch.empty((OUT_BATCH, *ref.shape[1:]), device=ref.device, dtype=ref.dtype)
+        rec["out_per_sample_s"], _ = timeit(lambda: dist.sample(out=buf), sync, min_time=0.2, max_reps=3)
+        rec["out_per_sample_s"] /= OUT_BATCH
         info = dist.info
         for key in ("law", "inversion", "chi_inversion", "standardisation", "points", "device", "gaussian_fields",
                     "mixing", "algorithm"):

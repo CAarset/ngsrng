@@ -12,7 +12,9 @@ the usual aliases ("gaussian", "chi2", "t", "student_t", torch.distributions-sty
 as a fallback, any scipy.stats distribution name with scipy's parameters).
 
 Output follows numpy: ``size=None`` gives one sample (a GridFunction for scalar fields), otherwise an array of shape
-(*size, nvalues, *event_shape). nvalues is the number of FE dofs for fields that are FE functions (normal,
+(*size, nvalues, *event_shape). ``out=`` fills a preallocated NumPy array or torch tensor of that shape in place (any
+float dtype, any device; ``size`` may then be omitted), batch by batch without full-size intermediates: the way to
+draw large batches repeatedly. nvalues is the number of FE dofs for fields that are FE functions (normal,
 Student-t process, type-G fields, white noise), and the number of quadrature points for pointwise-defined families in
 the default "quadrature" representation (``representation="projection"`` gives FE coefficients of the L2
 projection instead). Arrays are NumPy on the CPU and torch tensors on a GPU device (``output=`` overrides).
@@ -164,6 +166,26 @@ class _NormalField:
             return vals[:, 0] if n is None else vals
         return self._full(n)
 
+    def sample_into(self, rows) -> bool:
+        """Fill rows (k x ndof) with samples directly where possible: the CPU engine writes them from its threads
+        (float32 rows by casting the float64 coefficients), the torch engine on its device. Returns False otherwise
+        (the caller then copies from ``sample``)."""
+        g = self.gauss
+        if (self.trivial and self.evaluation is None and getattr(g, "engine", None) == "torch"
+                and rows.device == g.device and rows.dtype == g.dtype and hasattr(g, "_torch_rows")):
+            g._torch_rows(rows)  # GPU: written on the device, no transposed intermediate
+            return True
+        if (self.evaluation is not None or getattr(g, "engine", None) != "ngsolve" or not hasattr(g, "_ngs_rows")
+                or rows.device.type != "cpu" or rows.dtype not in (torch.float32, torch.float64)):
+            return False
+        if rows.shape[1] != g.space.ndof:
+            raise ValueError(f"out holds {rows.shape[1]} values per sample, normal gives {g.space.ndof}")
+        if self.trivial:
+            g._ngs_rows(rows.shape[0], rows.numpy())
+        else:
+            rows.copy_(torch.from_numpy(self._rows64(rows.shape[0])))  # float64: loc and scale exactly
+        return True
+
     def _full(self, n=None):
         g = self.gauss
         if n is None:
@@ -172,11 +194,21 @@ class _NormalField:
                 v = gf.vec.FV().NumPy()
                 v[:] = self.loc + self.scale * (v - g.mean)
             return gf
+        if not self.trivial and getattr(g, "engine", None) == "ngsolve" and hasattr(g, "_ngs_rows"):
+            return torch.from_numpy(self._rows64(int(n))).T.to(g.dtype)  # loc and scale applied in float64
         c = g.sample(int(n))
         if self.trivial:
             return c
         mean = torch.from_numpy(g.mean).to(c.device, c.dtype)[:, None]
         return torch.from_numpy(self.loc).to(c.device, c.dtype)[:, None] + self.scale * (c - mean)
+
+    def _rows64(self, n):
+        g = self.gauss
+        full = g._ngs_rows(n, np.empty((n, g.space.ndof)))
+        full -= g.mean
+        full *= self.scale
+        full += self.loc
+        return full
 
 
 class FieldDistribution:
@@ -189,8 +221,8 @@ class FieldDistribution:
     def info(self) -> dict:
         return self.field.info
 
-    def sample(self, size=None, output=None):
-        return self.generator._draw(self.field, size, output, self.name)
+    def sample(self, size=None, output=None, out=None):
+        return self.generator._draw(self.field, size, output, self.name, out=out)
 
     rvs = sample
 
@@ -437,7 +469,46 @@ class Generator:
 
     # ------------------------------------------------------------------ output
 
-    def _draw(self, field, size, output, name):
+    BATCH_VALUES = 2e7  # values per internal batch of ``out=`` draws (bounds the intermediates)
+
+    def _draw_into(self, field, size, name, out):
+        """Fill ``out`` (NumPy array or torch tensor, shape (*size, *value shape)) in place, batch by batch."""
+        target = torch.from_numpy(out) if isinstance(out, np.ndarray) else out
+        if not isinstance(target, torch.Tensor):
+            raise TypeError("out must be a NumPy array or a torch tensor")
+        if not target.is_contiguous():
+            raise ValueError("out must be contiguous")
+        if getattr(field, "representation", None) == "bernstein" and target.dtype != torch.float64:
+            raise ValueError("the Bernstein representation's range guarantee is about float64 coefficients: pass a "
+                             "float64 out")
+        if size is None:
+            shape = tuple(target.shape[:1])
+        else:
+            shape = (int(size),) if isinstance(size, numbers.Integral) else tuple(int(s) for s in size)
+            if tuple(target.shape[: len(shape)]) != shape:
+                raise ValueError(f"out has shape {tuple(target.shape)}, size is {shape}")
+        n = math.prod(shape)
+        flat = target.view(n, -1)
+        per = flat.shape[1]
+        # bound the output values and the Gaussian coefficients behind them (ndof per sample; values at a few points
+        # would otherwise put the whole batch's coefficients, and the solvers' work blocks, in memory at once)
+        ndof = getattr(getattr(field, "space", None), "ndof", 0)
+        batch = max(1, int(self.BATCH_VALUES // max(per, ndof, 1)))
+        for k0 in range(0, n, batch):
+            rows = flat[k0 : k0 + batch]
+            if hasattr(field, "sample_into") and field.sample_into(rows):
+                continue
+            vals = field.sample(rows.shape[0])
+            vals = vals if isinstance(vals, torch.Tensor) else torch.from_numpy(vals)
+            vals = vals.movedim(-1, 0).reshape(rows.shape[0], -1)
+            if vals.shape[1] != per:
+                raise ValueError(f"out holds {per} values per sample, {name} gives {vals.shape[1]}")
+            rows.copy_(vals)  # cast (and device transfer) in one pass
+        return out
+
+    def _draw(self, field, size, output, name, out=None):
+        if out is not None:
+            return self._draw_into(field, size, name, out)
         rep = getattr(field, "representation", None)
         # FE coefficients (projection, bernstein) are not values: no integer cast; bernstein stays in float64, since
         # its range guarantee is about these exact coefficients
@@ -464,10 +535,12 @@ class Generator:
         if output == "numpy":
             if isinstance(vals, torch.Tensor):
                 vals = vals.detach().cpu().numpy()
-            return vals.astype(np.int64 if discrete else torch.empty(0, dtype=dtype).numpy().dtype, copy=False)
+            # C order: samples are contiguous rows (internal arrays are often transposed views)
+            return vals.astype(np.int64 if discrete else torch.empty(0, dtype=dtype).numpy().dtype, order="C",
+                               copy=False)
         if output == "torch":
             t = torch.as_tensor(vals)
-            return t.to(self.device, torch.int64 if discrete else dtype)
+            return t.to(self.device, torch.int64 if discrete else dtype).contiguous()
         raise ValueError("output must be 'numpy' or 'torch'")
 
     # ------------------------------------------------------------------ public API
@@ -475,25 +548,26 @@ class Generator:
     def _split(self, name, args, kwargs):
         size = kwargs.pop("size", None)
         output = kwargs.pop("output", None)
+        out = kwargs.pop("out", None)
         k = _nparams(name)
         # numpy allows size as the positional argument after the parameters (scipy fallbacks: size by keyword only)
         if len(args) > k and not name.startswith("scipy:"):
             if size is not None or len(args) > k + 1:
                 raise TypeError(f"too many positional arguments for {name}()")
             args, size = args[:k], args[k]
-        return args, size, output
+        return args, size, output, out
 
     def sample(self, name, *args, **kwargs):
         """Draw from the named distribution: ``rng.sample("gamma", 2.0, size=10)`` == ``rng.gamma(2.0, size=10)``."""
         name = _canonical(name)
-        args, size, output = self._split(name, args, kwargs)
-        return self._draw(self._field(name, args, kwargs), size, output, name)
+        args, size, output, out = self._split(name, args, kwargs)
+        return self._draw(self._field(name, args, kwargs), size, output, name, out=out)
 
     def distribution(self, name, *args, **kwargs) -> FieldDistribution:
         """A frozen distribution (set-up done once): ``d = rng.distribution("beta", 2, 5); d.sample(100)``."""
         name = _canonical(name)
-        if "size" in kwargs or "output" in kwargs:
-            raise TypeError("pass size/output to FieldDistribution.sample")
+        if "size" in kwargs or "output" in kwargs or "out" in kwargs:
+            raise TypeError("pass size/output/out to FieldDistribution.sample")
         return FieldDistribution(self, name, self._field(name, args, kwargs))
 
     def info(self, name, *args, **kwargs) -> dict:

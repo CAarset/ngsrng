@@ -159,3 +159,34 @@ def test_posterior_from_local_averages_is_exact():
     _, sp_ = _dense_posterior(prior, g, np.eye(obs.m) / 0.01)
     assert obs.m == 9
     assert covariance_errors(sampler_covariance(obs.posterior()), sp_)["rel_fro"] < 1e-9
+
+
+@pytest.mark.parametrize("form", ["fe", "noise"])
+def test_noise_scaling_equals_rescaled_noise(form):
+    """posterior(noise_scaling=w) is the posterior with noise variances sigma^2 / w (w = 0: observation ignored)."""
+    fes = ngs.H1(ngs.Mesh(ngs.unit_square.GenerateMesh(maxh=0.25)), order=1)
+    prior = ngsrng.Gaussian(fes, ngsrng.matern(kappa=6.0, power=2), dtype=torch.float64, seed=0)
+    pts = np.random.default_rng(0).uniform(0.1, 0.9, (8, 2))
+    data = np.random.default_rng(1).standard_normal(8)
+    w = np.array([1.0, 0.5, 2.0, 0.0, 1.0, 3.0, 0.1, 1.0])
+    obs = ngsrng.LinearObservations(prior, points=pts, noise=0.04)
+    scaled = obs.posterior(data=data, noise_scaling=w, form=form)
+    keep = w > 0
+    ref = ngsrng.LinearObservations(prior, points=pts[keep], noise=0.04 / w[keep]).posterior(data=data[keep])
+    np.testing.assert_allclose(scaled.mean, ref.mean, atol=1e-10)
+    np.testing.assert_allclose(sampler_covariance(scaled), sampler_covariance(ref), atol=1e-10)
+    with pytest.raises(ValueError):
+        obs.posterior(noise_scaling=-w)
+
+
+def test_posterior_with_given_mean_keeps_the_covariance():
+    fes = ngs.H1(ngs.Mesh(ngs.unit_square.GenerateMesh(maxh=0.25)), order=1)
+    prior = ngsrng.Gaussian(fes, ngsrng.matern(kappa=6.0, power=2), dtype=torch.float64, seed=0)
+    obs = ngsrng.LinearObservations(prior, points=np.random.default_rng(0).uniform(0.1, 0.9, (6, 2)), noise=0.04)
+    centre = np.random.default_rng(1).standard_normal(fes.ndof)
+    post = obs.posterior(mean=centre, noise_scaling=np.full(6, 2.0))
+    np.testing.assert_allclose(post.mean, centre)
+    reference = obs.posterior(noise_scaling=np.full(6, 2.0))
+    np.testing.assert_allclose(sampler_covariance(post), sampler_covariance(reference), atol=1e-12)
+    with pytest.raises(ValueError):
+        obs.posterior(data=np.zeros(6), mean=centre)

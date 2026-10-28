@@ -12,9 +12,12 @@ from . import noise as nz
 from . import tuning as tn
 from .backend import (
     NormalStream,
+    Scratch,
+    available_threads,
     make_generator,
     ngs_sparse,
     numpy_blas_threads,
+    parallel_ranges,
     resolve_device,
     resolve_dtype,
     sparse_to_torch,
@@ -194,8 +197,9 @@ class Gaussian:
         else:
             self.noise.ngs_setup(s)
             self._ngs_mass = ngs_sparse(s.mass) if self.n_mass_steps else None
-            self._eta = ngs.la.BaseVector(self.nrand)
-            self._z, self._c, self._tmp = (ngs.la.BaseVector(s.ndof) for _ in range(3))
+            # work vectors (eta, z, c, tmp, result) per thread: samples run in parallel threads
+            self._work = Scratch(lambda: (ngs.la.BaseVector(self.nrand),
+                                          *(ngs.la.BaseVector(s.ndof) for _ in range(4))))
         self._maps = []  # noise-space maps, applied to eta before the pipeline
         self._post_maps = []  # FE-space maps, applied to the pipeline's output
         # NumPy BLAS threads inside the NGSolve engine (see backend.numpy_blas_threads); None = unchanged.
@@ -275,7 +279,10 @@ class Gaussian:
         if choice == "cudss":
             if self.device.type != "cuda":
                 raise ValueError("cudss needs a CUDA device")
-            return CudssDirect(s.assemble_free(form), self.device, self._work_dtype)
+            # right-hand sides per cuDSS call (each width keeps its own factorisation); larger widths amortise the
+            # call overhead of big batches
+            return CudssDirect(s.assemble_free(form), self.device, self._work_dtype,
+                               width=int(self.method.get("cudss_width", 32)))
         if choice == "torch-pcg":
             if self.engine != "torch":
                 raise ValueError("torch-pcg needs the torch engine")
@@ -305,18 +312,65 @@ class Gaussian:
     def nrand(self) -> int:
         return self.noise.nrand
 
-    def _ngs_one(self, out):
-        """Run the CPU pipeline on self._eta; writes the zero-mean full-dof sample into ``out`` (BaseVector)."""
+    def _ngs_one(self, work, out):
+        """Run the CPU pipeline on the noise in work[0]; writes the zero-mean full-dof sample into ``out``."""
+        eta, z, c, tmp = work[:4]
         for m in reversed(self._maps):
-            m.apply_ngs(self._eta)
-        self.noise.ngs_apply(self._eta, self._z)
-        self.first.ngs_apply(self._z, self._c)
+            m.apply_ngs(eta)
+        self.noise.ngs_apply(eta, z)
+        self.first.ngs_apply(z, c)
         for _ in range(self.n_mass_steps):
-            self._tmp.data = self._ngs_mass * self._c
-            self.solver.ngs_apply(self._tmp, self._c)
-        out.data = self.scale * self._c
+            tmp.data = self._ngs_mass * c
+            self.solver.ngs_apply(tmp, c)
+        out.data = self.scale * c
         for pm in self._post_maps:
             pm.apply_ngs(out)
+
+    @property
+    def _threads(self) -> int:
+        """Threads for batches in the CPU engine: one sample per thread at a time. Below ~1000 dofs a sample is too
+        cheap for threads to pay off (the per-sample Python work holds the GIL)."""
+        if "threads" in self.method:
+            return max(1, int(self.method["threads"]))
+        return available_threads() if self.space.ndof >= 1000 else 1
+
+    def _ngs_rows(self, n, out, *, eta=None, free_only=False, evaluate=None, add_mean=True):
+        """CPU engine: n samples, row k of ``out`` (n x width, float32 or float64) for sample k.
+
+        A row is the coefficient vector (plus the mean unless ``add_mean=False``), its free part (``free_only``), or
+        ``evaluate`` (an NGSolve matrix, e.g. point evaluation) applied to it. ``eta`` (nrand x n) replaces fresh
+        noise. Samples run in parallel threads; sample k uses the k-th reserved key of the normal stream, so results
+        equal a sequential loop of single samples, for any number of threads.
+        """
+        key0 = self.stream.reserve(n) if eta is None else None
+        mean, free = self._mean, self.space.free
+
+        def work(lo, hi):
+            w = self._work.get()
+            e, res = w[0].FV().NumPy(), w[4]
+            r = res.FV().NumPy()
+            ev = evaluate.CreateColVector() if evaluate is not None else None
+            for k in range(lo, hi):
+                if eta is None:
+                    self.stream.fill_keyed(e, key0 + k)
+                else:
+                    e[:] = eta[:, k]
+                self._ngs_one(w, res)
+                if add_mean:
+                    r += mean
+                if ev is not None:
+                    ev.data = evaluate * res
+                    out[k] = ev.FV().NumPy()
+                else:
+                    out[k] = r[free] if free_only else r
+
+        with numpy_blas_threads(self._cpu_blas_threads):
+            if n == 1:
+                with ngs.TaskManager():  # a single sample: NGSolve's task parallelism inside (agrees with batches
+                    work(0, n)           # to rounding: its parallel kernels sum in a different order)
+            else:
+                parallel_ranges(n, work, self._threads)  # any thread count gives identical results
+        return out
 
     def apply(self, eta: torch.Tensor) -> torch.Tensor:
         """Map standard normal eta (nrand x k) to zero-mean free-dof coefficients (nfree x k)."""
@@ -333,14 +387,9 @@ class Gaussian:
             return c
         squeeze = eta.ndim == 1
         e = (eta[:, None] if squeeze else eta).detach().cpu().double().numpy()
-        out = np.empty((self.space.nfree, e.shape[1]))
-        res = ngs.la.BaseVector(self.space.ndof)
-        with ngs.TaskManager(), numpy_blas_threads(self._cpu_blas_threads):
-            for k in range(e.shape[1]):
-                self._eta.FV().NumPy()[:] = e[:, k]
-                self._ngs_one(res)
-                out[:, k] = res.FV().NumPy()[self.space.free]
-        t = torch.from_numpy(out)
+        rows = self._ngs_rows(e.shape[1], np.empty((e.shape[1], self.space.nfree)), eta=e, free_only=True,
+                              add_mean=False)
+        t = torch.from_numpy(rows.T)
         return t[:, 0] if squeeze else t
 
     def apply_t(self, y: torch.Tensor) -> torch.Tensor:
@@ -445,30 +494,30 @@ class Gaussian:
         ns = 1 if n is None else int(n)
         if self.engine == "torch":
             return self._sample_torch(n, ns, out)
-        gf = ngs.GridFunction(self.space.fes)
+        rows = self._ngs_rows(ns, np.empty((ns, self.space.ndof)))
         if n is None:
-            vecs = [gf.vec]
-        elif out == "multivector":
-            mv = ngs.MultiVector(gf.vec, ns)
-            vecs = [mv[k] for k in range(ns)]
-        else:
-            arr = np.empty((ns, self.space.ndof))
-            res = ngs.la.BaseVector(self.space.ndof)
-            vecs = [res] * ns
-        eta_np = self._eta.FV().NumPy()
-        with ngs.TaskManager(), numpy_blas_threads(self._cpu_blas_threads):
-            for k, v in enumerate(vecs):
-                self.stream.fill(eta_np)
-                self._ngs_one(v)
-                vn = v.FV().NumPy()
-                vn += self._mean
-                if n is not None and out != "multivector":
-                    arr[k] = vn
-        if n is None:
+            gf = ngs.GridFunction(self.space.fes)
+            gf.vec.FV().NumPy()[:] = rows[0]
             return gf
         if out == "multivector":
+            mv = ngs.MultiVector(ngs.GridFunction(self.space.fes).vec, ns)
+            for k in range(ns):
+                mv[k].FV().NumPy()[:] = rows[k]
             return mv
-        return torch.from_numpy(arr).T.to(self.dtype)
+        return torch.from_numpy(rows).T.to(self.dtype)
+
+    def _torch_rows(self, rows):
+        """Torch engine: fill rows (k x ndof, on the device, in self.dtype) with samples, without the transposed
+        intermediate of ``sample``; same random numbers and arithmetic as ``sample(k)``."""
+        k = rows.shape[0]
+        eta = torch.randn(self.nrand, k, generator=self.generator, device=self.device, dtype=self._work_dtype)
+        c = self.apply(eta).to(self.dtype)
+        if not hasattr(self, "_mean_t") or self._mean_t.dtype != self.dtype:
+            self._mean_t = torch.from_numpy(self._mean).to(self.device, self.dtype)
+            self._free_t = torch.from_numpy(self.space.free).to(self.device)
+        rows.copy_(self._mean_t.expand(k, -1))
+        rows[:, self._free_t] += c.T
+        return rows
 
     def _sample_torch(self, n, ns, out):
         eta = torch.randn(self.nrand, ns, generator=self.generator, device=self.device, dtype=self._work_dtype)

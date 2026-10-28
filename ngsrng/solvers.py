@@ -8,7 +8,7 @@ import scipy.sparse as sp
 import torch
 from ngsolve.krylovspace import CGSolver
 
-from .backend import sparse_to_torch
+from .backend import Scratch, parallel_ranges, sparse_to_torch
 from .space import SpaceInfo
 
 
@@ -24,24 +24,37 @@ class Solver:
 
 
 class _NGSolveBase(Solver):
+    threadsafe = True  # concurrent solves on separate vectors (checked against sequential results in the tests)
+
     def __init__(self, space: SpaceInfo, form):
         self.space = space
         self.form = form
         self._vin = None
+        self._vectors = Scratch(lambda: (self.mat.CreateColVector(), self.mat.CreateColVector()))
 
     def _columns(self, x, solve_one):
+        """Solve column by column; columns are spread over threads (NGSolve releases the GIL), or, for a single
+        column, solved with NGSolve's own task parallelism."""
         squeeze = x.ndim == 1
         xs = (x[:, None] if squeeze else x).detach().to("cpu", torch.float64).numpy()
-        free, out = self.space.free, np.empty_like(xs)
-        rhs, sol = self.mat.CreateColVector(), self.mat.CreateColVector()
-        rhs_np, sol_np = rhs.FV().NumPy(), sol.FV().NumPy()
-        with ngs.TaskManager():
-            for k in range(xs.shape[1]):
+        free = self.space.free
+        out = np.empty((xs.shape[1], xs.shape[0]))  # rows: contiguous writes from the threads
+
+        def work(lo, hi):
+            rhs, sol = self._vectors.get()
+            rhs_np, sol_np = rhs.FV().NumPy(), sol.FV().NumPy()
+            for k in range(lo, hi):
                 rhs_np[:] = 0.0
                 rhs_np[free] = xs[:, k]
                 solve_one(rhs, sol)
-                out[:, k] = sol_np[free]
-        res = torch.from_numpy(out).to(device=x.device, dtype=x.dtype)
+                out[k] = sol_np[free]
+
+        if xs.shape[1] == 1 or not self.threadsafe:
+            with ngs.TaskManager():
+                work(0, xs.shape[1])
+        else:
+            parallel_ranges(xs.shape[1], work)
+        res = torch.from_numpy(out.T).to(device=x.device, dtype=x.dtype)
         return res[:, 0] if squeeze else res
 
 
@@ -70,6 +83,7 @@ class NGSolveCG(_NGSolveBase):
     """Preconditioned CG with an NGSolve preconditioner (bddc, h1amg, multigrid, local)."""
 
     exact = False
+    threadsafe = False  # NGSolve preconditioners are not verified for concurrent application
 
     def __init__(self, space: SpaceInfo, form, precond="bddc", tol=1e-10, maxiter=5000):
         super().__init__(space, form)
@@ -163,13 +177,17 @@ class CudssDirect(Solver):
     def apply(self, x):
         squeeze = x.ndim == 1
         x = (x[:, None] if squeeze else x).to(self.dtype)
-        cols, k = [], x.shape[1]
-        full = (k // self.width) * self.width
-        for start in range(0, full, self.width):
-            cols.append(self._solve(x[:, start : start + self.width]))
-        for j in range(full, k):
-            cols.append(self._solve(x[:, j : j + 1]))
-        out = torch.cat(cols, dim=1)
+        k = x.shape[1]
+        out = torch.empty(self.n, k, device=self.device, dtype=self.dtype)
+        for start in range(0, k, self.width):
+            block = x[:, start : start + self.width]
+            r = block.shape[1]
+            if r == self.width or r == 1:
+                out[:, start : start + r] = self._solve(block)
+            else:  # a remainder: zero-padded to the full width, one call (column by column was up to 25x slower)
+                padded = torch.zeros(self.n, self.width, device=self.device, dtype=self.dtype)
+                padded[:, :r] = block
+                out[:, start : start + r] = self._solve(padded)[:, :r]
         return out[:, 0] if squeeze else out
 
     def __del__(self):
@@ -242,14 +260,15 @@ class RationalSolver(Solver):
 
     def ngs_apply(self, rhs, out):
         if self._tmp is None:
-            self._tmp = rhs.CreateVector()
+            self._tmp = Scratch(rhs.CreateVector)  # per thread
+        tmp = self._tmp.get()
         out[:] = 0.0
         if self.rational.c0:
-            self.mass_inv.ngs_apply(rhs, self._tmp)
-            out.data += float(self.rational.c0) * self._tmp
+            self.mass_inv.ngs_apply(rhs, tmp)
+            out.data += float(self.rational.c0) * tmp
         for c, sv in zip(self.rational.coeffs, self.shifted):
-            sv.ngs_apply(rhs, self._tmp)
-            out.data += float(c) * self._tmp
+            sv.ngs_apply(rhs, tmp)
+            out.data += float(c) * tmp
 
     def info(self):
         r = self.rational
