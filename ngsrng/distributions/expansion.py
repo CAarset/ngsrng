@@ -58,8 +58,7 @@ class KLField(_FEField):
                             f"(covariance exactly {cov})",
                      "gaussian": gauss.plan, "kl": kl.plan.get("structure", "")}
 
-    def sample(self, n=None):
-        ns = 1 if n is None else int(n)
-        xi = np.asarray(self.law(self.rng, (self.rank, ns)), dtype=float)
-        return self._finish(torch.from_numpy(self.scaled_modes @ xi), n)
+    def _coefficients(self, ns):
+        xi = np.asarray(self.law(self.rng, (ns, self.rank)), dtype=float).T  # sample by sample
+        return torch.from_numpy(self.scaled_modes @ xi)
 

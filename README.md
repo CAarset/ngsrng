@@ -144,6 +144,15 @@ following:
 13. **Large batches:** on the CPU, samples are computed in parallel threads (one sample per thread; set the number
     with `method={"threads": k}`). Results do not depend on the number of threads. A batch and the same samples drawn
     one at a time agree to rounding (about 1e-14 relative), not bit for bit.
+14. **In-place sampling:** every sampler has an in-place form next to the allocating one, as torch has `normal_`
+    next to `normal`: `rng.<family>(..., out=buf)`, `rng.distribution(...).sample(out=buf)`, and
+    `Gaussian.sample(n, out=buf)` / `LowRankGaussian.sample(n, out=buf)` / `MatheronPosterior.sample(n, out=buf)` for
+    an (ndof x n) buffer. Refilling one buffer takes no memory proportional to the batch: the work runs in chunks of
+    `work_values` values (`default_rng(..., work_values=...)`; 2^20 on the CPU, 2^24 on a GPU), and on the CPU each
+    sample of a Gaussian field is written into its row by its worker thread. Refilling a 57 MB float32 buffer on a
+    2D P1 mesh added 0, 31, 67 and 0 MB at peak for normal(loc, scale), uniform, gamma and chi-square (114, 471,
+    1112 and 407 MB before this was introduced). On the CPU the result does not depend on the chunk size or the
+    thread count (to rounding for low-rank models and FE coefficients).
 
 #### Distributions, algorithms, accuracy and speed
 Speed is the cost of one sample relative to one sample of the underlying Gaussian field. It comes from a preliminary
@@ -219,6 +228,8 @@ from ngsrng.posterior import LinearObservations
 obs = LinearObservations(prior, averages=(centers, 0.05), functionals=[flux_form], noise=1e-4)
 post = obs.posterior(data=y)  # exact; a Gaussian with the prior's pipeline + a low-rank update
 post.sample(100)  # costs about one prior sample each
+# set-up keeps dense nrand x m and nfree x m factors (m observations): it raises MemoryError up front when they do not
+# fit, and LinearObservations(..., rank=k) is the randomised low-rank alternative
 
 post = prior.downdate(B, K)  # a known posterior C0 - B K^-1 B*, given directly
 
@@ -339,3 +350,8 @@ python bench/gpu_batch.py                     # GPU: batches of 5000 normal/logn
 python -m pytest                  # GPU tests are skipped automatically without a usable CUDA device
 ruff check . && ruff format .     # lint and formatting (configured in pyproject.toml)
 ```
+
+**Every sampler must have an in-place form** ([ngsrng/inplace.py](ngsrng/inplace.py)): inherit `InPlace` (chunked
+`sample` calls) or implement a direct `sample_into(rows)`, draw randomness sample by sample, and add new families to
+`ARGS` in `tests/test_inplace.py`. That test fails for any registered family whose `out=` fill differs from the
+allocating call, and for any class with a `sample` method but no in-place form.

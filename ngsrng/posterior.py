@@ -31,12 +31,30 @@ import scipy.linalg as sla
 import scipy.sparse as sp
 import torch
 
-from .backend import Scratch, numpy_blas_threads
+from .backend import Scratch, available_memory, numpy_blas_threads
+from .inplace import InPlace
 from .observations import CHUNK, observation_operator, whiten, whitener
 from .randomized import randomized_qr
 from .space import coefficient_columns, coefficient_vector
 
 # ------------------------------------------------------------------ low-rank update maps
+
+
+def check_memory(prior, columns, rows_per_column, what, hint):
+    """Raise MemoryError before a set-up allocates ``columns`` dense float64 columns of ``rows_per_column`` entries in
+    total (e.g. 3 nrand + 2 nfree per observation for an exact posterior) beyond the available host memory, and, for
+    a prior on a CUDA device, its F^T and Q (2 nrand per column) beyond the free device memory."""
+    need = 8.0 * columns * rows_per_column
+    avail = available_memory()
+    if avail is not None and need > avail:
+        raise MemoryError(f"{what} needs ~{need / 2**30:.1f} GiB of dense low-rank factors ({columns} columns), "
+                          f"{avail / 2**30:.1f} GiB available. {hint}")
+    device = getattr(prior, "device", None)
+    if getattr(prior, "engine", None) == "torch" and device is not None and device.type == "cuda":
+        dev_need, dev_free = 16.0 * columns * prior.nrand, torch.cuda.mem_get_info(device)[0]
+        if dev_need > dev_free:
+            raise MemoryError(f"{what} needs ~{dev_need / 2**30:.1f} GiB on {device}, {dev_free / 2**30:.1f} GiB "
+                              f"free. {hint}")
 
 
 class NoiseSpaceMap:
@@ -200,6 +218,14 @@ class LinearObservations:
         self._lq = None
         if not factorize:  # observation operator only (e.g. for MatheronPosterior)
             return
+        # dense blocks of the set-up (columns: observations, or the sketch width): F^T, its Q factor and Q U
+        # (nrand each), L Q and its NGSolve/torch copy for the FE-space form (nfree each)
+        width = self.m if rank is None else min(self.m, int(rank) + int(oversampling))
+        check_memory(prior, width, 3 * prior.nrand + 2 * s.nfree,
+                     "the exact posterior" if rank is None else f"the rank-{rank} posterior",
+                     "Use rank=k (randomised low rank: (2q+2)(k+oversampling) applications of L, error set by the "
+                     "decay of the data-informed spectrum), or fewer observations." if rank is None else
+                     "Use a smaller rank.")
         if rank is None:
             ft = self._lt(gh.T)  # F^T = L^T G^T Gamma^-T/2 (nrand x m)
             q, r = torch.linalg.qr(ft)
@@ -235,14 +261,18 @@ class LinearObservations:
         return self.q.shape[1]
 
     def _lt(self, x) -> torch.Tensor:
-        """L^T x, CHUNK columns at a time; x dense or sparse (densified one chunk at a time)."""
+        """L^T x (float64), CHUNK columns at a time into one preallocated result; x dense or sparse (densified one
+        chunk at a time)."""
         x = x.tocsc() if sp.issparse(x) else x
-        cols = []
+        out = None
         for i in range(0, x.shape[1], CHUNK):
             blk = x[:, i : i + CHUNK]
             blk = blk.toarray() if sp.issparse(blk) else np.ascontiguousarray(blk)
-            cols.append(self.prior.apply_t(torch.from_numpy(blk)))
-        return torch.cat(cols, dim=1).double()
+            col = self.prior.apply_t(torch.from_numpy(blk))
+            if out is None:
+                out = torch.empty((col.shape[0], x.shape[1]), dtype=torch.float64, device=col.device)
+            out[:, i : i + col.shape[1]] = col
+        return out
 
     def _l(self, eta: np.ndarray) -> np.ndarray:
         cols = [
@@ -355,7 +385,7 @@ def downdate(prior, b, k, mean=None, seed=None, tol=1e-8):
 # ------------------------------------------------------------------ (3) pathwise (Matheron) conditioning
 
 
-class MatheronPosterior:
+class MatheronPosterior(InPlace):
     """Exact posterior sampler by pathwise conditioning, independent of the noise-space construction:
 
         f_post = f0 + B K_d^-1 (y + e - G f0),   f0 ~ prior,  e ~ N(0, Gamma),
@@ -366,6 +396,8 @@ class MatheronPosterior:
 
     def __init__(self, obs: LinearObservations, data=None, seed=None):
         prior, s = obs.prior, obs.prior.space
+        check_memory(prior, obs.m, prior.nrand + 2 * s.nfree, "Matheron conditioning",
+                     "Use LinearObservations(..., rank=k).posterior() for many observations.")
         g = obs.gf  # sparse (m x nfree)
         gamma = np.diag(1.0 / obs.wdata**2) if obs.wkind == "diag" else np.asarray(obs.noise, dtype=float)
         lt = obs._lt(g.T)
@@ -410,9 +442,13 @@ class MatheronPosterior:
         out = torch.cat([top, torch.from_numpy(self.gamma_half.T @ w)], dim=0)
         return out[:, 0] if y.ndim == 1 else out
 
-    def sample(self, n=None):
+    def sample(self, n=None, out=None):
+        """One sample (GridFunction) or n samples (ndof x n). ``out``: an ndof x n buffer filled in place and returned
+        (:mod:`ngsrng.inplace`)."""
+        if out is not None:
+            return self._sample_out(n, out)
         ns = 1 if n is None else int(n)
-        eta = torch.from_numpy(self.rng.standard_normal((self.nrand, ns)))
+        eta = torch.from_numpy(self.rng.standard_normal((ns, self.nrand)).T)  # sample by sample
         x = np.repeat(self._mean[:, None], ns, axis=1)
         x[self.space.free] += self.apply(eta).numpy()
         if n is None:

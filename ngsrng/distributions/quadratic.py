@@ -57,7 +57,10 @@ class _Copies(PointwiseField):
             g = p.draw(n * self.copies, dev)
             std = p._torch_ops()[2] if dev else p.std
             z = g / std[:, None]
-        return z.reshape(p.npoints, self.copies, n), XP(dev)
+        # draw j = sample * copies + copy: a sample's copies are consecutive draws, so its values do not depend on
+        # how a batch is split into chunks (in-place fills)
+        z = z.reshape(p.npoints, n, self.copies)
+        return (z.transpose(1, 2) if dev else z.swapaxes(1, 2)), XP(dev)
 
 
 class ChiSquareField(_Copies):

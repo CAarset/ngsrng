@@ -247,6 +247,7 @@ class DirichletField(PointwiseField):
         cache = {}
         self.inv = [cache.setdefault(a, Inversion(st.gamma(a), method=method, tol=tol)) for a in self.alpha]
         self.torch_capable = all(i.torch_capable for i in self.inv)
+        self.copies = len(self.alpha)  # Gaussian fields per sample
 
     @property
     def info(self) -> dict:
@@ -260,7 +261,7 @@ class DirichletField(PointwiseField):
     def _values(self, n):
         dev = self.on_device
         k = len(self.alpha)
-        z = self.points.standardized(n * k, dev).reshape(self.points.npoints, k, n)
+        z = self.points.standardized(n * k, dev).reshape(self.points.npoints, n, k)  # a sample's k draws in a row
         xp = XP(dev)
-        g = xp.m.stack([self.inv[j](z[:, j, :], xp) for j in range(k)], 1)
+        g = xp.m.stack([self.inv[j](z[:, :, j], xp) for j in range(k)], 1)
         return g / g.sum(1, keepdims=True) if not xp.torch else g / g.sum(1, keepdim=True)

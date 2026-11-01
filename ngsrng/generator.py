@@ -32,7 +32,7 @@ import numpy as np
 import scipy.stats as st
 import torch
 
-from .backend import resolve_device, resolve_dtype
+from .backend import ngs_sparse, resolve_device, resolve_dtype
 from .correlation import MaternCorrelation, matern
 from .distributions.bernstein import BernsteinForm
 from .distributions.expansion import KLField
@@ -49,6 +49,7 @@ from .distributions.transforms import (
     transformed,
 )
 from .gaussian import Gaussian, check_method
+from .inplace import InPlace, as_tensor, chunks, default_work_values
 from .lowrank import LowRankGaussian, karhunen_loeve
 from .observations import observation_operator
 from .posterior import MatheronPosterior
@@ -135,7 +136,7 @@ def _as_spec(key, value):
     return value
 
 
-class _NormalField:
+class _NormalField(InPlace):
     """loc + scale (g - mean_g): an exact FE-space Gaussian (scale must be a number), optionally evaluated at
     ``points``."""
 
@@ -160,31 +161,49 @@ class _NormalField:
                      "gaussian": gauss.plan}
 
     def sample(self, n=None):
-        if self.evaluation is not None:
-            full = self._full(1 if n is None else n)
-            vals = self.evaluation @ full.double().cpu().numpy()
-            return vals[:, 0] if n is None else vals
-        return self._full(n)
-
-    def sample_into(self, rows) -> bool:
-        """Fill rows (k x ndof) with samples directly where possible: the CPU engine writes them from its threads
-        (float32 rows by casting the float64 coefficients), the torch engine on its device. Returns False otherwise
-        (the caller then copies from ``sample``)."""
-        g = self.gauss
-        if (self.trivial and self.evaluation is None and getattr(g, "engine", None) == "torch"
-                and rows.device == g.device and rows.dtype == g.dtype and hasattr(g, "_torch_rows")):
-            g._torch_rows(rows)  # GPU: written on the device, no transposed intermediate
-            return True
-        if (self.evaluation is not None or getattr(g, "engine", None) != "ngsolve" or not hasattr(g, "_ngs_rows")
-                or rows.device.type != "cpu" or rows.dtype not in (torch.float32, torch.float64)):
-            return False
-        if rows.shape[1] != g.space.ndof:
-            raise ValueError(f"out holds {rows.shape[1]} values per sample, normal gives {g.space.ndof}")
-        if self.trivial:
-            g._ngs_rows(rows.shape[0], rows.numpy())
+        if self.evaluation is None:
+            return self._full(n)
+        ns = 1 if n is None else int(n)
+        if getattr(self.gauss, "engine", None) == "ngsolve":  # float64 coefficients evaluated in the worker threads
+            vals = self.gauss._ngs_rows(ns, np.empty((ns, self.evaluation.shape[0])), evaluate=self._ngs_evaluation(),
+                                        add_mean=self.trivial, transform=None if self.trivial else self._affine).T
         else:
-            rows.copy_(torch.from_numpy(self._rows64(rows.shape[0])))  # float64: loc and scale exactly
-        return True
+            vals = self.evaluation @ self._full(ns).double().cpu().numpy()
+        return vals[:, 0] if n is None else vals
+
+    def sample_into(self, rows):
+        """Fill rows (k x ndof, or k x npoints with ``points``) in place (:mod:`ngsrng.inplace`). The CPU engine's
+        worker threads write every sample straight into its row (loc, scale and the point evaluation in float64,
+        one cast at the end); the torch engine writes on its device; other Gaussians work in chunks."""
+        g = self.gauss
+        rows = as_tensor(rows)
+        width = g.space.ndof if self.evaluation is None else self.evaluation.shape[0]
+        if rows[0].numel() != width:
+            raise ValueError(f"out holds {rows[0].numel()} values per sample, normal gives {width}")
+        rows = rows if rows.ndim == 2 else rows.view(rows.shape[0], width)
+        engine = getattr(g, "engine", None)
+        if engine == "ngsolve" and rows.device.type == "cpu" and rows.dtype in (torch.float32, torch.float64):
+            g._ngs_rows(rows.shape[0], rows.numpy(), evaluate=self._ngs_evaluation(), add_mean=self.trivial,
+                        transform=None if self.trivial else self._affine)
+            return rows
+        if engine == "torch" and self.evaluation is None and rows.device == g.device and rows.dtype == g.dtype:
+            loc = None if self.trivial else torch.from_numpy(self.loc).to(rows.device, rows.dtype)
+            for k0, k1 in chunks(rows.shape[0], self._per_sample(), self.work_values):
+                g._torch_rows(rows[k0:k1], loc=loc, scale=self.scale)
+            return rows
+        return super().sample_into(rows)
+
+    def _affine(self, r):
+        """loc + scale c for a zero-mean coefficient vector c, in place (float64, in the worker thread)."""
+        r *= self.scale
+        r += self.loc
+
+    def _ngs_evaluation(self):
+        if self.evaluation is None:
+            return None
+        if getattr(self, "_ngs_eval", None) is None:
+            self._ngs_eval = ngs_sparse(self.evaluation)
+        return self._ngs_eval
 
     def _full(self, n=None):
         g = self.gauss
@@ -204,11 +223,7 @@ class _NormalField:
 
     def _rows64(self, n):
         g = self.gauss
-        full = g._ngs_rows(n, np.empty((n, g.space.ndof)))
-        full -= g.mean
-        full *= self.scale
-        full += self.loc
-        return full
+        return g._ngs_rows(n, np.empty((n, g.space.ndof)), add_mean=False, transform=self._affine)
 
 
 class FieldDistribution:
@@ -222,6 +237,7 @@ class FieldDistribution:
         return self.field.info
 
     def sample(self, size=None, output=None, out=None):
+        """``out``: a buffer (*size, *value shape) filled in place and returned (:mod:`ngsrng.inplace`)."""
         return self.generator._draw(self.field, size, output, self.name, out=out)
 
     rvs = sample
@@ -256,11 +272,13 @@ class Generator:
         standardise with the prior's mean and std, so that e.g. ``uniform(correlation=post)`` is the posterior of the
         prior's uniform field; "own" uses the posterior's copula only
     output : None (NumPy on the CPU, torch on a GPU) | "numpy" | "torch"
+    work_values : values per internal chunk when filling ``out=`` buffers in place (bounds the transient memory;
+        default 2^20 on the CPU, 2^24 on a GPU, where larger chunks batch better), see :mod:`ngsrng.inplace`
     """
 
     def __init__(self, fes, seed=None, *, correlation=None, precision=None, covariance=None, device="cpu", dtype=None,
                  method=None, tol=1e-8, representation="quadrature", std="auto", order=None, output=None,
-                 standardize_by="prior"):
+                 standardize_by="prior", work_values=None):
         self.fes = fes
         self.seed_sequence = seed if isinstance(seed, np.random.SeedSequence) else np.random.SeedSequence(seed)
         given = [(k, v) for k, v in zip(CORRELATION_KEYS, (correlation, precision, covariance)) if v is not None]
@@ -272,6 +290,7 @@ class Generator:
         self.method, self.tol = (None if method is None else check_method(method)), tol
         self.representation, self.std, self.order, self.output = representation, std, order, output
         self.standardize_by = standardize_by
+        self.work_values = default_work_values(self.device) if work_values is None else int(work_values)
         self._np = np.random.default_rng(self.seed_sequence.spawn(1)[0])
         self._gaussians, self._points, self._fields, self._bernstein = {}, {}, {}, {}
 
@@ -284,7 +303,8 @@ class Generator:
         """n independent child generators with the same settings (numpy's ``Generator.spawn``)."""
         return [Generator(self.fes, s, correlation=self.correlation, device=self.device, dtype=self.dtype,
                           method=self.method, tol=self.tol, representation=self.representation, std=self.std,
-                          order=self.order, output=self.output, standardize_by=self.standardize_by)
+                          order=self.order, output=self.output, standardize_by=self.standardize_by,
+                          work_values=self.work_values)
                 for s in self.seed_sequence.spawn(n)]
 
     def gaussian(self, correlation=None, precision=None, covariance=None):
@@ -368,6 +388,7 @@ class Generator:
         if key not in self._fields:  # values are kept alive with the entry, so identity keys stay valid
             field = self._build(name, args, dict(kwargs), corr, dict(opts))
             field.out_dtype = torch.empty(0, dtype=self.dtype).numpy().dtype  # bounded families clamp in it
+            field.work_values = self.work_values  # chunk size of in-place fills (out=)
             self._fields[key] = ((args, kwargs, corr, opts), field)
         return self._fields[key][1]
 
@@ -469,13 +490,10 @@ class Generator:
 
     # ------------------------------------------------------------------ output
 
-    BATCH_VALUES = 2e7  # values per internal batch of ``out=`` draws (bounds the intermediates)
-
     def _draw_into(self, field, size, name, out):
-        """Fill ``out`` (NumPy array or torch tensor, shape (*size, *value shape)) in place, batch by batch."""
-        target = torch.from_numpy(out) if isinstance(out, np.ndarray) else out
-        if not isinstance(target, torch.Tensor):
-            raise TypeError("out must be a NumPy array or a torch tensor")
+        """Fill ``out`` (NumPy array or torch tensor, shape (*size, *value shape)) in place: ``field.sample_into``,
+        which works in chunks of ``work_values`` values (:mod:`ngsrng.inplace`)."""
+        target = as_tensor(out)
         if not target.is_contiguous():
             raise ValueError("out must be contiguous")
         if getattr(field, "representation", None) == "bernstein" and target.dtype != torch.float64:
@@ -487,23 +505,7 @@ class Generator:
             shape = (int(size),) if isinstance(size, numbers.Integral) else tuple(int(s) for s in size)
             if tuple(target.shape[: len(shape)]) != shape:
                 raise ValueError(f"out has shape {tuple(target.shape)}, size is {shape}")
-        n = math.prod(shape)
-        flat = target.view(n, -1)
-        per = flat.shape[1]
-        # bound the output values and the Gaussian coefficients behind them (ndof per sample; values at a few points
-        # would otherwise put the whole batch's coefficients, and the solvers' work blocks, in memory at once)
-        ndof = getattr(getattr(field, "space", None), "ndof", 0)
-        batch = max(1, int(self.BATCH_VALUES // max(per, ndof, 1)))
-        for k0 in range(0, n, batch):
-            rows = flat[k0 : k0 + batch]
-            if hasattr(field, "sample_into") and field.sample_into(rows):
-                continue
-            vals = field.sample(rows.shape[0])
-            vals = vals if isinstance(vals, torch.Tensor) else torch.from_numpy(vals)
-            vals = vals.movedim(-1, 0).reshape(rows.shape[0], -1)
-            if vals.shape[1] != per:
-                raise ValueError(f"out holds {per} values per sample, {name} gives {vals.shape[1]}")
-            rows.copy_(vals)  # cast (and device transfer) in one pass
+        field.sample_into(target.view(math.prod(shape), -1))
         return out
 
     def _draw(self, field, size, output, name, out=None):

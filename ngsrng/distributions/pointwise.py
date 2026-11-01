@@ -14,6 +14,7 @@ import torch
 
 from ..backend import ngs_sparse, sparse_to_torch
 from ..covariance import EXACT_LIMIT
+from ..inplace import InPlace
 from ..observations import observation_operator
 from ..quadrature import QuadratureRule
 from ..solvers import NGSolveDirect
@@ -260,14 +261,15 @@ class GaussianAtPoints:
                 self.std = np.where(pinned, np.inf, self.std)
 
 
-class PointwiseField:
+class PointwiseField(InPlace):
     """Base class: a pointwise function of Gaussian point values.
 
     Representations: "quadrature" (values at the quadrature points; a GridFunction on the IntegrationRuleSpace for
     a single sample), "projection" (L2 projection into the FE space) or "points" (values at user-given points;
     plain arrays). Subclasses implement ``_values(n)`` returning (npoints, ..., n) arrays; ``torch_capable`` says
     whether the transform can run on a CUDA device (NumPy otherwise). ``out_dtype`` is the precision the values are
-    delivered in (bounded families keep their values strictly inside the support in that precision).
+    delivered in (bounded families keep their values strictly inside the support in that precision). In-place fills
+    (``sample_into``, :mod:`ngsrng.inplace`) run ``sample`` on chunks of ``work_values`` internal values.
     """
 
     torch_capable = False
@@ -306,10 +308,28 @@ class PointwiseField:
 
     CHUNK_VALUES = 2e7  # Gaussian point values per internal batch (bounds the transforms' intermediates)
 
-    def _chunked(self, n):
+    def _per_sample(self):
         # the Gaussian behind a batch is ndof x n as well (and solvers keep a few such blocks): bound both
-        per_sample = max(self.points.npoints, self.space.ndof) * getattr(self, "copies", 1)
-        size = max(1, int(self.CHUNK_VALUES // per_sample))
+        return max(self.points.npoints, self.space.ndof) * getattr(self, "copies", 1)
+
+    def sample_into(self, rows):
+        # an "auto" quantile inversion picks a table or the exact ppf from the number of values per call: decide it
+        # for the whole fill, so the result does not depend on the chunking
+        values = rows.shape[0] * self.points.npoints * getattr(self, "copies", 1)
+        for inv in self._inversions():
+            inv._resolve(values, self.on_device)
+        return super().sample_into(rows)
+
+    def _inversions(self):
+        from .inversion import Inversion
+
+        found = []
+        for v in vars(self).values():
+            found += [x for x in (v if isinstance(v, (list, tuple)) else [v]) if isinstance(x, Inversion)]
+        return found
+
+    def _chunked(self, n):
+        size = max(1, int(self.CHUNK_VALUES // self._per_sample()))
         if n <= size:
             return self._values(n)
         parts = [self._values(min(size, n - k)) for k in range(0, n, size)]

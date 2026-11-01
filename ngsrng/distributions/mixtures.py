@@ -12,14 +12,31 @@ import ngsolve as ngs
 import numpy as np
 import torch
 
+from ..inplace import InPlace
 from ..noise import DiagonalNoise
 from .pointwise import is_conditioned
 
 
-class _FEField:
-    """Output: n=None gives a GridFunction, otherwise (ndof x n) coefficients (a tensor on the Gaussian's device)."""
+class _FEField(InPlace):
+    """Output: n=None gives a GridFunction, otherwise (ndof x n) coefficients (a tensor on the Gaussian's device).
+    Subclasses implement ``_coefficients(n)``: zero-mean free-dof coefficients (nfree x n)."""
 
     torch_capable = True
+
+    def sample(self, n=None):
+        return self._finish(self._coefficients(1 if n is None else int(n)), n)
+
+    def _per_sample(self):
+        return self.space.ndof + getattr(self.gauss, "nrand", 0)
+
+    def _fill(self, rows):
+        """In place: the mean, then the free coefficients added into the rows (no ndof x k intermediate)."""
+        c = self._coefficients(rows.shape[0])
+        if rows[0].numel() != self.space.ndof:
+            raise ValueError(f"out holds {rows[0].numel()} values per sample, the field gives {self.space.ndof}")
+        rows = rows.view(rows.shape[0], self.space.ndof)
+        rows.copy_(torch.from_numpy(self.gauss.mean).to(rows.device, rows.dtype).expand(rows.shape[0], -1))
+        rows[:, torch.from_numpy(self.space.free).to(rows.device)] += c.T.to(rows.device, rows.dtype)
 
     def _finish(self, c_free: torch.Tensor, n):
         g = self.gauss
@@ -83,13 +100,12 @@ class StudentTField(_FEField):
         self.space = gauss.space
         self.info = {"law": f"Student-t process (elliptical, nu={nu})", "gaussian": gauss.plan}
 
-    def sample(self, n=None):
-        ns = 1 if n is None else int(n)
+    def _coefficients(self, ns):
         g = self.gauss
         c = g.sample(ns)
         c = c[torch.from_numpy(g.space.free).to(c.device)] - torch.from_numpy(g.mean[g.space.free]).to(c)[:, None]
         scale = torch.from_numpy(np.sqrt(self.nu / self.rng.chisquare(self.nu, ns))).to(c)
-        return self._finish(c * scale[None, :], n)
+        return c * scale[None, :]
 
 
 class TypeGField(_FEField):
@@ -118,6 +134,7 @@ class TypeGField(_FEField):
         self.gauss, self.mixing, self.nu = gauss, mixing, float(nu)
         self.space = gauss.space
         self.rng = np.random.default_rng(seed)
+        self.rng_mix = self.rng.spawn(1)[0]  # mixing and white noise in separate streams, each sample by sample
         self.element_of_column = _element_map(gauss)
         self.volumes = ngs.Integrate(ngs.CoefficientFunction(1.0), self.space.mesh, element_wise=True).NumPy().copy()
         self.on_device = gauss.engine == "torch"
@@ -136,11 +153,12 @@ class TypeGField(_FEField):
         }
 
     def mixing_variables(self, n) -> np.ndarray:
-        """V_e for every element and sample (ne x n): mean 1, variance nu / |e|."""
-        shape = self.volumes / self.nu
+        """V_e for every element and sample (ne x n): mean 1, variance nu / |e|. Drawn sample by sample (so a
+        sample does not depend on how a batch is split)."""
+        shape = np.broadcast_to(self.volumes / self.nu, (n, len(self.volumes)))
         if self.mixing == "nig":
-            return self.rng.wald(1.0, np.repeat(shape[:, None], n, axis=1))
-        return self.rng.gamma(np.repeat(shape[:, None], n, axis=1), 1.0 / shape[:, None])
+            return self.rng_mix.wald(1.0, shape).T
+        return self.rng_mix.gamma(shape, 1.0 / shape).T
 
     def _device_mixing(self, n):
         shape = self.t_shape[:, None].expand(-1, n).contiguous()
@@ -148,8 +166,7 @@ class TypeGField(_FEField):
             return torch_inverse_gaussian(torch.ones_like(shape), shape, self.tgen)
         return torch_gamma(shape, self.tgen) / shape
 
-    def sample(self, n=None):
-        ns = 1 if n is None else int(n)
+    def _coefficients(self, ns):
         g = self.gauss
         if self.on_device:
             v = self._device_mixing(ns).to(g._work_dtype)
@@ -157,9 +174,9 @@ class TypeGField(_FEField):
             c = g.apply(eta * torch.sqrt(v[self.t_emap]))
         else:
             v = self.mixing_variables(ns)
-            eta = self.rng.standard_normal((g.nrand, ns)) * np.sqrt(v[self.element_of_column])
+            eta = self.rng.standard_normal((ns, g.nrand)).T * np.sqrt(v[self.element_of_column])  # sample by sample
             c = g.apply(torch.from_numpy(eta))
-        return self._finish(c.to(g.dtype), n)
+        return c.to(g.dtype)
 
 
 def _element_map(gauss) -> np.ndarray:

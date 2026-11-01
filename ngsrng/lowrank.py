@@ -9,12 +9,13 @@ import scipy.sparse as sp
 import torch
 
 from .backend import available_memory, numpy_blas_threads
+from .inplace import InPlace
 from .observations import observation_operator, whiten, whitener
 from .randomized import gram_orth, randomized_svd
 from .space import SpaceInfo, coefficient_columns, coefficient_vector
 
 
-class LowRankGaussian:
+class LowRankGaussian(InPlace):
     """Finite-rank Gaussian N(mean, B K^-1 B*) on a FE space (B: ndof x r coefficient columns, K: r x r SPD).
 
     Samples are B K^-1/2 zeta with zeta ~ N(0, I_r). The function-space structure is carried by the columns of B, so
@@ -59,9 +60,14 @@ class LowRankGaussian:
         v = y.detach().cpu().double().numpy()
         return torch.from_numpy(self.rinv.T @ (self._bf.T @ v))
 
-    def sample(self, n=None):
+    def sample(self, n=None, out=None):
+        """One sample (GridFunction) or n samples (ndof x n). ``out``: an ndof x n buffer filled in place and returned
+        (:mod:`ngsrng.inplace`)."""
+        if out is not None:
+            return self._sample_out(n, out)
         ns = 1 if n is None else int(n)
-        x = self._mean[:, None] + self.b @ (self.rinv @ self.rng.standard_normal((self.nrand, ns)))
+        zeta = self.rng.standard_normal((ns, self.nrand)).T  # sample by sample: chunked fills give the same samples
+        x = self._mean[:, None] + self.b @ (self.rinv @ zeta)
         if n is None:
             gf = ngs.GridFunction(self.space.fes)
             gf.vec.FV().NumPy()[:] = x[:, 0]

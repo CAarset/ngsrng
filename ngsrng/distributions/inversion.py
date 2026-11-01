@@ -101,8 +101,10 @@ def _q_newton(dist, z, iters=200):
     Solves g(y) = log F(x(y)) - log Phi(z) (or log Phi(-z) - log S(x(y)) for z > 0), increasing in y, with
     y = log x on positive supports and y = asinh(x / s) on the real line, so power-law and exponential tails become
     (close to) linear. Brackets come from a coarse ppf grid (scipy, |z| <= 9); ends that fail the sign check or are
-    missing are found by geometric expansion in y. Converged entries leave the active set.
+    missing are found by geometric expansion in y. Converged entries leave the active set. ``z`` may have any shape.
     """
+    shape = np.shape(z)
+    z = np.asarray(z, dtype=float).ravel()  # the bracketing below works on flat indices
     zc = np.linspace(-9.0, 9.0, 37)
     with np.errstate(all="ignore"):
         qc = np.where(zc <= 0, dist.ppf(sps.ndtr(zc)), dist.isf(sps.ndtr(-zc)))
@@ -177,7 +179,7 @@ def _q_newton(dist, z, iters=200):
         active = active[~conv]
         if not len(active):
             break
-    return np.clip(to_x(y), a, b)
+    return np.clip(to_x(y), a, b).reshape(shape)
 
 
 class Inversion:

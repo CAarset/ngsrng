@@ -23,6 +23,7 @@ from .backend import (
     resolve_dtype,
     sparse_to_torch,
 )
+from .inplace import InPlace, as_tensor, chunks, default_work_values, write
 from .solvers import CudssDirect, NGSolveCG, NGSolveDirect, TorchPCG, cudss_available
 from .space import SpaceInfo, mass_form
 from .specs import AssembledPrecision, OperatorPrecision, PDEPrecision
@@ -71,7 +72,7 @@ def check_method(method) -> dict:
     return dict(method)
 
 
-class Gaussian:
+class Gaussian(InPlace):
     """N(mean, C) as a random function in ``fes``.
 
     Parameters
@@ -103,6 +104,7 @@ class Gaussian:
         self.tuning = None if tun is False else (tn.Tuning.load(tun) if isinstance(tun, str) else tun or tn.active())
         self.plan = {"space": self.space.describe()}
         self.device = self._choose_device(device)
+        self.work_values = default_work_values(self.device)  # chunk size of in-place fills on the torch engine
         engine = self.method.get("engine", "auto")
         self.engine = ("torch" if self.device.type == "cuda" else "ngsolve") if engine == "auto" else engine
         if self.engine == "ngsolve" and self.device.type != "cpu":
@@ -411,13 +413,15 @@ class Gaussian:
             return max(1, int(self.method["threads"]))
         return available_threads() if self.space.ndof >= 1000 else 1
 
-    def _ngs_rows(self, n, out, *, eta=None, free_only=False, evaluate=None, add_mean=True):
-        """CPU engine: n samples, row k of ``out`` (n x width, float32 or float64) for sample k.
+    def _ngs_rows(self, n, out, *, eta=None, free_only=False, evaluate=None, add_mean=True, transform=None):
+        """CPU engine: n samples, row k of ``out`` (n x width, float32 or float64, any strides) for sample k.
 
-        A row is the coefficient vector (plus the mean unless ``add_mean=False``), its free part (``free_only``), or
+        A row is the coefficient vector (plus the mean unless ``add_mean=False``; then ``transform``, a function
+        changing the float64 coefficient vector in place, e.g. an affine map), its free part (``free_only``), or
         ``evaluate`` (an NGSolve matrix, e.g. point evaluation) applied to it. ``eta`` (nrand x n) replaces fresh
         noise. Samples run in parallel threads; sample k uses the k-th reserved key of the normal stream, so results
-        equal a sequential loop of single samples, for any number of threads.
+        equal a sequential loop of single samples, for any number of threads, and every thread writes its row of
+        ``out`` directly (one cast at the end, no intermediate).
         """
         key0 = self.stream.reserve(n) if eta is None else None
         mean, free = self._mean, self.space.free
@@ -435,6 +439,8 @@ class Gaussian:
                 self._ngs_one(w, res)
                 if add_mean:
                     r += mean
+                if transform is not None:
+                    transform(r)
                 if ev is not None:
                     ev.data = evaluate * res
                     out[k] = ev.FV().NumPy()
@@ -578,8 +584,11 @@ class Gaussian:
     def sample(self, n=None, out=None):
         """One sample as a GridFunction (n=None), or n samples as a (ndof x n) torch tensor.
 
-        ``out="multivector"`` returns an NGSolve MultiVector instead.
+        ``out``: a buffer (ndof x n; NumPy or torch, any float dtype and device) filled in place and returned, the
+        in-place form (see :meth:`sample_into`); ``"multivector"`` returns an NGSolve MultiVector instead.
         """
+        if out is not None and not isinstance(out, str):
+            return self._sample_out(n, out)
         ns = 1 if n is None else int(n)
         if self.engine == "torch":
             return self._sample_torch(n, ns, out)
@@ -595,19 +604,39 @@ class Gaussian:
             return mv
         return torch.from_numpy(rows).T.to(self.dtype)
 
-    def _torch_rows(self, rows):
+    def sample_into(self, rows):
+        """Fill rows (k x ndof, one sample per row; NumPy or torch, any float dtype and device) in place
+        (:mod:`ngsrng.inplace`). The CPU engine writes every sample from its worker thread straight into its row; the
+        torch engine works on its device in chunks of ``work_values`` values."""
+        rows = as_tensor(rows)
+        if tuple(rows.shape[1:]) != (self.space.ndof,):
+            raise ValueError(f"out holds {tuple(rows.shape[1:])} values per sample, the Gaussian gives "
+                             f"({self.space.ndof},)")
+        if self.engine == "ngsolve" and rows.device.type == "cpu" and rows.dtype in (torch.float32, torch.float64):
+            self._ngs_rows(rows.shape[0], rows.numpy())
+            return rows
+        for k0, k1 in chunks(rows.shape[0], self._per_sample(), self.work_values, self._min_chunk()):
+            if self.engine == "torch" and rows.device == self.device and rows.dtype == self.dtype:
+                self._torch_rows(rows[k0:k1])
+            else:
+                write(rows[k0:k1], self.sample(k1 - k0))
+        return rows
+
+    def _torch_rows(self, rows, loc=None, scale=1.0):
         """Torch engine: fill rows (k x ndof, on the device, in self.dtype) with samples, without the transposed
-        intermediate of ``sample``; same random numbers and arithmetic as ``sample(k)``."""
+        intermediate of ``sample``; same random numbers and arithmetic as ``sample(k)``. With ``loc`` (a device
+        tensor) and ``scale``: loc + scale (sample - mean)."""
         k = rows.shape[0]
         eta = torch.randn(self.nrand, k, generator=self.generator, device=self.device, dtype=self._work_dtype)
-        c = self.apply(eta).to(self.dtype)
+        c = self.apply(eta)
+        c = (c if scale == 1.0 else c.mul_(scale)).to(self.dtype)
         # device copy of the mean, keyed by the mean array itself (posteriors replace it: posterior(mean=...))
         cache = getattr(self, "_mean_t", None)
         if cache is None or cache[0] is not self._mean or cache[1].dtype != self.dtype:
             self._mean_t = cache = (self._mean, torch.from_numpy(self._mean).to(self.device, self.dtype),
                                     torch.from_numpy(self.space.free).to(self.device))
         _, mean_t, free_t = cache
-        rows.copy_(mean_t.expand(k, -1))
+        rows.copy_((mean_t if loc is None else loc).expand(k, -1))
         rows[:, free_t] += c.T
         return rows
 
