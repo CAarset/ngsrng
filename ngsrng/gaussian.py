@@ -1,6 +1,7 @@
 """Gaussian random functions on an NGSolve FE space, with automatic algorithm selection."""
 
 import copy
+import difflib
 import math
 import warnings
 
@@ -30,6 +31,45 @@ from .specs import AssembledPrecision, OperatorPrecision, PDEPrecision
 # benchmark-fitted cost model replaces it.
 DIRECT_LIMIT = {1: math.inf, 2: 2_000_000, 3: 200_000}
 
+# Accepted ``method`` keys and, for the algorithm choices, their values. Anything else raises: an ignored key would
+# silently change the computation (a misspelt "engine" runs a GPU study on the CPU, in float64).
+NOISE_METHODS = ("auto", "diagonal", "local-gram", "local-gram-explicit", "quadrature", "dense-cholesky", "chebyshev",
+                 "lumped")
+FORM_NOISE_METHODS = ("auto", "local-gram", "rational", "dense-cholesky")
+SOLVERS = ("auto", "direct", "cg", "cudss", "torch-pcg")
+ENGINES = ("auto", "ngsolve", "torch")
+METHOD_KEYS = {
+    "noise": NOISE_METHODS,
+    "form_noise": FORM_NOISE_METHODS,
+    "solver": SOLVERS,
+    "engine": ENGINES,
+    "tuning": None,  # False, a recommendations.json path, or a ngsrng.tuning.Tuning
+    "noise_tol": None,  # chebyshev noise
+    "inverse": None,  # NGSolve direct solver name (sparsecholesky, umfpack, pardiso)
+    "precond": None,  # NGSolve preconditioner name (bddc, h1amg, multigrid, local)
+    "cudss_width": None,
+    "threads": None,
+    "cpu_blas_threads": None,
+}
+
+
+def check_method(method) -> dict:
+    """A copy of the ``method`` overrides, with every key and algorithm name checked (ValueError if unknown)."""
+    if method is None:
+        return {}
+    if not isinstance(method, dict):
+        raise TypeError("method must be a dict of algorithm overrides, e.g. {'solver': 'cg'} (the inversion method "
+                        "of a distribution is a per-call option: rng.gamma(2.0, method='table'))")
+    for key, value in method.items():
+        if key not in METHOD_KEYS:
+            close = difflib.get_close_matches(str(key), METHOD_KEYS, n=1)
+            hint = f" (did you mean {close[0]!r}?)" if close else ""
+            raise ValueError(f"unknown method key {key!r}{hint}; valid keys: {', '.join(METHOD_KEYS)}")
+        choices = METHOD_KEYS[key]
+        if choices is not None and value not in choices:
+            raise ValueError(f"unknown {key} {value!r}; valid: {', '.join(choices)}")
+    return dict(method)
+
 
 class Gaussian:
     """N(mean, C) as a random function in ``fes``.
@@ -39,24 +79,32 @@ class Gaussian:
     fes : FESpace (H1 or L2). Dirichlet dofs, if any, are fixed to the mean.
     precision : PDEPrecision | AssembledPrecision
     mean : GridFunction or CoefficientFunction (interpolated with ``Set``), default 0
-    method : optional overrides, e.g. {"noise": "quadrature", "solver": "cg"}. "noise" selects the white-noise
-        sampler (even powers), "form_noise" the precision-shaped noise ("local-gram" | "dense-cholesky", odd powers
-        and assembled precisions), "solver" one of "direct" | "cg" | "torch-pcg", "engine" one of "ngsolve" (CPU
-        default) | "torch" (CUDA default; on CPU only useful for testing).
-    device, dtype : torch device ("cpu", "cuda", "auto") and output dtype (default float32)
+    method : optional overrides, e.g. {"noise": "quadrature", "solver": "cg"} (unknown keys or names raise; see
+        ``METHOD_KEYS``). "noise" selects the white-noise sampler (even powers; "chebyshev" and "lumped" are
+        approximate), "form_noise" the route for odd powers and assembled precisions ("local-gram": precision-shaped
+        noise, exact; "rational": white noise and a rational approximation of the square root, relative accuracy
+        1e-7, used automatically when the form couples elements; "dense-cholesky": exact, O(n^2) memory, only on
+        request), "solver" one of "direct" | "cg" | "cudss" | "torch-pcg" (with "inverse" / "precond"
+        naming the NGSolve direct solver / preconditioner), "engine" one of "ngsolve" (CPU default) | "torch" (CUDA
+        default; on CPU only useful for testing). Also "tuning" (False disables the benchmark tuning, or a
+        recommendations.json path), "noise_tol" (chebyshev noise), "cudss_width", "threads" (CPU batches) and
+        "cpu_blas_threads".
+    device, dtype : torch device ("cpu", "cuda", "auto") and output dtype (default float32; the CPU engine computes
+        in float64 and casts)
     tol : relative tolerance for iterative solvers
     """
 
     def __init__(self, fes, precision, mean=None, method=None, device="cpu", dtype=None, tol=1e-8, seed=None):
         self.space = SpaceInfo(fes)
         self.spec = precision
-        self.method = dict(method or {})
+        self.method = check_method(method)
         self.dtype = resolve_dtype(dtype)
         tun = self.method.get("tuning")
         self.tuning = None if tun is False else (tn.Tuning.load(tun) if isinstance(tun, str) else tun or tn.active())
         self.plan = {"space": self.space.describe()}
         self.device = self._choose_device(device)
-        self.engine = self.method.get("engine", "torch" if self.device.type == "cuda" else "ngsolve")
+        engine = self.method.get("engine", "auto")
+        self.engine = ("torch" if self.device.type == "cuda" else "ngsolve") if engine == "auto" else engine
         if self.engine == "ngsolve" and self.device.type != "cpu":
             raise ValueError("the ngsolve engine runs on the CPU only")
         self.tol = tol
@@ -112,6 +160,8 @@ class Gaussian:
             return self._build_fractional(spec)
         even = spec.power % 2 == 0
         self.noise = self._mass_noise() if even else self._form_noise(spec.form)
+        if self.noise is None:  # odd power without precision-shaped noise: (M^-1 K)^-1/2 by the rational route
+            return self._build_fractional(spec)
         self.solver = self.first = self._solver(spec.form)
         self.n_mass_steps = spec.power // 2 - 1 if even else (spec.power - 1) // 2
         nsolve = spec.power // 2 if even else (spec.power + 1) // 2
@@ -119,9 +169,13 @@ class Gaussian:
             f"C = A^-{spec.power}: {'white noise' if even else 'stiffness-shaped noise'} + {nsolve} solve(s) per sample"
         )
 
-    def _build_fractional(self, spec: PDEPrecision):
+    def _build_fractional(self, spec: PDEPrecision, label=None):
         """C = A^-beta, beta/2 = n + theta: c = (K^-1 M)^n r(M^-1 K) M^-1 z with r(lambda) ~ lambda^-theta rational,
-        r(M^-1 K) M^-1 = c0 M^-1 + sum_l c_l (K + t_l M)^-1, z white noise."""
+        r(M^-1 K) M^-1 = c0 M^-1 + sum_l c_l (K + t_l M)^-1, z white noise.
+
+        Also the route for odd integer powers (theta = 1/2) whose form couples elements (DG facet terms), where
+        precision-shaped noise would need a global factorisation: only white noise, sparse solves and the
+        relative-accuracy rational approximation."""
         from .rational import fractional_power, spectral_interval
         from .solvers import RationalSolver
 
@@ -145,8 +199,9 @@ class Gaussian:
         self.first = RationalSolver(rational, shifted, mass_inv)
         self.n_mass_steps = n
         self.plan["structure"] = (
-            f"C = A^-{spec.power:g}: white noise + rational (M^-1 K)^-{theta:g} ({rational.degree} shifted solves, "
-            f"rel. error {rational.rel_error:.1e} on [{lmin:.3g}, {lmax:.3g}]) + {n} integer solve(s) per sample"
+            f"{label or f'C = A^-{spec.power:g}'}: white noise + rational (M^-1 K)^-{theta:g} ({rational.degree} "
+            f"shifted solves, rel. error {rational.rel_error:.1e} on [{lmin:.3g}, {lmax:.3g}]) + {n} integer "
+            "solve(s) per sample"
         )
 
     def _build_operator(self, spec: OperatorPrecision):
@@ -162,6 +217,7 @@ class Gaussian:
             apply_q = lambda c: spec.apply(mass_t @ c)  # noqa: E731
         else:
             apply_q = spec.apply
+        self._apply_q = apply_q  # Sigma^-1 * scale^2 (primal -> dual), for apply_precision
         self.noise = self._mass_noise()
         mass_inv = self._solver(mass_form)
         if spec.spectrum is not None:
@@ -185,6 +241,10 @@ class Gaussian:
 
     def _build_assembled(self, spec: AssembledPrecision):
         self.noise = self._form_noise(spec.form)
+        if self.noise is None:  # c = scale (M^-1 Q)^-1/2 M^-1 z has covariance scale^2 Q^-1
+            self.scale = spec.scale
+            return self._build_fractional(PDEPrecision(spec.form, power=1, scale=spec.scale),
+                                          label="Sigma^-1 = Q assembled")
         self.solver = self.first = self._solver(spec.form)
         self.n_mass_steps, self.scale = 0, spec.scale
         self.plan["structure"] = "Sigma^-1 = Q assembled: local Q-noise + 1 solve"
@@ -202,6 +262,9 @@ class Gaussian:
                                           *(ngs.la.BaseVector(s.ndof) for _ in range(4))))
         self._maps = []  # noise-space maps, applied to eta before the pipeline
         self._post_maps = []  # FE-space maps, applied to the pipeline's output
+        # CPU engine: float64 torch copies of the noise sampler and the mass matrix (for apply_t). Shared with derived
+        # Gaussians (same pipeline); the noise copy keeps the shared sampler's own set-up untouched.
+        self._cpu_torch = {}
         # NumPy BLAS threads inside the NGSolve engine (see backend.numpy_blas_threads); None = unchanged.
         self._cpu_blas_threads = self.method.get("cpu_blas_threads", 1)
         self.plan.update(**self.noise.info(), **self.first.info())
@@ -214,7 +277,9 @@ class Gaussian:
         s, choice = self.space, self.method.get("noise", "auto")
         if choice == "auto" and self.tuning is not None:
             rec = self.tuning.noise(self._platform, s.dim, s.kind, s.order, s.nfree)
-            if rec and (rec != "diagonal" or s.mass_is_diagonal) and not rec.startswith(("chebyshev", "lumped")):
+            # exact samplers only; names a newer or older benchmark used but this version does not know are ignored
+            exact = rec in NOISE_METHODS and rec not in ("chebyshev", "lumped")
+            if exact and (rec != "diagonal" or s.mass_is_diagonal):
                 choice = rec
                 self.plan["noise_choice"] = "tuning"
         if choice == "local-gram-explicit":
@@ -238,23 +303,35 @@ class Gaussian:
             "chebyshev": lambda: nz.ChebyshevNoise(s.mass_free, tol=self.method.get("noise_tol", 1e-6)),
             "lumped": lambda: nz.LumpedNoise(s.mass_free),
         }
-        return builders[choice]()
+        noise = builders[choice]()
+        if not noise.exact:
+            accuracy = noise.accuracy()
+            if self._work_dtype == torch.float32:
+                accuracy += ", limited to ~1e-7 by float32 arithmetic"
+            self.plan["noise_accuracy"] = accuracy
+            warnings.warn(f"approximate white noise ({noise.name}): {accuracy}", stacklevel=4)
+        return noise
 
     def _form_noise(self, form):
+        """Precision-shaped noise z ~ N(0, A) for the form's matrix A, or None for the rational route (white noise
+        and (M^-1 A)^-1/2): on request, or automatically when A has no element-local factorisation (facet terms)."""
         s, choice = self.space, self.method.get("form_noise", "auto")
-        if choice in ("auto", "local-gram"):
-            try:
-                return nz.LocalGramNoise(s, form=form)
-            except (RuntimeError, NotImplementedError) as err:
-                if choice == "local-gram" or s.nfree > 20_000:
-                    raise RuntimeError(f"no exact local factorisation of the precision: {err}") from err
-                warnings.warn(f"falling back to dense Cholesky of the precision ({err})")
-        return nz.dense_cholesky_noise(s.assemble_free(form))
+        if choice == "rational":
+            return None
+        if choice == "dense-cholesky":  # only on request: O(n^2) memory
+            return nz.dense_cholesky_noise(s.assemble_free(form))
+        try:
+            return nz.LocalGramNoise(s, form=form)
+        except (RuntimeError, NotImplementedError) as err:
+            if choice == "local-gram":
+                raise RuntimeError(f"no exact local factorisation of the precision: {err}") from err
+            self.plan["form_noise_choice"] = f"rational ({err})"
+            return None
 
     def _solver(self, form):
         s, choice = self.space, self.method.get("solver", "auto")
         rec = self._tuned_prior(self._platform) if choice == "auto" else None
-        if rec and rec["method"].get("engine", self.engine) == self.engine:
+        if rec and rec["method"].get("engine", self.engine) == self.engine and rec["method"].get("solver") in SOLVERS:
             m = rec["method"]
             # Sparse direct factorisations in 3D are only trusted near the measured sizes (fill-in grows fast).
             if not (m["solver"] == "direct" and s.dim == 3 and s.nfree > max(DIRECT_LIMIT[3], 2 * rec["_target"])):
@@ -401,12 +478,12 @@ class Gaussian:
         squeeze = y.ndim == 1
         x = y[:, None] if squeeze else y
         if self.engine == "torch":
-            dev, wd, mass = self.device, self._work_dtype, self._mass
+            dev, wd, mass, noise = self.device, self._work_dtype, self._mass, self.noise
         else:
             dev, wd = torch.device("cpu"), torch.float64
-            if not getattr(self, "_noise_torch_ready", False):
-                self.noise.setup(dev, wd)
-                self._noise_torch_ready = True
+            noise = self._cpu_torch.get("noise")
+            if noise is None:  # a torch-side copy: the shared sampler is not re-set-up behind other Gaussians' backs
+                noise = self._cpu_torch["noise"] = copy.copy(self.noise).setup(dev, wd)
             mass = self._mass_cpu() if self.n_mass_steps else None
         x = x.to(dev, wd)
         for pm in reversed(self._post_maps):
@@ -416,23 +493,34 @@ class Gaussian:
         for _ in range(self.n_mass_steps):
             v = mass @ self.solver.apply(v)
         v = self.first.apply(v)
-        eta = self.scale * self.noise.apply_t(v)
+        eta = self.scale * noise.apply_t(v)
         for m in self._maps:
             eta = m.apply_torch(eta)
         return eta[:, 0] if squeeze else eta
 
     def _mass_cpu(self):
-        if getattr(self, "_mass_t_cpu", None) is None:
-            self._mass_t_cpu = sparse_to_torch(self.space.mass_free, torch.device("cpu"), torch.float64)
-        return self._mass_t_cpu
+        if "mass" not in self._cpu_torch:
+            self._cpu_torch["mass"] = sparse_to_torch(self.space.mass_free, torch.device("cpu"), torch.float64)
+        return self._cpu_torch["mass"]
 
     def apply_precision(self, c: torch.Tensor) -> torch.Tensor:
-        """Prior precision Sigma^-1 (primal -> dual) on free-dof vectors (nfree x k), computed in float64 on the CPU.
+        """Prior precision Sigma^-1 (primal -> dual) on free-dof vectors (nfree x k), returned in float64 on the CPU.
 
-        PDE priors: Sigma^-1 = scale^-2 K (M^-1 K)^(power-1), using a sparse factorisation of M (diagonal M is free).
+        Integer-power PDE priors: Sigma^-1 = scale^-2 K (M^-1 K)^(power-1), using a sparse factorisation of M
+        (diagonal M is free). Assembled precisions: scale^-2 Q. Apply-only precisions: their own action (on the
+        solver device). Fractional powers are sampled through a rational approximation whose precision has no closed
+        form, so they raise NotImplementedError.
         """
         if self._maps or self._post_maps:
             raise ValueError("apply_precision is defined for priors, not for conditioned Gaussians")
+        if isinstance(self.spec, PDEPrecision) and not self.spec.is_integer:
+            raise NotImplementedError(f"apply_precision needs an integer power (got {self.spec.power:g}): fractional "
+                                      "powers are sampled with a rational approximation, whose precision has no "
+                                      "closed form")
+        if isinstance(self.spec, OperatorPrecision):
+            x = c[:, None] if c.ndim == 1 else c
+            out = self._apply_q(x.to(self._solver_device, self._work_dtype)).double().cpu() / self.scale**2
+            return out[:, 0] if c.ndim == 1 else out
         s = self.space
         x = c.detach().cpu().double().numpy()
         x = x[:, None] if x.ndim == 1 else x
@@ -455,6 +543,7 @@ class Gaussian:
     def _derive(self, label, mean=None, *, eta_map=None, post_map=None, seed=None):
         """A new Gaussian sharing this one's pipeline, with an extra noise-space or FE-space map and/or a new mean."""
         new = copy.copy(self)
+        new.__dict__.pop("_mean_t", None)  # device copy of the parent's mean (see _torch_rows)
         new._maps = self._maps + ([eta_map] if eta_map is not None else [])
         new._post_maps = self._post_maps + ([post_map] if post_map is not None else [])
         new._mean = self._mean.copy() if mean is None else mean
@@ -512,11 +601,14 @@ class Gaussian:
         k = rows.shape[0]
         eta = torch.randn(self.nrand, k, generator=self.generator, device=self.device, dtype=self._work_dtype)
         c = self.apply(eta).to(self.dtype)
-        if not hasattr(self, "_mean_t") or self._mean_t.dtype != self.dtype:
-            self._mean_t = torch.from_numpy(self._mean).to(self.device, self.dtype)
-            self._free_t = torch.from_numpy(self.space.free).to(self.device)
-        rows.copy_(self._mean_t.expand(k, -1))
-        rows[:, self._free_t] += c.T
+        # device copy of the mean, keyed by the mean array itself (posteriors replace it: posterior(mean=...))
+        cache = getattr(self, "_mean_t", None)
+        if cache is None or cache[0] is not self._mean or cache[1].dtype != self.dtype:
+            self._mean_t = cache = (self._mean, torch.from_numpy(self._mean).to(self.device, self.dtype),
+                                    torch.from_numpy(self.space.free).to(self.device))
+        _, mean_t, free_t = cache
+        rows.copy_(mean_t.expand(k, -1))
+        rows[:, free_t] += c.T
         return rows
 
     def _sample_torch(self, n, ns, out):

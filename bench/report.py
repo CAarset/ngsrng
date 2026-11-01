@@ -184,7 +184,7 @@ def prior_section(df, plots_dir, recs):
             row["gpu speedup"] = f"{row['cpu_s'] / row['gpu_s']:.2g}x"
         for plat, s in sub.groupby("platform"):
             b = s.loc[s.best_time.idxmin()]
-            best_map.setdefault(plat, {})[f"{key[0]}|{key[1]}|{key[2]}|{key[3]}|{int(key[4])}"] = {
+            best_map.setdefault(plat, {})[f"{key[0]}|{key[1]}|{key[2]}|{key[3]:g}|{int(key[4])}"] = {
                 "solver": b.solver,
                 "method": {**SOLVER_OPTIONS.get(b.solver, {}), "engine": b.engine},
                 "noise": b.get("noise"),

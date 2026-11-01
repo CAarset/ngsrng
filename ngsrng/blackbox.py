@@ -53,7 +53,9 @@ class MultiShiftPCG:
         it = 0
         for it in range(1, self.maxiter + 1):
             qp = self.apply_q(p_seed)
-            alpha = rz / (p_seed * qp).sum(0)
+            pqp = (p_seed * qp).sum(0)
+            # columns with r = 0 (zero right-hand side, or converged exactly) would divide 0 / 0: no step
+            alpha = torch.where(pqp > 0, rz / pqp, torch.zeros_like(rz))
             # zeta recurrence for (A + sigma): r_sigma = zeta_sigma r (Frommer 2003, preconditioned form). Converged
             # shifted systems are frozen: their zeta would otherwise underflow (0/0) for large shifts.
             denom = alpha * beta_old * (zeta_old - zeta) + zeta_old * alpha_old * (1 + s * alpha)
@@ -63,7 +65,7 @@ class MultiShiftPCG:
             r = r - alpha * qp
             z = self.apply_minv(r)
             rz_new = (r * z).sum(0)
-            beta = rz_new / rz
+            beta = torch.where(rz > 0, rz_new / rz, torch.zeros_like(rz))
             ps = torch.where(
                 active.unsqueeze(1), zeta_new.unsqueeze(1) * z.unsqueeze(0) + (beta * ratio**2).unsqueeze(1) * ps, ps
             )

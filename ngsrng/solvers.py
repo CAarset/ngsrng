@@ -1,6 +1,7 @@
 """Linear solvers on the free dofs, all exposed as ``apply(X) -> A^{-1} X`` for torch tensors (nfree x ns)."""
 
 import os
+import warnings
 
 import ngsolve as ngs
 import numpy as np
@@ -9,7 +10,7 @@ import torch
 from ngsolve.krylovspace import CGSolver
 
 from .backend import Scratch, parallel_ranges, sparse_to_torch
-from .space import SpaceInfo
+from .space import SpaceInfo, mass_form
 
 
 class Solver:
@@ -29,6 +30,8 @@ class _NGSolveBase(Solver):
     def __init__(self, space: SpaceInfo, form):
         self.space = space
         self.form = form
+        # mass solves on the dgjumps-free twin (same dofs): no facet couplings in the graph, hence no needless fill
+        self.fes = space.plain if form is mass_form else space.fes
         self._vin = None
         self._vectors = Scratch(lambda: (self.mat.CreateColVector(), self.mat.CreateColVector()))
 
@@ -64,8 +67,8 @@ class NGSolveDirect(_NGSolveBase):
     def __init__(self, space: SpaceInfo, form, inverse="sparsecholesky"):
         super().__init__(space, form)
         self.name = f"ngsolve-direct({inverse})"
-        u, v = space.fes.TnT()
-        a = ngs.BilinearForm(space.fes)
+        u, v = self.fes.TnT()
+        a = ngs.BilinearForm(self.fes)
         a += form(u, v)
         with ngs.TaskManager():
             a.Assemble()
@@ -89,8 +92,8 @@ class NGSolveCG(_NGSolveBase):
         super().__init__(space, form)
         self.name = f"ngsolve-cg({precond})"
         self.tol, self.maxiter = tol, maxiter
-        u, v = space.fes.TnT()
-        a = ngs.BilinearForm(space.fes)
+        u, v = self.fes.TnT()
+        a = ngs.BilinearForm(self.fes)
         a += form(u, v)
         self.pre = ngs.Preconditioner(a, precond)
         with ngs.TaskManager():
@@ -219,18 +222,24 @@ class TorchPCG(Solver):
         p = z.clone()
         rz = (r * z).sum(0)
         bnorm = torch.linalg.vector_norm(b, dim=0).clamp_min(torch.finfo(b.dtype).tiny)
-        it = 0
+        it, res = 0, None
         for it in range(1, self.maxiter + 1):
             ap = self.a @ p
-            alpha = rz / (p * ap).sum(0)
+            pap = (p * ap).sum(0)
+            # a column with r = 0 (zero right-hand side, or converged exactly) would divide 0 / 0: it takes no step
+            alpha = torch.where(pap > 0, rz / pap, torch.zeros_like(rz))
             x += alpha * p
             r -= alpha * ap
-            if (torch.linalg.vector_norm(r, dim=0) / bnorm).max() <= self.tol:
+            res = (torch.linalg.vector_norm(r, dim=0) / bnorm).max()
+            if res <= self.tol:
                 break
             z = self.dinv[:, None] * r
             rz_new = (r * z).sum(0)
-            p = z + (rz_new / rz) * p
+            p = z + torch.where(rz > 0, rz_new / rz, torch.zeros_like(rz)) * p
             rz = rz_new
+        else:
+            warnings.warn(f"torch PCG did not converge in {self.maxiter} iterations (relative residual "
+                          f"{float(res):.1e} > tol {self.tol:.0e}); float32 rarely gets below ~1e-6", stacklevel=2)
         self.iterations.append(it)
         return x[:, 0] if squeeze else x
 

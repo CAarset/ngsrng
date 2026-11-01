@@ -18,7 +18,7 @@ import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 import torch
 
-from .backend import Scratch, ngs_sparse, sparse_to_torch, spmm
+from .backend import Scratch, available_memory, ngs_sparse, sparse_to_torch, spmm
 from .space import SpaceInfo, assemble, mass_form
 
 
@@ -60,6 +60,10 @@ class NoiseSampler:
     def info(self) -> dict:
         return {"noise": self.name, "nrand": self.nrand, "exact": self.exact}
 
+    def accuracy(self) -> str:
+        """How far Cov(z) is from A, in words (approximate samplers state their error)."""
+        return "exact (Cov = A)"
+
 
 class DiagonalNoise(NoiseSampler):
     """A diagonal (e.g. L2 mass on affine meshes): z = sqrt(diag A) * eta."""
@@ -95,6 +99,12 @@ class LumpedNoise(DiagonalNoise):
         self.d = np.sqrt(rs)
         self.nfree = self.nrand = len(self.d)
         self.h = sp.diags(self.d).tocsr()
+        # max |Cov - A| / max |A|, Cov = diag(row sums): the off-diagonal of A and the diagonal shift
+        diff = abs(a_free - sp.diags(rs))
+        self.rel_error = float(diff.max() / abs(a_free).max()) if diff.nnz else 0.0
+
+    def accuracy(self):
+        return f"Cov = diag(row sums of A), relative covariance error {self.rel_error:.1e} (max |Cov - A| / max |A|)"
 
 
 class SparseFactorNoise(NoiseSampler):
@@ -121,25 +131,61 @@ class SparseFactorNoise(NoiseSampler):
         return self.h
 
 
+def factor_error(h: sp.spmatrix, a: sp.spmatrix, probes: int = 4) -> float:
+    """Relative error of H H^T against A, without forming H H^T: the larger of the diagonal error (exact,
+    max |diag(H H^T - A)| / max |diag A|) and the probe estimate ||(H H^T - A) X||_F / ||A X||_F of the relative
+    Frobenius error, X Gaussian (fixed seed). Costs 2 ``probes`` products with H."""
+    dh = np.asarray(h.multiply(h).sum(axis=1)).ravel()
+    da = a.diagonal()
+    diag = np.abs(dh - da).max() / np.abs(da).max()
+    x = np.random.default_rng(0).standard_normal((a.shape[0], probes))
+    ax = a @ x
+    full = np.linalg.norm(h @ (h.T @ x) - ax) / np.linalg.norm(ax)
+    return float(max(diag, full))
+
+
 def dense_cholesky_noise(a_free: sp.spmatrix) -> SparseFactorNoise:
-    """Baseline for small problems: lower Cholesky of the full matrix."""
+    """Baseline for small problems: lower Cholesky of the full matrix. O(n^2) memory (peak ~24 n^2 bytes: the dense
+    matrix, its factor and the sparse copy of the factor); raises MemoryError up front if that exceeds the available
+    memory. Never chosen automatically."""
+    n = a_free.shape[0]
+    need, avail = 24.0 * n**2, available_memory()
+    if avail is not None and need > avail:
+        raise MemoryError(f"dense Cholesky of a {n} x {n} matrix needs ~{need / 2**30:.1f} GiB, "
+                          f"{avail / 2**30:.1f} GiB available")
     return SparseFactorNoise(sp.csr_matrix(np.linalg.cholesky(a_free.toarray())), "dense-cholesky")
 
 
-def quadrature_noise(space: SpaceInfo, order: int | None = None, max_nnz: float = 4e8) -> SparseFactorNoise:
+def quadrature_noise(space: SpaceInfo, order: int | None = None, max_nnz: float = 4e8,
+                     rtol: float = 1e-8) -> SparseFactorNoise:
     """White noise sampled at quadrature points: b_i = sum_q sqrt(w_q) phi_i(x_q) xi_q (see ``ngsrng.quadrature``).
 
-    Exact (Cov = M) whenever the rule integrates phi_i phi_j exactly, i.e. order >= 2p on affine elements.
-    Raises MemoryError before assembly if the factor would exceed ``max_nnz`` nonzeros (~12 bytes each).
+    Exact (Cov = M) whenever the rule integrates phi_i phi_j exactly: order >= p on affine elements (the rule has degree
+    2 order; see ``ngsrng.quadrature``), and on curved elements only order = p, the rule NGSolve assembles M with. The
+    default (``order=None``) is p, which is exact on affine, mapped and curved meshes alike and has the fewest points
+    (6 instead of 25 per P2 triangle at 2p); should it ever miss M, 2p is tried before giving up. Every rule is checked
+    against the assembled M (see :func:`factor_error`), and one that misses it by more than ``rtol`` raises: a
+    covariance error of 1e-3 is invisible in samples. Raises MemoryError before assembly if the factor would exceed
+    ``max_nnz`` nonzeros (~12 bytes each).
     """
     from .quadrature import QuadratureRule
 
-    rule = QuadratureRule(space, order, max_nnz)
-    h = rule.b[space.free] @ sp.diags(1.0 / np.sqrt(rule.weights))
-    dh = np.asarray(h.multiply(h).sum(axis=1)).ravel()
-    dm = space.mass_free.diagonal()
-    if rule.order >= 2 * space.order and np.abs(dh - dm).max() > 1e-8 * dm.max():
-        raise RuntimeError("quadrature noise failed its diag(H H^T) == diag(M) self-check")
+    errors = {}
+    for o in [space.order, 2 * space.order] if order is None else [order]:
+        if o in errors:  # p = 0
+            continue
+        rule = QuadratureRule(space, o, max_nnz)
+        h = rule.b[space.free] @ sp.diags(1.0 / np.sqrt(rule.weights))
+        errors[o] = factor_error(h, space.mass_free)
+        if errors[o] <= rtol:
+            break
+    else:
+        tried = ", ".join(f"{err:.1e} at order {o}" for o, err in errors.items())
+        raise RuntimeError(
+            f"quadrature noise is not exact for {space.kind}(order={space.order}): relative covariance error {tried} "
+            f"(> {rtol:.0e}). The rule must integrate products of basis functions exactly: order >= {space.order} on "
+            f"affine elements, order = {space.order} on curved ones"
+        )
     noise = SparseFactorNoise(h, "quadrature")
     noise.quad_order = rule.order
     noise.element_of_column = np.repeat(np.arange(space.mesh.ne), rule.npoints // space.mesh.ne)
@@ -251,6 +297,10 @@ class ChebyshevNoise(NoiseSampler):
 
     def info(self):
         return {**super().info(), "degree": self.degree, "spectrum": (self.lo, self.hi)}
+
+    def accuracy(self):
+        return (f"Cov = A up to a relative error of ~{2 * self.tol:.0e} (degree-{self.degree} Chebyshev square root, "
+                f"relative error < {self.tol:.0e} on the estimated spectrum)")
 
 
 class LocalGramNoise(NoiseSampler):

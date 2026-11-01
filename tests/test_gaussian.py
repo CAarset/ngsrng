@@ -1,3 +1,5 @@
+import warnings
+
 import ngsolve as ngs
 import numpy as np
 import pytest
@@ -62,11 +64,37 @@ def test_l2_dg_matern_exact(power):
     _check(g, 1e-11)
 
 
-def test_l2_dg_odd_power_falls_back_to_dense():
+@pytest.mark.parametrize("power", [1, 3])
+def test_l2_dg_odd_power_takes_the_rational_route(power):
+    """DG forms couple elements, so there is no local precision-shaped noise: white noise, sparse solves and the
+    rational square root instead of a dense factorisation."""
     fes = ngs.L2(_square(), order=1, dgjumps=True)
-    with pytest.warns(UserWarning, match="dense Cholesky"):
-        g = ngsrng.Gaussian(fes, ngsrng.matern_dg(fes, 3.0, power=3), dtype="float64")
-    _check(g, 1e-11)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # power 1 is not trace class in 2D
+        g = ngsrng.Gaussian(fes, ngsrng.matern_dg(fes, 3.0, power=power), dtype="float64")
+    assert g.plan["noise"] == "diagonal" and "rational (M^-1 K)^-0.5" in g.plan["structure"]
+    assert g.plan["form_noise_choice"].startswith("rational")
+    _check(g, 1e-6)
+    exact = ngsrng.Gaussian(fes, ngsrng.matern_dg(fes, 3.0, power=3), dtype="float64",
+                            method={"form_noise": "dense-cholesky"})  # still available on request
+    assert exact.plan["noise"] == "dense-cholesky"
+
+
+def test_assembled_precision_with_facet_terms():
+    fes = ngs.L2(_square(), order=1, dgjumps=True)
+    form = ngsrng.matern_dg(fes, 3.0, power=1).form
+    g = ngsrng.Gaussian(fes, ngsrng.AssembledPrecision(form, scale=2.0), dtype="float64")
+    assert g.plan["structure"].startswith("Sigma^-1 = Q assembled: white noise + rational")
+    q = g.space.assemble_free(form).toarray()
+    err = covariance_errors(sampler_covariance(g), 4.0 * np.linalg.inv(q))
+    assert err["rel_fro"] < 1e-6 and err["max_rel_var"] < 1e-6, err
+
+
+def test_rational_route_on_request():
+    fes = ngs.H1(_square(), order=2, dirichlet="left")
+    g = ngsrng.Gaussian(fes, ngsrng.matern(3.0, power=3), dtype="float64", method={"form_noise": "rational"})
+    assert "rational" in g.plan["structure"]
+    _check(g, 1e-6)
 
 
 def test_assembled_fourth_order_precision():
@@ -159,3 +187,106 @@ def test_cudss_column_slices_and_odd_batches():
     for j in (0, 33, 36):
         torch.testing.assert_close(g.apply(eta[:, j]), full[:, j])
     torch.testing.assert_close(g.apply(eta[:, 3:4]), full[:, 3:4])
+
+
+# ------------------------------------------------------------------ silent-failure guards (review 2026-10-31)
+
+
+def test_method_keys_and_names_are_validated():
+    """A misspelt key must not be ignored (it would e.g. run a GPU study on the CPU), nor a bad name be a KeyError."""
+    fes = ngs.H1(_square(0.4), order=1)
+    with pytest.raises(ValueError, match="did you mean 'engine'"):
+        ngsrng.Gaussian(fes, ngsrng.matern(3.0), method={"engien": "torch"})
+    with pytest.raises(ValueError, match="unknown noise 'lokal-gram'.*local-gram"):
+        ngsrng.Gaussian(fes, ngsrng.matern(3.0), method={"noise": "lokal-gram"})
+    with pytest.raises(ValueError, match="unknown solver"):
+        ngsrng.Gaussian(fes, ngsrng.matern(3.0), method={"solver": "cholesky"})
+    with pytest.raises(ValueError, match="unknown method key"):  # at construction, before any draw
+        ngsrng.default_rng(fes, correlation=0.3, method={"solvr": "cg"})
+    with pytest.raises(TypeError, match="per-call option"):
+        ngsrng.default_rng(fes, correlation=0.3, method="table")
+    g = ngsrng.Gaussian(fes, ngsrng.matern(3.0), method={"engine": "auto", "solver": "auto"})
+    assert g.engine == "ngsolve"
+
+
+@pytest.mark.parametrize("noise,expected", [("lumped", "relative covariance error"), ("chebyshev", "1e-08")])
+def test_approximate_noise_states_its_accuracy(noise, expected):
+    fes = ngs.H1(_square(), order=1)  # row-sum lumping is invalid (non-positive) for P2
+    with pytest.warns(UserWarning, match=f"approximate white noise \\({noise}\\).*{expected}"):
+        g = ngsrng.Gaussian(fes, ngsrng.matern(3.0), method={"noise": noise, "noise_tol": 5e-9}, dtype="float64")
+    assert expected in g.plan["noise_accuracy"]
+    if noise == "lumped":  # the stated error is the actual one
+        m = g.space.mass_free.toarray()
+        assert f"{np.abs(np.diag(m.sum(axis=1)) - m).max() / np.abs(m).max():.1e}" in g.plan["noise_accuracy"]
+
+
+def test_dense_cholesky_checks_memory_first(monkeypatch):
+    fes = ngs.L2(_square(), order=1, dgjumps=True)
+    spec = ngsrng.matern_dg(fes, 3.0, power=3)
+    monkeypatch.setattr("ngsrng.noise.available_memory", lambda: 1e3)
+    with pytest.raises(MemoryError, match="needs .* GiB"):
+        ngsrng.Gaussian(fes, spec, dtype="float64", method={"form_noise": "dense-cholesky"})
+
+
+def test_derived_gaussians_leave_the_prior_untouched():
+    """apply_t of a posterior (CPU engine) must not re-set-up the noise object it shares with its prior."""
+    fes = ngs.H1(_square(), order=2, dirichlet="left")
+    prior = ngsrng.Gaussian(fes, ngsrng.matern(3.0), dtype="float64", seed=0)
+    noise_state = dict(vars(prior.noise))
+    post = prior.condition(points=[[0.5, 0.5], [0.3, 0.7]], noise=1e-3)
+    y = torch.randn(prior.space.nfree, 3, dtype=torch.float64)
+    lt = post.apply_t(y)
+    assert vars(prior.noise).keys() == noise_state.keys()  # no torch set-up on the shared sampler
+    # adjoint of apply: <L eta, y> == <eta, L^T y>
+    eta = torch.randn(post.nrand, 3, dtype=torch.float64)
+    torch.testing.assert_close((post.apply(eta) * y).sum(), (eta * lt).sum(), rtol=1e-10, atol=1e-12)
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=cuda)])
+def test_posterior_out_buffer_uses_the_posterior_mean(device):
+    """Regression: posteriors are copies of their prior, and inherited the prior's cached device mean, so batches
+    filled in place (``out=``, torch engine) were centred on the prior mean."""
+    fes = ngs.H1(_square(0.3), order=2)
+    prior = ngsrng.Gaussian(fes, ngsrng.matern(5.0), method={"engine": "torch"}, device=device, seed=1)
+    rng = ngsrng.default_rng(fes, seed=0, correlation=prior, device=device)
+    buf = torch.empty(2000, fes.ndof, dtype=torch.float32, device=device)
+    rng.normal(out=buf)  # caches the prior mean on the device
+    post = prior.condition(points=[[0.5, 0.5]], noise=1e-6, data=[5.0])
+    g = ngsrng.observation_operator(fes, points=[[0.5, 0.5]])
+    for gauss, target in ((post, 5.0), (prior, 0.0)):
+        rng.normal(out=buf, correlation=gauss)
+        assert abs((g @ buf.double().cpu().numpy().T).mean() - target) < 0.05
+    shifted = ngsrng.LinearObservations(prior, points=[[0.5, 0.5]], noise=1e-6).posterior(mean=ngs.CF(2.0))
+    rng.normal(out=buf, correlation=shifted)
+    assert abs((g @ buf.double().cpu().numpy().T).mean() - 2.0) < 0.05
+
+
+def test_apply_precision_by_specification():
+    fes = ngs.H1(_square(), order=2, dirichlet="left")
+    s = ngsrng.space.SpaceInfo(fes)
+    k = s.assemble_free(lambda u, v: (ngs.grad(u) * ngs.grad(v) + 9 * u * v) * ngs.dx).toarray()
+    m = s.mass_free.toarray()
+    q = torch.from_numpy(k @ np.linalg.solve(m, k))
+    c = torch.randn(s.nfree, 2, dtype=torch.float64)
+    expected = (q @ c) / 4.0
+    pde = ngsrng.Gaussian(fes, ngsrng.matern(3.0, power=2, scale=2.0), dtype="float64")
+    torch.testing.assert_close(pde.apply_precision(c), expected)
+    op = ngsrng.Gaussian(fes, ngsrng.OperatorPrecision(lambda x: q @ x, scale=2.0), dtype="float64")
+    torch.testing.assert_close(op.apply_precision(c), expected)
+    frac = ngsrng.Gaussian(fes, ngsrng.matern(3.0, power=2.5), dtype="float64")
+    with pytest.raises(NotImplementedError, match="integer power"):
+        frac.apply_precision(c)
+
+
+def test_torch_pcg_zero_columns_and_non_convergence():
+    from ngsrng.solvers import TorchPCG
+
+    s = ngsrng.space.SpaceInfo(ngs.H1(_square(), order=2, dirichlet="left"))
+    a = s.assemble_free(lambda u, v: (ngs.grad(u) * ngs.grad(v) + u * v) * ngs.dx)
+    b = torch.randn(s.nfree, 3, dtype=torch.float64)
+    b[:, 1] = 0.0
+    x = TorchPCG(a, "cpu", torch.float64, tol=1e-12).apply(b)
+    assert torch.isfinite(x).all() and (x[:, 1] == 0).all()
+    np.testing.assert_allclose(a @ x.numpy(), b.numpy(), atol=1e-9)
+    with pytest.warns(UserWarning, match="did not converge in 3 iterations"):
+        TorchPCG(a, "cpu", torch.float64, tol=1e-12, maxiter=3).apply(b)

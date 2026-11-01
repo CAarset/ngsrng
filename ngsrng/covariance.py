@@ -285,6 +285,11 @@ class LocalCovariance:
         return ngs.sqrt(ngs.IfPos(v, v, 0.0))
 
 
+def _check_method_arg(method):
+    if not isinstance(method, str):  # e.g. a space passed positionally: NGSolve's __eq__ would raise a TypeError
+        raise TypeError(f"method must be a string, not {type(method).__name__} (pass a space as fes=...)")
+
+
 def local_covariance(source, method="auto", *, fes=None, convention=None, rank=100, samples=None,
                      power_iterations=2, seed=0) -> LocalCovariance:
     """The covariance on element-local dof pairs, from which pointwise variances and traces follow.
@@ -305,6 +310,7 @@ def local_covariance(source, method="auto", *, fes=None, convention=None, rank=1
 
     The result is cached on the source object.
     """
+    _check_method_arg(method)
     src = as_covariance(source, fes, convention)
     requested = method
     if method == "auto":
@@ -485,6 +491,7 @@ def covariance_trace(source, method="auto", *, fes=None, convention=None, probes
     The randomised estimators work on the Euclidean PSD operator A = L^T M L (when a factor Sigma = L L^T is known)
     or A = H^T Sigma H (white-noise factor M = H H^T), both with tr(A) = tr(Sigma M).
     """
+    _check_method_arg(method)
     src = as_covariance(source, fes, convention)
     if method == "auto":
         cheap = src.lowrank is not None or src.update is not None or src.space.nfree <= EXACT_LIMIT
@@ -602,9 +609,11 @@ def functional_covariance(source, operator=None, *, fes=None, convention=None, *
     src = as_covariance(source, fes, convention)
     s = src.space
     g = observation_operator(s.fes, operator, **observations)[:, s.free]
+    gt = g.T.tocsc()
+    out = np.empty((g.shape[0], g.shape[0]))
     with numpy_blas_threads(src.blas):
-        y = src.sigma(np.ascontiguousarray(g.T.toarray()))
-    out = np.asarray(g @ y)
+        for i in range(0, g.shape[0], CHUNK):  # nfree x CHUNK at a time, not nfree x m
+            out[:, i:i + CHUNK] = np.asarray(g @ src.sigma(gt[:, i:i + CHUNK].toarray()))
     return 0.5 * (out + out.T)
 
 

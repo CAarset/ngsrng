@@ -52,3 +52,16 @@ def test_operator_precision_is_exact(bilaplacian, convention):
     err = covariance_errors(sampler_covariance(g), np.linalg.inv(q))
     assert err["rel_fro"] < 1e-6 and err["max_rel_var"] < 1e-6, err
     np.testing.assert_allclose(exact_covariance(g), np.linalg.inv(q), rtol=1e-8, atol=1e-14)
+
+
+def test_multishift_pcg_zero_column(bilaplacian):
+    """A zero right-hand side column used to divide 0 / 0 and turn into NaN."""
+    _, _, m, q = bilaplacian
+    qt, mi = torch.from_numpy(q), torch.from_numpy(np.linalg.inv(m))
+    r = fractional_power(0.5, 10.0, 1e6, rtol=1e-7)
+    b = torch.randn(q.shape[0], 3, dtype=torch.float64)
+    b[:, 0] = 0.0
+    out = MultiShiftPCG(lambda x: qt @ x, lambda x: mi @ x, r.shifts, r.coeffs, tol=1e-11).solve(b)
+    assert torch.isfinite(out).all() and (out[:, 0] == 0).all()
+    ref = sum(c * np.linalg.solve(q + t * m, b.numpy()[:, 1:]) for c, t in zip(r.coeffs, r.shifts))
+    assert np.linalg.norm(out[:, 1:].numpy() - ref) / np.linalg.norm(ref) < 1e-9

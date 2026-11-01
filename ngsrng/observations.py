@@ -1,7 +1,5 @@
 """Observation operators: any finite set of bounded linear functionals on a FE space, as sparse G (m x ndof)."""
 
-import re
-
 import ngsolve as ngs
 import numpy as np
 import scipy.linalg as sla
@@ -25,18 +23,22 @@ def observation_operator(fes, matrix=None, functionals=None, points=None, averag
       normalised local averages f -> int f psi_i / int psi_i around each centre;
     - ``points``: (m x dim) point evaluations f -> f(x_i). Only meaningful for continuous samples (point evaluation is
       not bounded on L2); local averages are the robust alternative.
+
+    Every observation must see the field: a row that is identically zero (e.g. a ``ds`` region name that matches no
+    boundary) raises ValueError, as does a point outside the mesh.
     """
+    # Rows are kept sparse as they come (G is m x ndof: dense intermediates would cost m ndof values); matrix-free maps
+    # are applied CHUNK observations at a time
     blocks = []
     if matrix is not None:
         if hasattr(matrix, "rmatmat") or (hasattr(matrix, "T") and hasattr(matrix, "matvec")):
-            blocks.append(sp.csr_matrix(np.asarray(matrix.T @ np.eye(matrix.shape[0])).T))
+            blocks.append(_from_adjoint(lambda e: matrix.T @ e, matrix.shape[0]))
         else:
             blocks.append(sp.csr_matrix(matrix))
     if adjoint is not None:
         if m is None:
             raise ValueError("adjoint needs the number of observations m")
-        cols = [np.asarray(adjoint(np.eye(m)[:, i : i + CHUNK])) for i in range(0, m, CHUNK)]
-        blocks.append(sp.csr_matrix(np.hstack(cols).T))
+        blocks.append(_from_adjoint(adjoint, m))
     if functionals:
         rows = []
         for fn in functionals:
@@ -45,10 +47,10 @@ def observation_operator(fes, matrix=None, functionals=None, points=None, averag
                     raise ValueError("LinearForm is defined on a different space")
                 if not np.any(fn.vec.FV().NumPy()):
                     fn.Assemble()
-                rows.append(fn.vec.FV().NumPy().copy())
+                rows.append(sp.csr_matrix(fn.vec.FV().NumPy()))
             else:
-                rows.append(ngs.LinearForm(fn * fes.TestFunction() * ngs.dx).Assemble().vec.FV().NumPy().copy())
-        blocks.append(sp.csr_matrix(np.array(rows)))
+                rows.append(sp.csr_matrix(ngs.LinearForm(fn * fes.TestFunction() * ngs.dx).Assemble().vec.FV().NumPy()))
+        blocks.append(sp.vstack(rows))
     if averages is not None:
         blocks.append(_average_rows(fes, *averages))
     if points is not None:
@@ -59,7 +61,22 @@ def observation_operator(fes, matrix=None, functionals=None, points=None, averag
     if g.shape[1] != fes.ndof:
         raise ValueError(f"observation matrix has {g.shape[1]} columns, space has {fes.ndof} dofs")
     g.eliminate_zeros()
+    empty = np.flatnonzero(np.diff(g.indptr) == 0)
+    if empty.size:
+        raise ValueError(f"observation(s) {empty[:10].tolist()} are identically zero (rows in the order: matrix, "
+                         "adjoint, functionals, averages, points), e.g. a boundary name that matches nothing; an "
+                         "observation must depend on the field")
     return g
+
+
+def _from_adjoint(adjoint, m):
+    """G (m x ndof, sparse) from Y -> G^T Y, applied to CHUNK unit columns at a time."""
+    blocks = []
+    for i in range(0, m, CHUNK):
+        e = np.zeros((m, min(CHUNK, m - i)))
+        e[np.arange(i, i + e.shape[1]), np.arange(e.shape[1])] = 1.0
+        blocks.append(sp.csr_matrix(np.asarray(adjoint(e)).T))
+    return sp.vstack(blocks)
 
 
 def _average_rows(fes, centers, radius, kernel="ball", bonus_intorder=4):
@@ -83,26 +100,45 @@ def _average_rows(fes, centers, radius, kernel="ball", bonus_intorder=4):
         vol = row @ ones
         if vol <= 0:
             raise ValueError(f"averaging region around {c} does not intersect the mesh")
-        rows.append(row / vol)
-    return sp.csr_matrix(np.array(rows))
+        rows.append(sp.csr_matrix(row / vol))
+    return sp.vstack(rows)
 
 
 def _point_rows(fes, points):
-    """Exact point-evaluation rows from NGSolve's PointEvaluationFunctional (sparse; values read back exactly)."""
+    """Exact point-evaluation rows from NGSolve's PointEvaluationFunctional (sparse; values read back exactly).
+
+    The functional only exposes inner products, so its entries are read with unit vectors on the dofs of the element
+    containing the point (the element NGSolve evaluates in). Each row must reproduce constants (row . 1_h = 1), which
+    checks that no entry was missed.
+    """
+    mesh = fes.mesh
+    if points.shape[1] != mesh.dim:
+        raise ValueError(f"points have {points.shape[1]} coordinates, the mesh is {mesh.dim}D")
     v = fes.TestFunction()
     probe = ngs.la.BaseVector(fes.ndof)
     pv = probe.FV().NumPy()
     pv[:] = 0.0
+    one = ngs.GridFunction(fes)
+    one.Set(1.0)
+    ones = one.vec.FV().NumPy()
     rows, cols, vals = [], [], []
     for i, p in enumerate(points):
+        el = mesh(*p).nr
+        if el < 0:  # NGSolve 6.2.2608 segfaults assembling a point evaluation outside the mesh (known issue 15)
+            raise ValueError(f"point {tuple(float(c) for c in p)} lies outside the mesh")
         sv = v(*p).Assemble()
-        idx = [int(t) for t in re.findall(r"(\d+):", str(sv))]
-        for j in idx:
+        row = {}
+        for j in fes.GetDofNrs(ngs.ElementId(ngs.VOL, el)):
+            if j < 0 or j in row:
+                continue
             pv[j] = 1.0
-            rows.append(i)
-            cols.append(j)
-            vals.append(sv.InnerProduct(probe.FV()))
+            row[j] = sv.InnerProduct(probe.FV())
             pv[j] = 0.0
+        if abs(sum(val * ones[j] for j, val in row.items()) - 1.0) > 1e-8:
+            raise RuntimeError(f"could not read the point evaluation at {tuple(float(c) for c in p)} from element {el}")
+        rows += [i] * len(row)
+        cols += list(row)
+        vals += list(row.values())
     return sp.csr_matrix((vals, (rows, cols)), shape=(len(points), fes.ndof))
 
 

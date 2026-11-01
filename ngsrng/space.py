@@ -64,7 +64,9 @@ class SpaceInfo:
 
     @cached_property
     def mass(self) -> sp.csr_matrix:
-        return assemble(self.fes, mass_form)
+        # on the dgjumps-free twin: a dgjumps space's matrix graph includes facet couplings, which the mass matrix
+        # does not have (3x more stored zeros than entries for L2 p2, and a 6x slower sparse Cholesky)
+        return assemble(self.plain, mass_form)
 
     @cached_property
     def mass_free(self) -> sp.csr_matrix:

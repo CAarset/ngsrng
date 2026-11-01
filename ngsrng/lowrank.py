@@ -1,12 +1,14 @@
 """Finite-rank Gaussians N(m, B K^-1 B*) on FE spaces, and truncated Karhunen-Loeve expansions of any Gaussian."""
 
+import warnings
+
 import ngsolve as ngs
 import numpy as np
 import scipy.linalg as sla
 import scipy.sparse as sp
 import torch
 
-from .backend import numpy_blas_threads
+from .backend import available_memory, numpy_blas_threads
 from .observations import observation_operator, whiten, whitener
 from .randomized import gram_orth, randomized_svd
 from .space import SpaceInfo, coefficient_columns, coefficient_vector
@@ -24,6 +26,8 @@ class LowRankGaussian:
     def __init__(self, fes, b, k, mean=None, d=None, seed=None):
         self.space = SpaceInfo(fes)
         self.b = coefficient_columns(b, fes.ndof)
+        free = self.space.free
+        self._bf = self.b if len(free) == fes.ndof else self.b[free]  # free rows, copied once rather than per apply
         self.k = np.asarray(k, dtype=float)
         self.rinv = sla.solve_triangular(np.linalg.cholesky(self.k).T, np.eye(self.k.shape[0]))  # K^-1 = rinv rinv^T
         if d is not None:
@@ -48,12 +52,12 @@ class LowRankGaussian:
     def apply(self, eta: torch.Tensor) -> torch.Tensor:
         """eta (r x k) -> zero-mean free-dof coefficients (nfree x k): B K^-1/2 eta."""
         e = eta.detach().cpu().double().numpy()
-        return torch.from_numpy(self.b[self.space.free] @ (self.rinv @ e))
+        return torch.from_numpy(self._bf @ (self.rinv @ e))
 
     def apply_t(self, y: torch.Tensor) -> torch.Tensor:
         """Adjoint of ``apply``: (nfree x k) -> (r x k)."""
         v = y.detach().cpu().double().numpy()
-        return torch.from_numpy(self.rinv.T @ (self.b[self.space.free].T @ v))
+        return torch.from_numpy(self.rinv.T @ (self._bf.T @ v))
 
     def sample(self, n=None):
         ns = 1 if n is None else int(n)
@@ -151,6 +155,11 @@ def karhunen_loeve(gauss, rank=None, oversampling=None, power_iterations=None, s
             lam = np.clip(lam[order], 0.0, None)
             keep = lam > lam[0] * 1e-14
             lam, vecs = lam[keep], q @ v[:, order][:, keep]
+    if len(lam) < rank:
+        dims = min(s.nfree, gauss.nrand)
+        why = (f"the Gaussian has only {dims} dimensions" if dims < rank else
+               "the other eigenvalues are numerically zero, below 1e-14 of the largest")
+        warnings.warn(f"karhunen_loeve: rank {len(lam)} instead of {rank} ({why})", stacklevel=2)
     modes = np.zeros((s.ndof, len(lam)))
     modes[s.free] = vecs
     out = LowRankGaussian(s.fes, modes, np.diag(1.0 / lam), mean=gauss.mean, seed=seed)
@@ -213,7 +222,7 @@ def operator_kl(fes, cov, mean=None, seed=0) -> LowRankGaussian:
     sz = apply_sigma(z)
     total = float(np.mean(np.sum(z * sz, axis=0)))  # Hutchinson: E z^T Sigma z = tr(Sigma M)
 
-    rank = cov.rank or min(32, s.nfree)
+    rank = cov.rank or min(32, cov.max_rank, s.nfree)
     while True:
         ell = min(rank + max(10, rank // 2), s.nfree)
         y = apply_a(rng.standard_normal((s.nfree, ell)))
@@ -228,9 +237,21 @@ def operator_kl(fes, cov, mean=None, seed=0) -> LowRankGaussian:
         proj = u.T @ z  # Sigma_r = U Lambda U^T, so z^T Sigma_r z = sum_i lambda_i (u_i^T z)^2
         resid = float(np.mean(np.sum(z * sz, axis=0) - np.sum(lam[:, None] * proj**2, axis=0)))
         rel = max(resid, 0.0) / max(total, 1e-300)
-        if cov.rank is not None or rel <= cov.tol or rank >= min(cov.max_rank, s.nfree):
+        if cov.rank is not None or rel <= cov.tol:
             break
-        rank = min(2 * rank, cov.max_rank, s.nfree)
+        if rank >= min(cov.max_rank, s.nfree):
+            limit = f"max_rank={cov.max_rank}"
+            break
+        nxt = min(2 * rank, cov.max_rank, s.nfree)
+        avail = available_memory()  # the sketch blocks are dense nfree x ell (about six of them alive at a time)
+        if avail is not None and 48.0 * s.nfree * min(nxt + max(10, nxt // 2), s.nfree) > 0.5 * avail:
+            limit = "memory"
+            break
+        rank = nxt
+    if cov.rank is None and rel > cov.tol:
+        warnings.warn(f"operator KL stopped at rank {rank} ({limit}): uncaptured trace ~{rel:.1e} > tol {cov.tol:g}; "
+                      "the field misses that fraction of its variance (rough covariances need high ranks)",
+                      stacklevel=3)
     keep = lam > lam[0] * 1e-14
     modes = np.zeros((s.ndof, int(keep.sum())))
     modes[s.free] = u[:, keep]

@@ -83,3 +83,10 @@ def test_operator_kl_reaches_trace_tolerance(convention):
         approx = lr.modes[prior.space.free] @ np.diag(lr.eigenvalues) @ lr.modes[prior.space.free].T
         true = np.trace((sigma - approx) @ m) / np.trace(sigma @ m)
         assert true < 2 * tol and abs(lr.trace_residual - true) < 0.5 * true + 1e-6
+
+
+def test_karhunen_loeve_warns_when_the_rank_is_not_reached():
+    prior = _prior()
+    with pytest.warns(UserWarning, match=r"instead of 1000 \(the Gaussian has only"):
+        kl = ngsrng.karhunen_loeve(prior, 1000)
+    assert kl.eigenvalues.size <= prior.space.nfree

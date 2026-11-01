@@ -6,7 +6,13 @@ B_iq = w_q phi_i(x_q). Then:
 - the values of f_h = sum c_i phi_i at the points are B^T c / w,
 - int g phi_i dx ~ (B g)_i for point values g, so the L2 projection of point values into V_h is M^-1 B g,
 - b = B W^-1/2 xi (xi iid standard normal) is FE white noise: Cov(b) = B W^-1 B^T = M whenever the rule integrates
-  phi_i phi_j exactly (order >= 2p on affine elements).
+  phi_i phi_j exactly.
+
+``order`` is that of the IntegrationRuleSpace, whose rule is NGSolve's ``IntegrationRule(et, 2 * order)`` (exact for
+polynomials of degree 2 order, on every element type). So order >= p already integrates phi_i phi_j exactly on affine
+elements, and on curved elements NGSolve assembles M with the degree-2p rule, which order = p reproduces and order = 2p
+does not: white noise (``noise.quadrature_noise``) uses order = p. The default here, order = 2p, is the point set of
+the pointwise ("quadrature") representation of the distributions.
 """
 
 from functools import cached_property
@@ -28,7 +34,8 @@ class QuadratureRule:
             raise NotImplementedError("quadrature representations currently need a single element type")
         et = next(iter(mesh.Elements(ngs.VOL))).type
         self.irs = IntegrationRuleSpace(mesh, order=self.order)
-        # IntegrationRuleSpace does not report its 1D rule; it uses Gauss points of twice the requested order.
+        # IntegrationRuleSpace uses IntegrationRule(et, 2 * order) for every element type, but does not report its 1D
+        # rule.
         self.rule = ngs.IntegrationRule(et, 2 * self.order) if et == ngs.ET.SEGM else self.irs.GetIntegrationRules()[et]
         if self.irs.ndof != len(self.rule.points) * mesh.ne:
             raise RuntimeError("could not match the IntegrationRuleSpace points")
@@ -52,6 +59,15 @@ class QuadratureRule:
     @property
     def npoints(self) -> int:
         return len(self.weights)
+
+    @staticmethod
+    def count(space: SpaceInfo, order: int | None = None) -> int | None:
+        """Number of points of ``QuadratureRule(space, order)`` without building it (None: not supported)."""
+        if not space.single_element_type:
+            return None
+        et = next(iter(space.mesh.Elements(ngs.VOL))).type
+        order = 2 * space.order if order is None else order
+        return space.mesh.ne * len(ngs.IntegrationRule(et, 2 * order).points)
 
     @cached_property
     def evaluation_full(self) -> sp.csr_matrix:

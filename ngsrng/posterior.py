@@ -195,9 +195,8 @@ class LinearObservations:
         self.wkind, self.wdata = whitener(noise, self.m)
         self.noise = noise
         self.gf = self.G[:, s.free]  # observation of the free part
-        gh = self.gf.toarray()
-        gh = whiten(self.wkind, self.wdata, gh)  # Gamma^-1/2 G_free (m x nfree)
-        self._gh = gh
+        # Gamma^-1/2 G_free (m x nfree): sparse for diagonal noise, dense only when correlated noise mixes the rows
+        gh = sp.diags(self.wdata) @ self.gf if self.wkind == "diag" else self.wdata @ self.gf
         self._lq = None
         if not factorize:  # observation operator only (e.g. for MatheronPosterior)
             return
@@ -235,11 +234,14 @@ class LinearObservations:
     def rank(self) -> int:
         return self.q.shape[1]
 
-    def _lt(self, x: np.ndarray) -> torch.Tensor:
-        cols = [
-            self.prior.apply_t(torch.from_numpy(np.ascontiguousarray(x[:, i : i + CHUNK])))
-            for i in range(0, x.shape[1], CHUNK)
-        ]
+    def _lt(self, x) -> torch.Tensor:
+        """L^T x, CHUNK columns at a time; x dense or sparse (densified one chunk at a time)."""
+        x = x.tocsc() if sp.issparse(x) else x
+        cols = []
+        for i in range(0, x.shape[1], CHUNK):
+            blk = x[:, i : i + CHUNK]
+            blk = blk.toarray() if sp.issparse(blk) else np.ascontiguousarray(blk)
+            cols.append(self.prior.apply_t(torch.from_numpy(blk)))
         return torch.cat(cols, dim=1).double()
 
     def _l(self, eta: np.ndarray) -> np.ndarray:
@@ -364,11 +366,11 @@ class MatheronPosterior:
 
     def __init__(self, obs: LinearObservations, data=None, seed=None):
         prior, s = obs.prior, obs.prior.space
-        g = obs.gf.toarray()
+        g = obs.gf  # sparse (m x nfree)
         gamma = np.diag(1.0 / obs.wdata**2) if obs.wkind == "diag" else np.asarray(obs.noise, dtype=float)
         lt = obs._lt(g.T)
         self.bmat = obs._l(lt.cpu().numpy())  # Sigma0 G^T (nfree x m_a)
-        kd = gamma + g @ self.bmat
+        kd = gamma + np.asarray(g @ self.bmat)
         self.kd_chol = sla.cho_factor(kd)
         self.gamma_half = np.linalg.cholesky(gamma)
         self.g, self.prior, self.ma = g, prior, obs.m
@@ -394,7 +396,7 @@ class MatheronPosterior:
         e = e[:, None] if e.ndim == 1 else e
         f0 = self.prior.apply(e[: self.prior.nrand]).double().cpu().numpy()
         noise = self.gamma_half @ e[self.prior.nrand :].numpy()
-        corr = self.bmat @ sla.cho_solve(self.kd_chol, noise - self.g @ f0)
+        corr = self.bmat @ sla.cho_solve(self.kd_chol, noise - np.asarray(self.g @ f0))
         out = torch.from_numpy(f0 + corr)
         return out[:, 0] if eta.ndim == 1 else out
 
@@ -403,7 +405,8 @@ class MatheronPosterior:
         v = y.detach().cpu().double()
         v = v[:, None] if v.ndim == 1 else v
         w = sla.cho_solve(self.kd_chol, self.bmat.T @ v.numpy())
-        top = self.prior.apply_t(torch.from_numpy(np.ascontiguousarray(v.numpy() - self.g.T @ w))).double().cpu()
+        top = self.prior.apply_t(torch.from_numpy(np.ascontiguousarray(v.numpy() - np.asarray(self.g.T @ w))))
+        top = top.double().cpu()
         out = torch.cat([top, torch.from_numpy(self.gamma_half.T @ w)], dim=0)
         return out[:, 0] if y.ndim == 1 else out
 

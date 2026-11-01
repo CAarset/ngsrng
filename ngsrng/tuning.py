@@ -16,6 +16,7 @@ import math
 import os
 import shutil
 import sys
+import warnings
 
 ENV_VAR = "NGSRNG_TUNING"
 
@@ -33,8 +34,13 @@ def platform_of(engine: str, device: str, dtype: str) -> str:
     return "cuda-f32" if "32" in str(dtype) else "cuda-f64"
 
 
+# Key fields of the tables bench/report.py writes (power may be fractional, e.g. "2.6" or "2.0")
+KEY_FIELDS = {"noise": "dim|kind|order|ndof", "prior": "dim|kind|order|power|ndof"}
+
+
 class Tuning:
     def __init__(self, data: dict, source: str):
+        _check(data, source)
         self.data, self.source = data, source
 
     @classmethod
@@ -61,11 +67,11 @@ def _nearest(table, dim, kind, order, ndof, power=None):
     best, best_d = None, None
     for key, val in table.items():
         parts = key.split("|")
-        d, k, o = int(parts[0]), parts[1], int(parts[2])
+        d, k, o = int(float(parts[0])), parts[1], int(float(parts[2]))
         if d != dim or k != kind:
             continue
         if power is not None:
-            pw, target = int(parts[3]), float(parts[4])
+            pw, target = float(parts[3]), float(parts[4])
             pdist = abs(pw - power)
         else:
             target, pdist = float(parts[3]), 0
@@ -73,6 +79,24 @@ def _nearest(table, dim, kind, order, ndof, power=None):
         if best_d is None or dist < best_d:
             best, best_d = {**val, "_target": target}, dist
     return best
+
+
+def _check(data, source):
+    """Reject tables this version cannot read (e.g. written by another version of bench/report.py)."""
+    if not isinstance(data, dict):
+        raise ValueError(f"{source}: not a tuning table")
+    for suite, fields in KEY_FIELDS.items():
+        for platform, table in data.get(suite, {}).items():
+            for key, val in table.items():
+                parts = key.split("|")
+                try:
+                    ok = len(parts) == len(fields.split("|")) and isinstance(val, dict) and "method" in val
+                    [float(p) for i, p in enumerate(parts) if i != 1]
+                except ValueError:
+                    ok = False
+                if not ok:
+                    raise ValueError(f"{source}: unreadable {suite} entry {platform}/{key!r} (expected {fields} "
+                                     "with a 'method')")
 
 
 _ACTIVE = {}
@@ -84,7 +108,8 @@ def active():
     if path not in _ACTIVE:
         try:
             _ACTIVE[path] = Tuning.load(path)
-        except (OSError, ValueError):
+        except (OSError, ValueError) as err:
+            warnings.warn(f"ignoring the installed tuning ({err}); the built-in rules apply")
             _ACTIVE[path] = None
     return _ACTIVE[path]
 

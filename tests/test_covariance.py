@@ -288,3 +288,22 @@ def test_robin_boundary_flattens_the_variance(kind):
     b = ngsrng.SpaceInfo(fes if kind == "H1" else ngs.H1(mesh, order=1)).assemble_free(ngsrng.matern(5.0).form)
     one = np.ones(a.shape[0])
     assert abs((one @ (a - b) @ one) / (5.0 / 1.42) / 4.0 - 1) < 1e-10  # beta * |boundary| = (kappa / 1.42) * 4
+
+
+def test_space_passed_as_method_is_a_clear_error():
+    fes = ngs.H1(ngs.Mesh(ngs.unit_square.GenerateMesh(maxh=0.3)), order=1)
+    _, g = _setup(fes)
+    with pytest.raises(TypeError, match="pass a space as fes"):
+        ngsrng.covariance_trace(g, fes)
+    with pytest.raises(TypeError, match="pass a space as fes"):
+        ngsrng.pointwise_variance(g, fes)
+
+
+def test_operator_kl_says_when_it_stops_short():
+    fes = ngs.H1(ngs.Mesh(ngs.unit_square.GenerateMesh(maxh=0.2)), order=1)
+    _, g = _setup(fes, length=0.05)  # rough: slow spectral decay
+    sigma = _dense(g)
+    cov = ngsrng.OperatorCovariance(lambda y: torch.from_numpy(sigma @ y.numpy()), tol=1e-6, max_rank=8)
+    with pytest.warns(UserWarning, match="stopped at rank 8 \\(max_rank=8\\)"):
+        kl = cov.bind(fes, seed=0)
+    assert kl.trace_residual > 1e-6

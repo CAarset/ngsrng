@@ -48,11 +48,11 @@ from .distributions.transforms import (
     named_marginal,
     transformed,
 )
-from .gaussian import Gaussian
+from .gaussian import Gaussian, check_method
 from .lowrank import LowRankGaussian, karhunen_loeve
 from .observations import observation_operator
 from .posterior import MatheronPosterior
-from .space import mass_form
+from .space import SpaceInfo, mass_form
 from .specs import AssembledPrecision, OperatorCovariance, OperatorPrecision, PDEPrecision
 
 DISCRETE = {"poisson", "binomial", "bernoulli", "negative_binomial", "geometric", "logseries", "zipf",
@@ -269,7 +269,7 @@ class Generator:
         self.correlation = _as_spec(*given[0]) if given else None
         self.device = resolve_device(device)
         self.dtype = resolve_dtype(dtype)
-        self.method, self.tol = method, tol
+        self.method, self.tol = (None if method is None else check_method(method)), tol
         self.representation, self.std, self.order, self.output = representation, std, order, output
         self.standardize_by = standardize_by
         self._np = np.random.default_rng(self.seed_sequence.spawn(1)[0])
@@ -340,7 +340,7 @@ class Generator:
         """Coordinates (npoints x dim) of the quadrature points that index pointwise-family values."""
         from .quadrature import QuadratureRule
 
-        return QuadratureRule(self.gaussian().space, self.order if order is None else order).points
+        return QuadratureRule(SpaceInfo(self.fes), self.order if order is None else order).points
 
     def dx(self, order=None):
         """The integration measure to use with quadrature-point fields in forms: ``a * grad(u) * grad(v) *
@@ -348,7 +348,7 @@ class Generator:
         6.2 crashes (segfault). The FE representations (``representation="bernstein"``) work with any ``dx``."""
         from .quadrature import QuadratureRule
 
-        rule = QuadratureRule(self.gaussian().space, self.order if order is None else order)
+        rule = QuadratureRule(SpaceInfo(self.fes), self.order if order is None else order)
         if len(rule.rule) > 256:
             warnings.warn(
                 f"this rule has {len(rule.rule)} points: NGSolve 6.2 crashes in SIMD evaluation of quadrature-point "
@@ -536,8 +536,15 @@ class Generator:
             if isinstance(vals, torch.Tensor):
                 vals = vals.detach().cpu().numpy()
             # C order: samples are contiguous rows (internal arrays are often transposed views)
-            return vals.astype(np.int64 if discrete else torch.empty(0, dtype=dtype).numpy().dtype, order="C",
-                               copy=False)
+            target = np.int64 if discrete else torch.empty(0, dtype=dtype).numpy().dtype
+            try:
+                with np.errstate(over="raise"):
+                    return vals.astype(target, order="C", copy=False)
+            except FloatingPointError:
+                warnings.warn(f"values beyond the range of {np.dtype(target).name} became +-inf in the output; "
+                              "pass dtype='float64' for heavy-tailed fields", RuntimeWarning, stacklevel=4)
+                with np.errstate(over="ignore"):
+                    return vals.astype(target, order="C", copy=False)
         if output == "torch":
             t = torch.as_tensor(vals)
             return t.to(self.device, torch.int64 if discrete else dtype).contiguous()
@@ -657,16 +664,39 @@ class Generator:
         """Gaussian-copula field with any frozen scipy.stats marginal ``dist``."""
         return self.sample("marginal", dist, size=size, **kwargs)
 
-    def as_gridfunction(self, values, order=None) -> ngs.GridFunction:
-        """A GridFunction from one sample's values: FE coefficients (length ndof) or point values (length npoints)."""
+    def as_gridfunction(self, values, order=None, kind="auto") -> ngs.GridFunction:
+        """A GridFunction from one sample's values.
+
+        ``kind="coefficients"``: FE coefficients (length ndof; Gaussian-type fields, ``representation="bernstein"`` or
+        ``"projection"``), giving a GridFunction on the generator's space. ``kind="points"``: values at the quadrature
+        points of ``order`` (the default representation), giving a GridFunction on an **IntegrationRuleSpace**: a
+        coefficient for forms integrated with ``rng.dx(order)``, but not an FE function. It can only be evaluated at
+        its own points; drawing it or evaluating it elsewhere crashes NGSolve 6.2. Use
+        ``representation="bernstein"`` for an FE function. ``kind="auto"`` decides by length and refuses a length that
+        fits both.
+        """
+        from .quadrature import QuadratureRule
+
         values = values.detach().cpu().numpy() if isinstance(values, torch.Tensor) else np.asarray(values)
-        if values.shape[0] == self.fes.ndof:
+        order = self.order if order is None else order
+        if kind == "auto":
+            npoints = QuadratureRule.count(SpaceInfo(self.fes), order)
+            if values.shape[0] == self.fes.ndof == npoints:
+                raise ValueError(f"{npoints} values fit both the coefficients and the quadrature points: pass "
+                                 "kind='coefficients' or kind='points'")
+            kind = "coefficients" if values.shape[0] == self.fes.ndof else "points"
+        if kind == "coefficients":
+            if values.shape[0] != self.fes.ndof:
+                raise ValueError(f"{values.shape[0]} values, the space has {self.fes.ndof} dofs")
             gf = ngs.GridFunction(self.fes)
             gf.vec.FV().NumPy()[:] = values
             return gf
-        from .quadrature import QuadratureRule
-
-        rule = QuadratureRule(self.gaussian().space, self.order if order is None else order)
+        if kind != "points":
+            raise ValueError("kind must be 'auto', 'coefficients' or 'points'")
+        rule = QuadratureRule(SpaceInfo(self.fes), order)
+        if values.shape[0] != rule.npoints:
+            raise ValueError(f"{values.shape[0]} values, the space has {self.fes.ndof} dofs and {rule.npoints} "
+                             f"quadrature points (order {rule.order})")
         return rule.to_gridfunction(values)
 
     def __repr__(self):

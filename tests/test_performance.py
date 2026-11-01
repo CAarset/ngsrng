@@ -47,7 +47,8 @@ def test_apply_and_solver_columns_are_exact_in_threads(fes):
     g = ngsrng.default_rng(fes, seed=1, correlation=0.3, dtype="float64").gaussian()
     eta = torch.from_numpy(np.random.default_rng(0).standard_normal((g.nrand, 9)))
     cols = torch.cat([g.apply(eta[:, [k]]) for k in range(9)], dim=1)  # single columns: NGSolve task parallelism
-    np.testing.assert_allclose(g.apply(eta).numpy(), cols.numpy(), rtol=1e-11, atol=0)
+    # its summation order varies from run to run: entries near zero differ at rounding level (seen: 1.9e-15)
+    np.testing.assert_allclose(g.apply(eta).numpy(), cols.numpy(), rtol=1e-11, atol=1e-13 * cols.abs().max().item())
     solver = NGSolveDirect(SpaceInfo(fes), mass_form)
     x = torch.from_numpy(np.random.default_rng(1).standard_normal((len(SpaceInfo(fes).free), 7)))
     one_by_one = torch.cat([solver.apply(x[:, k]).reshape(-1, 1) for k in range(7)], dim=1)

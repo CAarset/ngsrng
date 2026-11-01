@@ -70,6 +70,14 @@ scipy and torch.distributions names; unknown names fall back to scipy.stats dist
   with `points=`. For an FE function use `representation="bernstein"`: it stays inside the distribution's range at
   every point (see limitation 3). `rng.points()` gives the quadrature point coordinates,
   `rng.as_gridfunction(values)` a GridFunction.
+- So the last axis has different lengths: `ndof` for coefficients (Gaussian-type fields, `representation="bernstein"`
+  or `"projection"`), the number of quadrature points for the default representation (several times `ndof`: about
+  10x for P2 triangles at the default `order`), and the number of `points=` otherwise. `as_gridfunction` of
+  quadrature-point values is a GridFunction on an IntegrationRuleSpace: a coefficient for forms integrated with
+  `rng.dx()`, not an FE function (evaluating or drawing it elsewhere crashes NGSolve,
+  known issue 11).
+- Output arrays are float32 by default, also on the CPU (where everything is computed in float64 and cast at the end).
+  Pass `dtype="float64"` to the generator for double-precision output.
 - Parameters may vary in space (CoefficientFunctions, GridFunctions or arrays of point values).
 - `construction=` picks between genuinely different fields with the same single-point distribution (e.g.
   `chisquare(df, construction="squares" | "copula")`, `wishart(..., construction="process" | "bartlett")`,
@@ -172,6 +180,10 @@ print(prior)  # chosen algorithms (plan) and why
 f = prior.sample()  # GridFunction
 F = prior.sample(100)  # torch tensor (ndof x 100), float32 by default
 ```
+Algorithms can be overridden with `method={...}` (here or in `default_rng`), e.g. `{"engine": "torch", "solver": "cg",
+"noise": "quadrature"}`; the valid keys and names are in `ngsrng.gaussian.METHOD_KEYS`, and anything else raises.
+The approximate white-noise samplers (`"chebyshev"`, `"lumped"`) are never chosen automatically and warn with their
+error when requested.
 
 Precisions:
 - `matern(kappa, power)` (H1) or `matern_dg(fes, kappa, power)` (L2 with `dgjumps=True`): $\mathcal C = \mathcal A^{-\text{power}}$.
@@ -179,7 +191,8 @@ Precisions:
   condition the variance is about twice as large at edges and four times as large in corners;
   `matern_correlation(..., boundary="robin")` keeps it within a few percent of the interior value except near corners
   (up to about 12% lower there), as measured in the Stokes walkthrough.
-  `power` is any positive real (Matérn smoothness $\nu=\text{power}-d/2$). Integer powers are exact. Real powers use
+  `power` is any positive real (Matérn smoothness $\nu=\text{power}-d/2$). Integer powers are exact, except odd powers of forms with facet terms (`matern_dg`), which take the
+  rational route below with a relative accuracy of `rtol` (no global factorisation is ever formed). Real powers use
   a rational approximation with relative accuracy `rtol` (default 1e-7) on the discrete spectrum, i.e. 7–25 shifted
   solves $(K+tM)^{-1}$ per sample.
 - `PDEPrecision(form, power)`: any bilinear form.

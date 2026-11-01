@@ -190,6 +190,21 @@ def available_threads() -> int:
         return os.cpu_count() or 1
 
 
+def available_memory() -> float | None:
+    """Bytes of host memory available to new allocations (Linux ``MemAvailable``), or None where unknown."""
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return float(line.split()[1]) * 1024
+    except OSError:
+        pass
+    try:
+        return float(os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
+    except (AttributeError, ValueError, OSError):
+        return None
+
+
 _POOL = []
 _IN_WORKER = threading.local()
 

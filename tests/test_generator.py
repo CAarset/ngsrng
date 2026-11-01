@@ -201,3 +201,31 @@ def test_dx_matches_the_quadrature_representation(rng, fes):
     cube = ngs.H1(ngs.Mesh(ngs.unit_cube.GenerateMesh(maxh=0.6)), order=1)
     with pytest.warns(UserWarning, match="crashes in SIMD"):
         ngsrng.default_rng(cube, correlation=0.5).dx(order=6)
+
+
+def test_as_gridfunction_kinds(fes):
+    rng = ngsrng.default_rng(fes, seed=0, correlation=0.3, dtype="float64")
+    coeffs = rng.normal(size=1)[0]
+    assert rng.as_gridfunction(coeffs).space is fes
+    vals = rng.uniform(size=1)[0]
+    gf = rng.as_gridfunction(vals)
+    assert gf.vec.size == rng.points().shape[0] != fes.ndof
+    with pytest.raises(ValueError, match="quadrature points"):
+        rng.as_gridfunction(vals[:-1])
+    # a space whose quadrature points happen to number ndof (L2 p = 1 on triangles: 3 dofs and, at order 1, 3 points)
+    l2 = ngs.L2(fes.mesh, order=1)
+    r0 = ngsrng.default_rng(l2, order=1)  # no correlation needed for this
+    assert r0.points().shape[0] == l2.ndof
+    with pytest.raises(ValueError, match="fit both"):
+        r0.as_gridfunction(np.zeros(l2.ndof))
+    assert r0.as_gridfunction(np.zeros(l2.ndof), kind="coefficients").space is l2
+
+
+def test_float32_overflow_is_named(fes):
+    r = ngsrng.default_rng(fes, seed=3, correlation=0.3)  # float32 output
+    d = r.distribution("lognormal", 0.0, 3.0)
+    n = d.field.points.npoints
+    d.field.points.standardized = lambda k, dev=False: np.full((n, k), 40.0)  # exp(120) > float32 max
+    with pytest.warns(RuntimeWarning, match="beyond the range of float32.*dtype='float64'"):
+        x = d.sample(1)
+    assert np.isinf(x).all()

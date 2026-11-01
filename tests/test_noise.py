@@ -97,3 +97,90 @@ def test_dg_form_is_rejected_by_local_gram():
 
     with pytest.raises(RuntimeError):
         nz.LocalGramNoise(SpaceInfo(fes), form=form)
+
+
+def test_quadrature_noise_rejects_inexact_rules():
+    """Regression: the self-check used to be diagonal-only and skipped below order 2p, i.e. exactly where it fails
+    (P2 at order 1: ~1e-2 relative covariance error)."""
+    space = SpaceInfo(ngs.H1(ngs.Mesh(ngs.unit_square.GenerateMesh(maxh=0.3)), order=2))
+    with pytest.raises(RuntimeError, match="not exact"):
+        nz.quadrature_noise(space, order=1)
+    # the rule of order o has degree 2 o: order p is already exact
+    assert _cov_error(nz.quadrature_noise(space, order=2), space) < 1e-12
+
+
+def test_factor_error_sees_off_diagonal_errors():
+    space = SpaceInfo(ngs.H1(ngs.Mesh(ngs.unit_square.GenerateMesh(maxh=0.3)), order=1))
+    m = space.mass_free
+    lumped = nz.LumpedNoise(m)
+    assert nz.factor_error(nz.dense_cholesky_noise(m).h, m) < 1e-12
+    assert nz.factor_error(lumped.h, m) > 1e-2
+    dense = m.toarray()
+    assert lumped.rel_error == pytest.approx(np.abs(np.diag(dense.sum(axis=1)) - dense).max() / np.abs(dense).max())
+
+
+def _mixed_mesh(nx=4, ny=3):
+    """Unit square: quadrilaterals on the left half, triangles on the right; boundaries "left" and "rest"."""
+    import netgen.meshing as nm
+
+    mesh = nm.Mesh(dim=2)
+    p = {(i, j): mesh.Add(nm.MeshPoint(nm.Pnt(i / nx, j / ny, 0))) for j in range(ny + 1) for i in range(nx + 1)}
+    dom = mesh.AddRegion("dom", dim=2)
+    left, rest = mesh.AddRegion("left", dim=1), mesh.AddRegion("rest", dim=1)
+    for j in range(ny):
+        for i in range(nx):
+            a, b, c, d = p[i, j], p[i + 1, j], p[i + 1, j + 1], p[i, j + 1]
+            if i < nx // 2:
+                mesh.Add(nm.Element2D(dom, [a, b, c, d]))
+            else:
+                mesh.Add(nm.Element2D(dom, [a, b, c]))
+                mesh.Add(nm.Element2D(dom, [a, c, d]))
+    for j in range(ny):
+        mesh.Add(nm.Element1D([p[0, j + 1], p[0, j]], index=left))
+        mesh.Add(nm.Element1D([p[nx, j], p[nx, j + 1]], index=rest))
+    for i in range(nx):
+        mesh.Add(nm.Element1D([p[i, 0], p[i + 1, 0]], index=rest))
+        mesh.Add(nm.Element1D([p[i + 1, ny], p[i, ny]], index=rest))
+    return ngs.Mesh(mesh)
+
+
+@pytest.mark.parametrize(
+    "make",
+    [lambda: SPACES["2D-H1-p4-dir"](), lambda: SPACES["3D-H1-p3-dir"](), lambda: SPACES["2D-L2-p2-dgjumps"](),
+     lambda: SPACES["2D-H1-p3-mapped"](), lambda: ngs.H1(_mixed_mesh(), order=2, dirichlet="left"),
+     lambda: ngs.L2(_mixed_mesh(), order=1)],
+    ids=["2D-H1-dir", "3D-H1-dir", "2D-L2-dgjumps", "mapped-quads", "mixed-H1-dir", "mixed-L2"],
+)
+@pytest.mark.parametrize("kind", ["local-gram", "local-gram-explicit", "quadrature"])
+def test_element_of_column(make, kind):
+    """Per-element operations (type-G mixing) scale noise column c by a variable of element element_of_column[c]
+    (an NGSolve element number): every column must live on that element's dofs, and every element own columns."""
+    space = SpaceInfo(make())
+    if kind == "quadrature" and not space.single_element_type:
+        pytest.skip("quadrature representations need one element type")
+    sampler = {"local-gram": lambda: nz.LocalGramNoise(space).setup(*CPU64),
+               "local-gram-explicit": lambda: nz.LocalGramNoise(space).explicit(),
+               "quadrature": lambda: nz.quadrature_noise(space)}[kind]()
+    h = sampler.factor().tocsc()
+    emap = sampler.element_of_column
+    assert emap.shape == (sampler.nrand,)
+    assert set(emap) == set(range(space.mesh.ne))
+    freepos = np.full(space.ndof, -1)
+    freepos[space.free] = np.arange(space.nfree)
+    owned = [set(freepos[list(el.dofs)]) - {-1} for el in space.fes.Elements(ngs.VOL)]
+    for c in range(h.shape[1]):
+        rows = h.indices[h.indptr[c]:h.indptr[c + 1]][np.abs(h.data[h.indptr[c]:h.indptr[c + 1]]) > 0]
+        assert set(rows) <= owned[emap[c]], (c, emap[c])
+
+
+def test_quadrature_noise_default_order_is_exact_on_curved_meshes():
+    """The default rule (order p) is the one NGSolve assembles M with, also on curved elements; order 2p is not."""
+    from netgen.occ import Circle, OCCGeometry
+
+    mesh = ngs.Mesh(OCCGeometry(Circle((0, 0), 1).Face(), dim=2).GenerateMesh(maxh=0.5))
+    mesh.Curve(3)
+    space = SpaceInfo(ngs.H1(mesh, order=3))
+    noise = nz.quadrature_noise(space)
+    assert noise.quad_order == 3 and _cov_error(noise, space) < 1e-12
+    with pytest.raises(RuntimeError, match="not exact"):
+        nz.quadrature_noise(space, order=6)

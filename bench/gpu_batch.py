@@ -78,17 +78,21 @@ def checks(device, log):
     u = rng.uniform(size=4000, output="numpy")
     out["uniform_ks_min_p"] = float(min(st.kstest(u[:, j], "uniform").pvalue for j in (0, 1000, 5000)))
     # out= equals the returned arrays (same seeds; two separately built generators: their factorisations, on the
-    # GPU as on the CPU, agree to rounding, not bit for bit)
+    # GPU as on the CPU, agree to rounding, not bit for bit). Rounding differences of the solves grow with the
+    # condition number (~1e4 here), so the gate is relative to the dtype's precision: it is there to catch wrong
+    # means, seeds or transforms (O(1) differences), not rounding (measured 3.7e-4 in float32 at 6cb2b82)
+    dt = torch.float32  # the generators' default dtype
     diffs = []
     for name, args in (("normal", ()), ("lognormal", (0.0, 0.5)), ("uniform", ())):
-        a = getattr(ngsrng.default_rng(fes, seed=2, correlation=corr, device=device), name)(*args, size=5,
-                                                                                            output="torch")
+        a = getattr(ngsrng.default_rng(fes, seed=2, correlation=corr, device=device, dtype=dt), name)(
+            *args, size=5, output="torch")
         buf = torch.empty_like(a)
-        getattr(ngsrng.default_rng(fes, seed=2, correlation=corr, device=device), name)(*args, out=buf)
+        getattr(ngsrng.default_rng(fes, seed=2, correlation=corr, device=device, dtype=dt), name)(*args, out=buf)
         diffs.append(float(((buf - a).abs() / a.abs().clamp_min(1e-3)).max()))
     out["out_vs_returned_max_rel"] = max(diffs)
+    out["out_vs_returned_tol"] = 1e5 * torch.finfo(dt).eps
     out["passed"] = (out["ndtr_max_rel_float64"] < 1e-11 and out["gauss_var_max_abs_z"] < 5
-                     and out["uniform_ks_min_p"] > 1e-4 and out["out_vs_returned_max_rel"] < 1e-4)
+                     and out["uniform_ks_min_p"] > 1e-4 and out["out_vs_returned_max_rel"] < out["out_vs_returned_tol"])
     log(f"checks: {out}")
     return out
 
