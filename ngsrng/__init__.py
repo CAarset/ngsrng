@@ -1,5 +1,6 @@
 """ngsrng: function-space random variables in NGSolve finite element spaces."""
 
+from .boundary import BoundarySampler, boundary_covariance, boundary_dofs, boundary_mass  # [bnd] boundary sampling
 from .correlation import MaternCorrelation
 from .correlation import matern as matern_correlation
 from .covariance import (
@@ -50,3 +51,4 @@ __all__ = [
     "matern",
     "matern_dg",
 ]
+__all__ += ["BoundarySampler", "boundary_covariance", "boundary_dofs", "boundary_mass"]  # [bnd] boundary sampling
