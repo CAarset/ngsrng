@@ -177,3 +177,29 @@ def test_exact_posterior_memory_check(fes, monkeypatch):
         ngsrng.MatheronPosterior(obs)
     monkeypatch.setattr("ngsrng.posterior.available_memory", lambda: 1e12)
     ngsrng.LinearObservations(prior, points=pts, noise=1e-2)
+
+
+@pytest.mark.parametrize("name,args,kw", [
+    ("normal", (), {"bnd": "left"}),
+    ("uniform", (), {"bnd": "left"}),
+    ("gamma", (2.0,), {"bnd": "bottom", "representation": "bernstein"}),
+    ("normal", (1.0, 0.5), {"bnd": "left", "bnd_mode": "field"}),
+    ("normal", (), {"bnd": "left", "bnd_values": 0.25}),
+], ids=["restrict-normal", "restrict-uniform", "restrict-bernstein", "field-drawn", "field-prescribed"])
+def test_boundary_draws_fill_in_place(fes, name, args, kw):
+    """bnd= draws (ngsrng/boundary.py) through out=: the boundary step runs on the filled buffer chunk by chunk, with
+    the trace noise drawn sample by sample, so the result equals the allocating call."""
+    kw = dict(kw)
+    if "bnd_values" in kw:  # prescribed data on the boundary DoFs
+        n_bnd = ngsrng.boundary_dofs(fes, kw["bnd"]).size
+        kw["bnd_values"] = np.full(n_bnd, kw["bnd_values"])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ref = np.asarray(ngsrng.default_rng(fes, seed=4, correlation=0.4).sample(name, *args, size=6, **kw))
+        buf = np.empty_like(ref)
+        rng = ngsrng.default_rng(fes, seed=4, correlation=0.4, work_values=SMALL_WORK)
+        assert rng.sample(name, *args, size=6, out=buf, **kw) is buf
+    np.testing.assert_allclose(buf, ref, rtol=1e-6, atol=1e-6 * np.abs(ref).max())  # float32 / float64 rounding
+    off = np.setdiff1d(np.arange(fes.ndof), ngsrng.boundary_dofs(fes, kw["bnd"], free_only=False))
+    if kw.get("bnd_mode") != "field" and "bnd_values" not in kw:
+        assert np.all(buf[:, off] == 0)  # restrict: zero off the boundary

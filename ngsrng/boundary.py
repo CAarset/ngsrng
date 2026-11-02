@@ -194,22 +194,44 @@ class BoundarySampler:
         self._off = np.setdiff1d(np.arange(self.fes.ndof), self.dofs)
         self._chol = None
         self._residual = None
-
-        src = as_covariance(source, self.fes)
-        E = np.zeros((free.size, self.n_bnd))
-        E[self._pos, np.arange(self.n_bnd)] = 1.0
-        cols = np.asarray(src.sigma(E), dtype=np.float64)          # Sigma_h[:, B], free coordinates
-        self._cols = cols
-        block = cols[self._pos, :]
-        self.sigma_bb = 0.5 * (block + block.T)
-        # Dense linear algebra below is only ever on n_bnd x n_bnd blocks (the trace DoFs); everything of interior
-        # size stays sparse. sigma_bb is the one small dense factorisation: it is n_bnd^2 by construction.
-        self._bb = spla.splu(sp.csc_matrix(self.sigma_bb))
-        self.lifting = cols @ self._bb.solve(np.eye(self.n_bnd))
-        self.lifting[self._pos, :] = np.eye(self.n_bnd)            # R P = I, so R(u - P(Ru - g)) = g exactly
-        self.P = np.zeros((self.fes.ndof, self.n_bnd))
-        self.P[free, :] = self.lifting
+        self._src = as_covariance(source, self.fes)
+        # sigma_bb, lifting and P need n_bnd applications of Sigma_h and dense n_free x n_bnd blocks: computed on
+        # first use, so "restrict" draws (which only need the DoF lists) never form them
+        self._regression = None
         self.info = {"name": self.name, "n_bnd": self.n_bnd, "dofs": self.dofs.copy()}
+
+    def _regress(self):
+        if self._regression is None:
+            free = self.space.free
+            E = np.zeros((free.size, self.n_bnd))
+            E[self._pos, np.arange(self.n_bnd)] = 1.0
+            cols = np.asarray(self._src.sigma(E), dtype=np.float64)  # Sigma_h[:, B], free coordinates
+            block = cols[self._pos, :]
+            sigma_bb = 0.5 * (block + block.T)
+            # Dense linear algebra below is only ever on n_bnd x n_bnd blocks (the trace DoFs); everything of
+            # interior size stays sparse. sigma_bb is the one small dense factorisation: n_bnd^2 by construction.
+            bb = spla.splu(sp.csc_matrix(sigma_bb))
+            lifting = cols @ bb.solve(np.eye(self.n_bnd))
+            lifting[self._pos, :] = np.eye(self.n_bnd)                  # R P = I, so R(u - P(Ru - g)) = g exactly
+            P = np.zeros((self.fes.ndof, self.n_bnd))
+            P[free, :] = lifting
+            self._regression = (sigma_bb, lifting, P)
+        return self._regression
+
+    @property
+    def sigma_bb(self):
+        """Covariance of the boundary DoFs (n_bnd x n_bnd)."""
+        return self._regress()[0]
+
+    @property
+    def lifting(self):
+        """``Sigma_{.,B} Sigma_BB^{-1}`` on the free DoFs (n_free x n_bnd), identity rows at ``B``."""
+        return self._regress()[1]
+
+    @property
+    def P(self):
+        """The lifting on all DoFs (ndof x n_bnd; zero rows at fixed DoFs)."""
+        return self._regress()[2]
 
     # ----------------------------------------------------------------------- diagnostics
 
@@ -282,7 +304,8 @@ class BoundarySampler:
             if w.min() <= -1e-8 * max(w.max(), 1e-300):
                 raise np.linalg.LinAlgError("the boundary covariance block is not positive semidefinite")
             self._chol = V * np.sqrt(np.clip(w, 0.0, None))
-        out = float(scale) * (self._chol @ rng.standard_normal((self.n_bnd, int(n)))).T
+        # drawn sample by sample, so in-place fills in chunks give the draws of one call (ngsrng.inplace)
+        out = float(scale) * (rng.standard_normal((int(n), self.n_bnd)) @ self._chol.T)
         loc = _vector(loc)
         if loc is not None:
             out += loc[self.dofs]

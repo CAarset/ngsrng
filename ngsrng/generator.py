@@ -516,26 +516,10 @@ class Generator:
                 raise ValueError(f"out has shape {tuple(target.shape)}, size is {shape}")
         n = math.prod(shape)
         flat = target.view(n, -1)
-        per = flat.shape[1]
-        # bound the output values and the Gaussian coefficients behind them (ndof per sample; values at a few points
-        # would otherwise put the whole batch's coefficients, and the solvers' work blocks, in memory at once)
-        ndof = getattr(getattr(field, "space", None), "ndof", 0)
-        batch = max(1, int(self.BATCH_VALUES // max(per, ndof, 1)))
-        bnd = getattr(field, "bnd", None)  # [bnd] boundary (trace) sampling: ngsrng/boundary.py
-        for k0 in range(0, n, batch):
-            rows = flat[k0 : k0 + batch]
-            if hasattr(field, "sample_into") and field.sample_into(rows):
-                if bnd is not None:  # [bnd]
-                    self._apply_bnd(field, rows)
-                continue
-            vals = field.sample(rows.shape[0])
-            vals = vals if isinstance(vals, torch.Tensor) else torch.from_numpy(vals)
-            vals = vals.movedim(-1, 0).reshape(rows.shape[0], -1)
-            if vals.shape[1] != per:
-                raise ValueError(f"out holds {per} values per sample, {name} gives {vals.shape[1]}")
-            rows.copy_(vals)  # cast (and device transfer) in one pass
-            if bnd is not None:  # [bnd]
-                self._apply_bnd(field, rows)
+        field.sample_into(flat)
+        if getattr(field, "bnd", None) is not None:  # [bnd] in place, chunk by chunk (bounded temporaries)
+            for k0, k1 in chunks(n, flat.shape[1], self.work_values):
+                self._apply_bnd(field, flat[k0:k1])
         return out
 
     def _draw(self, field, size, output, name, out=None):
