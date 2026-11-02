@@ -324,7 +324,24 @@ def test_boundary_eigenvalue_decay(mesh):
     assert slopes[3] < slopes[2], slopes
     # The asymptotic exponent -(2 power - 1) needs a boundary mesh fine enough to resolve the bulk of the
     # spectrum; with a handful of trace DoFs only the qualitative behaviour is measurable. The exponent is
-    # measured on a refined mesh.
+    # compared with the continuum spectrum on refined meshes outside the test suite.
+
+
+def test_trace_spectrum_is_that_of_the_trace_operator():
+    """The eigenvalues are those of Sigma_BB M_Gamma: they sum to E||gamma u||^2 = tr(M_Gamma Sigma_BB), and at
+    power = 1 they approximate the Neumann-to-Dirichlet map of the square, mu_0 = 1, mu_k = tanh(k pi) / (k pi)."""
+    fes = h1(ngs.Mesh(ngs.unit_square.GenerateMesh(maxh=0.125)), 2)
+    form = lambda uu, vv: ngs.InnerProduct(ngs.grad(uu), ngs.grad(vv)) * ngs.dx
+    rng = ngsrng.default_rng(fes, seed=1, precision=ngsrng.PDEPrecision(form, power=1), dtype="float64")
+    sam = BoundarySampler(rng.gaussian(), "left")
+    w = sam.trace_eigenvalues()
+    Mg = ngsrng.boundary.boundary_mass(fes, "left").tocsc()[sam.dofs][:, sam.dofs]
+    assert abs(w.sum() - np.trace(Mg @ sam.sigma_bb)) < 1e-12 * w.sum()
+    k = np.arange(1, 4)
+    mu = np.concatenate([[1.0], np.tanh(k * np.pi) / (k * np.pi)])
+    assert np.abs(w[:4] / mu - 1).max() < 1e-2, w[:4] / mu
+    top = sam.trace_eigenvalues(n=3)
+    assert np.allclose(top, w[:3], rtol=1e-8), (top, w[:3])
 
 
 def test_3d_face(mesh3):
@@ -373,3 +390,29 @@ def test_torch_engine_matches(mesh):
     # The two engines factor C differently (a sparse Cholesky path against the torch one), so this compares the
     # law to solver accuracy, not bit for bit. Measured here: 2e-9 relative.
     assert np.abs(S1 - S2).max() < 1e-6 * np.abs(S1).max()
+
+
+@pytest.mark.parametrize("power", [1, 2])
+def test_correction_paths_agree(mesh, monkeypatch, power):
+    """The three ways of applying the lifting P without forming it -- sparse harmonic lifting (power 1), small dense
+    lifting, matrix-free Sigma application -- give the same conditioned samples."""
+    import ngsrng.boundary as bmod
+
+    fes = h1(mesh, 2)
+    form = lambda u, v: (ngs.InnerProduct(ngs.grad(u), ngs.grad(v)) + 4.0 * u * v) * ngs.dx
+    g = ngsrng.Gaussian(fes, ngsrng.PDEPrecision(form, power=power), dtype="float64", seed=0)
+    rows = g.sample(5).T.numpy().copy()
+    data = np.linspace(-1.0, 1.0, boundary_dofs(fes, "left").size)
+    results = []
+    for dense_limit, sparse in ((2**24, True), (2**24, False), (0, False)):
+        monkeypatch.setattr(bmod, "DENSE_LIFTING_VALUES", dense_limit)
+        sam = BoundarySampler(g, "left")
+        if not sparse:
+            sam._sparse_form = None
+        elif power != 1:
+            continue
+        results.append(sam.condition(rows.copy(), data))
+    assert len(results) >= 2
+    for r in results[1:]:
+        np.testing.assert_allclose(r, results[0], rtol=1e-8, atol=1e-10 * np.abs(results[0]).max())
+    assert np.all(results[0][:, sam.dofs] == data)

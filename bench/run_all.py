@@ -298,6 +298,8 @@ def main():
         help="per-worker resident memory limit (default: 80%% of currently available memory)",
     )
     ap.add_argument("--resume", default=None, help="run directory to continue")
+    ap.add_argument("--out", default=None,
+                    help="run directory of a new run (default: results/runs/<host>_<date>_<profile>)")
     ap.add_argument("--dry-run", action="store_true", help="list groups and task counts only")
     ap.add_argument(
         "--install",
@@ -324,7 +326,7 @@ def main():
         args.profile, devices = saved["profile"], saved["devices"]
     else:
         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M")
-        run_dir = os.path.join(ROOT, "results", "runs", f"{env['host']}_{stamp}_{args.profile}")
+        run_dir = args.out or os.path.join(ROOT, "results", "runs", f"{env['host']}_{stamp}_{args.profile}")
         os.makedirs(run_dir, exist_ok=True)
         with open(os.path.join(run_dir, "config.json"), "w") as fh:
             json.dump(

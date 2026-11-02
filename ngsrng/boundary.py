@@ -49,17 +49,21 @@ The two modes of ``bnd="name"``
     ``Cov(u - P R u, R u) = Sigma_{.,B} - P Sigma_BB = 0``, the pair ``(u*, R u*) = (u - P R u + P g, g)`` has the
     same joint law as ``(u, R u)``: the field remains an exact prior draw whose trace is an independent draw of the
     boundary marginal. With prescribed ``g`` it is exact hard Dirichlet conditioning (the Matheron / Gibbs form).
+    With a drawn ``g`` the result has the law of a plain prior draw (that is the content of the identity), so the
+    mode only matters with prescribed data. ``P`` is never formed: for a sparse precision ``Q`` (power 1, assembled
+    precisions) ``P d`` is the discrete harmonic lifting ``(d, -Q_II^-1 Q_IB d)``, one sparse solve; otherwise it is
+    ``Sigma E Sigma_BB^-1 d``, one application of ``Sigma_h`` plus a Cholesky solve with the ``n_B x n_B`` block.
     For copula families the latent Gaussian must be conditioned before the pointwise map, so only ``"restrict"`` is
     offered there.
 
 Regularity
 ----------
 ``Sigma_BB`` is a principal block of an SPD matrix and always exists: the discrete trace is bounded regardless of
-the field's regularity. Continuum trace-class-ness is a different question: the RKHS of a Whittle-Matern prior is
-``H^{power}(D)``, evaluation on a ``d'``-dimensional set is bounded iff ``power > d - d'/2``, and Seeley's trace
-calculus makes ``gamma C gamma*`` a pseudo-differential operator of order ``-(2 power - 1)`` on the
-``(d-1)``-dimensional boundary, with eigenvalues ``~ j^{-(2 power - 1)/(d-1)}``: trace class exactly when
-``2 power > d`` -- the same threshold the bulk point-value guard uses. So the sampler needs no new regularity
+the field's regularity. Continuum trace-class-ness is a different question. For ``C = A^-power`` the trace
+covariance ``gamma C gamma*`` is a pseudo-differential operator of order ``-(2 power - 1)`` on the
+``(d-1)``-dimensional boundary (Seeley, Grubb), with eigenvalues ``~ j^{-(2 power - 1)/(d-1)}``: trace class exactly
+when ``2 power > d`` -- the same threshold the bulk point-value guard uses (``E|u(x)|^2 < inf`` iff
+``delta_x in H^{-power}``, i.e. ``2 power > d``). So the sampler needs no new regularity
 condition, but whether the returned data converges to an ``L^2(Gamma)`` function as ``h -> 0`` does;
 :meth:`BoundarySampler.trace_eigenvalues` measures the exponent.
 
@@ -69,10 +73,12 @@ Reverting this prototype: delete this file, the lines tagged ``[bnd]`` in ``ngsr
 
 import ngsolve as ngs
 import numpy as np
+import scipy.linalg as sla
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 
-from .covariance import as_covariance
+from .backend import available_memory
+from .covariance import CHUNK, as_covariance
 from .space import SpaceInfo, assemble, to_scipy
 
 try:  # torch rows arrive from the GPU engine; the algebra below is written to run in either backend
@@ -86,6 +92,10 @@ __all__ = ["boundary_mass", "boundary_dofs", "boundary_covariance", "BoundarySam
 RESTRICT, FIELD = "restrict", "field"
 MODES = (RESTRICT, FIELD)
 _TOL = 1e-13
+# Largest dense lifting P (n_free x n_bnd entries) kept for the correction of a general source: below it a product
+# with P is cheaper than an application of Sigma_h; above it, P (which grows like N^((2d-1)/d) under refinement, unlike
+# a fixed low rank) is never formed
+DENSE_LIFTING_VALUES = 2**24
 
 
 def _convert(arr, x):
@@ -138,7 +148,7 @@ def boundary_dofs(fes, name, free_only=True):
     ``free_only=False`` also returns DoFs that the space fixes through ``dirichlet=``.
     """
     diag = boundary_mass(fes, name).diagonal()
-    dofs = np.flatnonzero(diag > _TOL * max(float(np.abs(diag).max()), 1.0))
+    dofs = np.flatnonzero(diag > _TOL * float(np.abs(diag).max(initial=0.0)))  # relative: unit independent
     if not free_only:
         return dofs
     free = np.asarray(fes.FreeDofs(), dtype=bool)
@@ -192,46 +202,102 @@ class BoundarySampler:
         self._free = np.zeros(free.size, dtype=bool)
         self._free[self._pos] = True
         self._off = np.setdiff1d(np.arange(self.fes.ndof), self.dofs)
-        self._chol = None
+        self._root = None          # symmetric square root of sigma_bb (trace draws)
+        self._chol = None          # Cholesky factor of sigma_bb (correction of general sources)
         self._residual = None
         self._src = as_covariance(source, self.fes)
-        # sigma_bb, lifting and P need n_bnd applications of Sigma_h and dense n_free x n_bnd blocks: computed on
-        # first use, so "restrict" draws (which only need the DoF lists) never form them
-        self._regression = None
+        self._sigma_bb = None      # n_bnd applications of Sigma_h, on first use: "restrict" draws never need it
+        self._cols = None          # Sigma_h[:, B] (free rows), kept only when it is at most DENSE_LIFTING_VALUES
+        self._dense = None         # the corresponding small dense lifting, used by the correction
+        self._regression = None    # dense lifting and P as attributes: diagnostics, on request only
+        # Sigma^-1 assembled and sparse (power 1, assembled precisions): the lifting is the sparse harmonic one
+        self._sparse_form = _sparse_precision(source)
+        self._q = None
         self.info = {"name": self.name, "n_bnd": self.n_bnd, "dofs": self.dofs.copy()}
-
-    def _regress(self):
-        if self._regression is None:
-            free = self.space.free
-            E = np.zeros((free.size, self.n_bnd))
-            E[self._pos, np.arange(self.n_bnd)] = 1.0
-            cols = np.asarray(self._src.sigma(E), dtype=np.float64)  # Sigma_h[:, B], free coordinates
-            block = cols[self._pos, :]
-            sigma_bb = 0.5 * (block + block.T)
-            # Dense linear algebra below is only ever on n_bnd x n_bnd blocks (the trace DoFs); everything of
-            # interior size stays sparse. sigma_bb is the one small dense factorisation: n_bnd^2 by construction.
-            bb = spla.splu(sp.csc_matrix(sigma_bb))
-            lifting = cols @ bb.solve(np.eye(self.n_bnd))
-            lifting[self._pos, :] = np.eye(self.n_bnd)                  # R P = I, so R(u - P(Ru - g)) = g exactly
-            P = np.zeros((self.fes.ndof, self.n_bnd))
-            P[free, :] = lifting
-            self._regression = (sigma_bb, lifting, P)
-        return self._regression
 
     @property
     def sigma_bb(self):
-        """Covariance of the boundary DoFs (n_bnd x n_bnd)."""
-        return self._regress()[0]
+        """Covariance of the boundary DoFs (n_bnd x n_bnd): ``n_bnd`` applications of ``Sigma_h``, ``CHUNK`` at a
+        time, keeping only the boundary rows (dense ``n_bnd^2``, never ``n_free x n_bnd``)."""
+        if self._sigma_bb is None:
+            need, avail = 24.0 * self.n_bnd**2, available_memory()
+            if avail is not None and need > avail:
+                raise MemoryError(f"the boundary covariance block of '{self.name}' ({self.n_bnd} trace DoFs) needs "
+                                  f"~{need / 2**30:.1f} GiB, {avail / 2**30:.1f} GiB available")
+            block = np.empty((self.n_bnd, self.n_bnd))
+            small = self.space.nfree * self.n_bnd <= DENSE_LIFTING_VALUES
+            cols = np.empty((self.space.nfree, self.n_bnd)) if small else None
+            for j0 in range(0, self.n_bnd, CHUNK):
+                j1 = min(self.n_bnd, j0 + CHUNK)
+                e = np.zeros((self.space.nfree, j1 - j0))
+                e[self._pos[j0:j1], np.arange(j1 - j0)] = 1.0
+                c = np.asarray(self._src.sigma(e), dtype=np.float64)
+                block[:, j0:j1] = c[self._pos]
+                if small:
+                    cols[:, j0:j1] = c
+            self._sigma_bb = 0.5 * (block + block.T)
+            self._cols = cols
+        return self._sigma_bb
+
+    def _regress(self):
+        """Dense lifting ``Sigma_{.,B} Sigma_BB^{-1}`` (n_free x n_bnd) and P (ndof x n_bnd): diagnostics only;
+        sampling applies them matrix-free (:meth:`_correction`)."""
+        if self._regression is None:
+            _dense_guard(self.fes.ndof, self.n_bnd, "the lifting P")
+            eye = np.eye(self.n_bnd)
+            lifting = self._correction(eye)[:, self.space.free].T  # column j: P e_j
+            P = np.zeros((self.fes.ndof, self.n_bnd))
+            P[self.space.free, :] = lifting
+            self._regression = (lifting, P)
+        return self._regression
 
     @property
     def lifting(self):
-        """``Sigma_{.,B} Sigma_BB^{-1}`` on the free DoFs (n_free x n_bnd), identity rows at ``B``."""
-        return self._regress()[1]
+        """``Sigma_{.,B} Sigma_BB^{-1}`` on the free DoFs (n_free x n_bnd, dense; a diagnostic), identity rows at
+        ``B``."""
+        return self._regress()[0]
 
     @property
     def P(self):
-        """The lifting on all DoFs (ndof x n_bnd; zero rows at fixed DoFs)."""
-        return self._regress()[2]
+        """The lifting on all DoFs (ndof x n_bnd, dense; a diagnostic; zero rows at fixed DoFs)."""
+        return self._regress()[1]
+
+    def _correction(self, d):
+        """Rows ``(P d_k)^T`` (k x ndof, float64) for boundary residuals ``d`` (k x n_bnd), without forming P.
+
+        Sparse precision ``Q`` (power 1, assembled precisions): ``P d = (d on B, -Q_II^-1 Q_IB d on I)``, one sparse
+        solve with the interior block (the discrete harmonic lifting). Otherwise ``P d = Sigma E Sigma_BB^-1 d``: a
+        Cholesky solve with the boundary block and one application of ``Sigma_h``.
+        """
+        d = np.asarray(d, dtype=np.float64).reshape(-1, self.n_bnd)
+        free = self.space.free
+        out = np.zeros((d.shape[0], self.fes.ndof))
+        if self._sparse_form is not None:
+            qii, qib, interior = self._sparse_blocks()
+            out[:, free[interior]] = np.asarray(qii.solve(-(qib @ d.T))).reshape(-1, d.shape[0]).T
+            out[:, self.dofs] = d
+            return out
+        if self._chol is None:
+            self._chol = sla.cho_factor(self.sigma_bb, lower=True)
+        if self._cols is not None:  # small problem: the dense lifting is cheaper than an application of Sigma_h
+            if self._dense is None:
+                self._dense = sla.cho_solve(self._chol, self._cols.T).T  # Sigma E Sigma_BB^-1 (n_free x n_bnd)
+                self._dense[self._pos] = np.eye(self.n_bnd)  # R P = I exactly
+            out[:, free] = d @ self._dense.T
+            return out
+        y = np.zeros((self.space.nfree, d.shape[0]))
+        y[self._pos] = sla.cho_solve(self._chol, d.T)
+        out[:, free] = np.asarray(self._src.sigma(y), dtype=np.float64).T
+        return out
+
+    def _sparse_blocks(self):
+        if self._q is None:
+            from .distributions.bernstein import SymmetricFactor  # NGSolve sparse Cholesky, threaded right-hand sides
+
+            q = self.space.assemble_free(self._sparse_form).tocsr()  # Sigma^-1 up to the scale factor
+            interior = ~self._free
+            self._q = (SymmetricFactor(q[interior][:, interior]), q[interior][:, self._free].tocsr(), interior)
+        return self._q
 
     # ----------------------------------------------------------------------- diagnostics
 
@@ -254,6 +320,7 @@ class BoundarySampler:
                     "uses sigma_bb and lifting, which are available matrix-free for any source.")
             K = assemble(self.fes, form)[self.space.free][:, self.space.free]
             ii = np.flatnonzero(~self._free)
+            _dense_guard(ii.size, ii.size, "residual_covariance (K_II^-1)")
             lu = spla.splu(sp.csc_matrix(K[ii][:, ii]))
             self._residual = np.asarray(lu.solve(np.eye(ii.size)))  # dense by request: a verification diagnostic
         return self._residual
@@ -266,6 +333,7 @@ class BoundarySampler:
         """
         K = sp.csc_matrix(assemble(self.fes, form)[self.space.free][:, self.space.free])
         b, i = self._free, ~self._free
+        _dense_guard(int(i.sum()), self.n_bnd, "dtn (K_II^-1 K_IB)")
         lu = spla.splu(K[i][:, i].tocsc())
         # SuperLU takes a dense right-hand side: it has n_bnd columns, the small block of the problem, while the
         # n_int x n_int interior factorisation stays sparse, so this is not a dense solve.
@@ -273,39 +341,39 @@ class BoundarySampler:
         return sp.csr_matrix(np.asarray(K[b][:, b].todense()) - np.asarray(sp.csr_matrix(K[b][:, i]) @ X))
 
     def trace_eigenvalues(self, n=None):
-        """Generalised eigenvalues of ``(Sigma_BB, M_Gamma)``, ``M_Gamma`` = boundary mass matrix.
+        """Eigenvalues of the discrete trace covariance operator, i.e. of ``Sigma_BB M_Gamma``.
 
-        They approximate the eigenvalues of the continuum trace covariance ``gamma C gamma*``, which decay like
-        ``j^{-(2 power - 1)/(d-1)}``: their sum is finite exactly when ``2 power > d``. The pencil is ``n_bnd`` x
-        ``n_bnd`` (the trace DoFs), which is why it is the one place a dense ``n_bnd`` matrix is formed from the
-        sparse boundary mass.
+        The trace ``sum_i c_i phi_i`` with ``Cov(c) = Sigma_BB`` has the covariance operator
+        ``f -> sum_ij phi_i (Sigma_BB)_ij (phi_j, f)_Gamma``; on the trace space its matrix is ``Sigma_BB M_Gamma``, so
+        its eigenvalues are those of the symmetric-definite pencil ``(M_Gamma Sigma_BB M_Gamma, M_Gamma)`` and sum to
+        ``tr(M_Gamma Sigma_BB) = E ||gamma u||^2``. They approximate the eigenvalues of the continuum trace covariance
+        ``gamma C gamma*``, which decay like ``j^{-(2 power - 1)/(d-1)}``. The pencil is ``n_bnd`` x ``n_bnd``.
         """
-        M = boundary_mass(self.fes, self.name).tocsc()[self.dofs][:, self.dofs]
-        S = sp.csc_matrix(self.sigma_bb)
-        n_bnd = S.shape[0]
+        M = boundary_mass(self.fes, self.name).tocsc()[self.dofs][:, self.dofs].toarray()
+        A = M @ np.asarray(self.sigma_bb) @ M
+        A = 0.5 * (A + A.T)
+        n_bnd = A.shape[0]
         if n is None:
             # dense by request: the full spectrum of an n_bnd x n_bnd symmetric-definite pencil. Do not use on a
             # boundary mesh fine enough that n_bnd is large - pass n to get the top n by ARPACK instead.
-            from scipy.linalg import eigh as geigh
-            w = np.sort(geigh(S.toarray(), M.toarray(), eigvals_only=True))[::-1]
-            return w
+            return np.sort(sla.eigh(A, M, eigvals_only=True))[::-1]
         k = min(int(n), n_bnd - 1)
         if k < 1:
-            return np.array([S.toarray()[0, 0] / M.toarray()[0, 0]])
-        w = spla.eigsh(S, M=M, k=k, which="LM", return_eigenvectors=False)
+            return np.array([A[0, 0] / M[0, 0]])
+        w = spla.eigsh(A, M=sp.csc_matrix(M), k=k, which="LA", return_eigenvectors=False)
         return np.sort(w)[::-1]
 
     # ----------------------------------------------------------------------- sampling
 
     def sample_trace(self, n, rng, loc=None, scale=1.0):
         """``n`` independent draws of the boundary marginal ``N(loc_B, scale^2 Sigma_BB)`` as (n, n_bnd) rows."""
-        if self._chol is None:
+        if self._root is None:
             w, V = np.linalg.eigh(self.sigma_bb)
             if w.min() <= -1e-8 * max(w.max(), 1e-300):
                 raise np.linalg.LinAlgError("the boundary covariance block is not positive semidefinite")
-            self._chol = V * np.sqrt(np.clip(w, 0.0, None))
+            self._root = V * np.sqrt(np.clip(w, 0.0, None))
         # drawn sample by sample, so in-place fills in chunks give the draws of one call (ngsrng.inplace)
-        out = float(scale) * (rng.standard_normal((int(n), self.n_bnd)) @ self._chol.T)
+        out = float(scale) * (rng.standard_normal((int(n), self.n_bnd)) @ self._root.T)
         loc = _vector(loc)
         if loc is not None:
             out += loc[self.dofs]
@@ -317,7 +385,7 @@ class BoundarySampler:
         For ``power = 1`` and ``loc = 0`` this is the ``K``-harmonic extension of the data into the domain.
         """
         base = np.zeros(self.fes.ndof, dtype=np.float64) if (mean := _vector(loc)) is None else mean.copy()
-        return base + self.P @ (np.asarray(values, dtype=np.float64).ravel() - base[self.dofs])
+        return base - self._correction(base[self.dofs] - np.asarray(values, dtype=np.float64).ravel())[0]
 
     def restrict(self, rows):
         """Zero every DoF that carries no trace (in place). The exact marginal of the boundary DoFs."""
@@ -346,9 +414,12 @@ class BoundarySampler:
                 g = np.broadcast_to(g, (r.shape[0], self.n_bnd))
             if g.shape[0] != r.shape[0]:
                 raise ValueError(f"bnd_values has {g.shape[0]} rows for {r.shape[0]} samples")
-        g, P, dofs = _convert(r, g), _convert(r, self.P), _index(r, self.dofs)
-        r -= (r[:, dofs] - g) @ P.T
-        r[:, dofs] = g  # exact by construction (R P = I); written for bit-level agreement with the data
+        dofs = _index(r, self.dofs)
+        trace = r[:, dofs]
+        trace = trace.detach().double().cpu().numpy() if _torch is not None and isinstance(trace, _torch.Tensor) \
+            else np.asarray(trace, dtype=np.float64)
+        r -= _convert(r, self._correction(trace - g))  # u - P (R u - g), P never formed
+        r[:, dofs] = _convert(r, g)  # exact by construction (R P = I); written for bit-level agreement with the data
         return rows
 
 
@@ -418,6 +489,29 @@ def attach_boundary(field, name, mode=None, values=None, generator=None):
                  "loc": loc, "scale": scale,
                  "info": {**sampler.info, "mode": mode,
                           "data": "prescribed" if values is not None else "drawn from the marginal"}}
+
+
+def _dense_guard(rows, cols, what):
+    """Raise MemoryError before a dense diagnostic of ``rows x cols`` float64 entries (with a working copy) that does
+    not fit in the available memory."""
+    need, avail = 16.0 * rows * cols, available_memory()
+    if avail is not None and need > avail:
+        raise MemoryError(f"{what} is a dense {rows} x {cols} matrix (~{need / 2**30:.1f} GiB with its working copy), "
+                          f"{avail / 2**30:.1f} GiB available; it is a diagnostic for small problems")
+
+
+def _sparse_precision(source):
+    """The bilinear form whose matrix is ``Sigma^-1`` up to a scale factor -- a prior :class:`~ngsrng.Gaussian` with
+    a ``power = 1`` PDE precision or an assembled precision -- or None (posteriors, other powers, low rank)."""
+    from .gaussian import Gaussian
+    from .specs import AssembledPrecision, PDEPrecision
+
+    if not isinstance(source, Gaussian) or source._maps or source._post_maps:
+        return None
+    spec = source.spec
+    if isinstance(spec, AssembledPrecision) or (isinstance(spec, PDEPrecision) and spec.power == 1):
+        return spec.form
+    return None
 
 
 def _boundaries(source, fes=None):

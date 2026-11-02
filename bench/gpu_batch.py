@@ -3,12 +3,15 @@
     python bench/gpu_batch.py                  # CUDA, full grid (~20-40 min)
     python bench/gpu_batch.py --quick          # CUDA, small sizes (a few minutes)
     python bench/gpu_batch.py --device cpu --quick   # dry run of the script on the CPU engine
+    python bench/gpu_batch.py --quick --work-values 2**22,2**24,2**26   # in-place chunk-size sweep
 
 1. Checks on the device (they gate the timings): the normal CDF in both tails, Gaussian variances against the exact
    pointwise variance (CPU reference), uniform marginals (KS), and ``out=`` against returned arrays.
 2. Throughput of ``rng.<family>(out=buffer)`` with a preallocated buffer on the device, repeated (in-place
    replacement), for 2D P2 and 3D P1 spaces of several sizes: torch engine with cuDSS at several right-hand-side
-   widths and with batched PCG, float32 and float64; the CPU engine (threaded NGSolve) as reference.
+   widths and with batched PCG, float32 and float64; the CPU engine (threaded NGSolve) as reference. With
+   ``--work-values`` every configuration is repeated for each chunk size of the in-place fill
+   (:mod:`ngsrng.inplace`); the peak device memory of every measurement is recorded.
 
 Results go to results/runs/<host>_<date>_gpubatch/ (results.jsonl, report.md).
 """
@@ -50,6 +53,15 @@ def space(kind, maxh):
 def sync(device):
     if device.type == "cuda":
         torch.cuda.synchronize()
+
+
+def _ints(text):
+    """'2**22,2**24,16777216' -> [4194304, 16777216, 16777216]."""
+    vals = []
+    for v in text.split(","):
+        base, _, exp = v.strip().partition("**")
+        vals.append(int(float(base)) ** int(exp) if exp else int(float(base)))
+    return vals
 
 
 # ------------------------------------------------------------------ checks
@@ -128,12 +140,15 @@ def main():
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--batch", type=int, default=5000)
     ap.add_argument("--repeats", type=int, default=3)
+    ap.add_argument("--work-values", type=_ints, default=None,
+                    help="chunk sizes of the in-place fill to sweep, e.g. 2**22,2**24,2**26 (default: the library's)")
+    ap.add_argument("--out-dir", default=None, help="run directory (default: results/runs/<host>_<date>_gpubatch)")
     args = ap.parse_args()
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         sys.exit("no CUDA device available (use --device cpu for a dry run)")
     stamp = datetime.now().strftime("%Y%m%d-%H%M")
-    run_dir = os.path.join(ROOT, "results", "runs", f"{socket.gethostname()}_{stamp}_gpubatch")
+    run_dir = args.out_dir or os.path.join(ROOT, "results", "runs", f"{socket.gethostname()}_{stamp}_gpubatch")
     os.makedirs(run_dir, exist_ok=True)
     out_path = os.path.join(run_dir, "results.jsonl")
 
@@ -183,47 +198,64 @@ def main():
                 if cpu and fes.ndof > 2e5:
                     continue  # the reference is too slow at this size
                 for family, where in families:
-                    rec = {"kind": "timing", "space": kind, "maxh": h, "ndof": fes.ndof, "config": label,
-                           "dtype": str(dt)[6:], "family": family, "values": where or "quadrature/coefficients"}
-                    try:
-                        rng = ngsrng.default_rng(fes, seed=0, correlation=0.2, device=dev, dtype=dt,
-                                                 method=None if cpu else {"engine": "torch", **method})
-                        b = min(batch, 500) if cpu else batch
-                        rec.update(time_batch(rng, family, fes, b, args.repeats, dev, dt,
-                                              points=pts if where == "points" else None))
-                        if dev.type == "cuda":
-                            rec["gpu_peak_gb"] = torch.cuda.max_memory_allocated() / 1e9
-                            torch.cuda.reset_peak_memory_stats()
-                        rec["status"] = "ok"
-                        log(f"  {label:32s} {rec['dtype']:7s} {family:9s} {where or '':6s}: "
-                            f"{1e3 * rec['per_sample_s']:8.3f} ms/sample (batch {rec['batch']})")
-                    except Exception as err:  # noqa: BLE001 - every failure is a result
-                        rec.update(status="error", error=f"{type(err).__name__}: {err}"[:300],
-                                   traceback=traceback.format_exc()[-1000:])
-                        log(f"  {label} {family}: {rec['error']}")
-                    finally:
-                        rng = None
-                        gc.collect()
-                        if device.type == "cuda":
-                            torch.cuda.empty_cache()
-                    record(rec)
+                    for wv in args.work_values or [None]:
+                        rec = {"kind": "timing", "space": kind, "maxh": h, "ndof": fes.ndof, "config": label,
+                               "dtype": str(dt)[6:], "family": family, "values": where or "quadrature/coefficients",
+                               "work_values": wv or "default"}
+                        try:
+                            rng = ngsrng.default_rng(fes, seed=0, correlation=0.2, device=dev, dtype=dt,
+                                                     method=None if cpu else {"engine": "torch", **method},
+                                                     work_values=wv)
+                            b = min(batch, 500) if cpu else batch
+                            if dev.type == "cuda":
+                                torch.cuda.reset_peak_memory_stats()
+                            rec.update(time_batch(rng, family, fes, b, args.repeats, dev, dt,
+                                                  points=pts if where == "points" else None))
+                            if dev.type == "cuda":
+                                rec["gpu_peak_gb"] = torch.cuda.max_memory_allocated() / 1e9
+                                rec["buffer_gb"] = rec["batch"] * rec["values_per_sample"] * \
+                                    torch.empty(0, dtype=dt).element_size() / 1e9
+                            rec["status"] = "ok"
+                            log(f"  {label:32s} {rec['dtype']:7s} {family:9s} {where or '':6s} wv={wv or 'default'}: "
+                                f"{1e3 * rec['per_sample_s']:8.3f} ms/sample (batch {rec['batch']})")
+                        except Exception as err:  # noqa: BLE001 - every failure is a result
+                            rec.update(status="error", error=f"{type(err).__name__}: {err}"[:300],
+                                       traceback=traceback.format_exc()[-1000:])
+                            log(f"  {label} {family}: {rec['error']}")
+                        finally:
+                            rng = None
+                            gc.collect()
+                            if device.type == "cuda":
+                                torch.cuda.empty_cache()
+                        record(rec)
     report(run_dir)
 
 
 def report(run_dir):
-    import pandas as pd
-
     recs = [json.loads(line) for line in open(os.path.join(run_dir, "results.jsonl"))]
     lines = ["# GPU batch benchmark\n", f"- run: `{os.path.basename(run_dir)}`\n"]
     chk = [r for r in recs if r["kind"] == "checks"]
     if chk:
         lines.append("## Checks\n\n" + "\n".join(f"- {k}: {v}" for k, v in chk[0].items() if k != "kind") + "\n")
-    df = pd.DataFrame([r for r in recs if r["kind"] == "timing" and r.get("status") == "ok"])
+    try:
+        import pandas as pd
+        import tabulate  # noqa: F401 - used by DataFrame.to_markdown
+    except ImportError:
+        lines.append("Timing tables need pandas and tabulate (`pip install -e .[bench]`); the records are in "
+                     "results.jsonl.\n")
+        pd = None
+    df = pd.DataFrame([r for r in recs if r["kind"] == "timing" and r.get("status") == "ok"]) if pd else []
     if len(df):
         df["ms/sample"] = 1e3 * df["per_sample_s"]
-        piv = df.pivot_table(index=["space", "ndof", "family", "values"], columns=["config", "dtype"],
+        df["work_values"] = df["work_values"].astype(str)
+        piv = df.pivot_table(index=["space", "ndof", "family", "values"], columns=["config", "dtype", "work_values"],
                              values="ms/sample")
         lines.append("## Milliseconds per sample (batch filled in place)\n\n" + piv.to_markdown(floatfmt=".3f") + "\n")
+        if "gpu_peak_gb" in df:
+            mem = df.pivot_table(index=["space", "ndof", "family", "values"],
+                                 columns=["config", "dtype", "work_values"], values="gpu_peak_gb")
+            lines.append("## Peak device memory, GB (including the out buffer)\n\n" + mem.to_markdown(floatfmt=".2f")
+                         + "\n")
     with open(os.path.join(run_dir, "report.md"), "w") as fh:
         fh.write("\n".join(lines))
     print(f"report: {os.path.join(run_dir, 'report.md')}")
