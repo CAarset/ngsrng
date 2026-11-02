@@ -33,6 +33,7 @@ import scipy.stats as st
 import torch
 
 from .backend import resolve_device, resolve_dtype
+from .boundary import attach_boundary  # [bnd] boundary (trace) sampling: ngsrng/boundary.py
 from .correlation import MaternCorrelation, matern
 from .distributions.bernstein import BernsteinForm
 from .distributions.expansion import KLField
@@ -77,7 +78,8 @@ ALIASES = {
 }
 
 CORRELATION_KEYS = ("correlation", "precision", "covariance")
-FIELD_KEYS = ("representation", "method", "tol", "std", "order", "construction", "points", "standardize_by")
+FIELD_KEYS = ("representation", "method", "tol", "std", "order", "construction", "points", "standardize_by",
+              "bnd", "bnd_mode", "bnd_values")  # [bnd] boundary (trace) sampling: see ngsrng/boundary.py
 
 
 def _canonical(name: str) -> str:
@@ -219,7 +221,10 @@ class FieldDistribution:
 
     @property
     def info(self) -> dict:
-        return self.field.info
+        out = self.field.info
+        if getattr(self.field, "bnd", None) is not None:  # [bnd] boundary (trace) sampling: ngsrng/boundary.py
+            out = {**out, "bnd": self.field.bnd["info"]}
+        return out
 
     def sample(self, size=None, output=None, out=None):
         return self.generator._draw(self.field, size, output, self.name, out=out)
@@ -368,12 +373,16 @@ class Generator:
         if key not in self._fields:  # values are kept alive with the entry, so identity keys stay valid
             field = self._build(name, args, dict(kwargs), corr, dict(opts))
             field.out_dtype = torch.empty(0, dtype=self.dtype).numpy().dtype  # bounded families clamp in it
+            if opts.get("bnd") is not None:  # [bnd] boundary (trace) sampling: ngsrng/boundary.py
+                attach_boundary(field, opts["bnd"], opts.get("bnd_mode"), opts.get("bnd_values"), self)
             self._fields[key] = ((args, kwargs, corr, opts), field)
         return self._fields[key][1]
 
     def _build(self, name, args, kw, corr, opts):
         explicit_rep = "representation" in opts
         rep = opts.pop("representation", self.representation)
+        if opts.get("bnd") is not None and not explicit_rep:  # [bnd] boundary DoFs only exist for a representation
+            rep = "projection"  # [bnd] whose samples are finite element coefficients
         method, tol = opts.pop("method", "auto"), opts.pop("tol", 1e-10)
         construction = opts.pop("construction", None)
         std, order = opts.pop("std", None), opts.pop("order", None)
@@ -494,9 +503,12 @@ class Generator:
         # would otherwise put the whole batch's coefficients, and the solvers' work blocks, in memory at once)
         ndof = getattr(getattr(field, "space", None), "ndof", 0)
         batch = max(1, int(self.BATCH_VALUES // max(per, ndof, 1)))
+        bnd = getattr(field, "bnd", None)  # [bnd] boundary (trace) sampling: ngsrng/boundary.py
         for k0 in range(0, n, batch):
             rows = flat[k0 : k0 + batch]
             if hasattr(field, "sample_into") and field.sample_into(rows):
+                if bnd is not None:  # [bnd]
+                    self._apply_bnd(field, rows)
                 continue
             vals = field.sample(rows.shape[0])
             vals = vals if isinstance(vals, torch.Tensor) else torch.from_numpy(vals)
@@ -504,6 +516,8 @@ class Generator:
             if vals.shape[1] != per:
                 raise ValueError(f"out holds {per} values per sample, {name} gives {vals.shape[1]}")
             rows.copy_(vals)  # cast (and device transfer) in one pass
+            if bnd is not None:  # [bnd]
+                self._apply_bnd(field, rows)
         return out
 
     def _draw(self, field, size, output, name, out=None):
@@ -518,16 +532,37 @@ class Generator:
         if size is None:
             out = field.sample(None)
             if isinstance(out, ngs.GridFunction):
+                if getattr(field, "bnd", None) is not None:  # [bnd]
+                    self._apply_bnd(field, out.vec.FV().NumPy())
                 return out
             return self._convert(out, output, discrete, keep64)
         shape = (int(size),) if isinstance(size, numbers.Integral) else tuple(int(s) for s in size)
         n = math.prod(shape)
         vals = field.sample(n)
+        if getattr(field, "bnd", None) is not None:  # [bnd] in place on the (ndof, n) sample array
+            self._apply_bnd(field, vals.T)
         if isinstance(vals, torch.Tensor):
             vals = vals.movedim(-1, 0).reshape(*shape, *vals.shape[:-1])
         else:
             vals = np.moveaxis(vals, -1, 0).reshape(*shape, *vals.shape[:-1])
         return self._convert(vals, output, discrete, keep64)
+
+    def _apply_bnd(self, field, rows):
+        """Boundary (trace) step of a ``bnd=`` draw, on ``rows`` (samples by DoFs, in place, NumPy or torch).
+
+        See :mod:`ngsrng.boundary`: ``"restrict"`` keeps the exact marginal of the boundary DoFs, ``"field"``
+        replaces the trace by an independent draw of that marginal, or by prescribed Dirichlet data.
+        """
+        b = field.bnd
+        sampler = b["sampler"]
+        if rows.shape[-1] != sampler.fes.ndof:
+            raise ValueError(f'bnd="{sampler.name}" restricts the DoFs of the samples: expected {sampler.fes.ndof} '
+                             f'values per sample, got {rows.shape[-1]}. This distribution does not deliver finite '
+                             "element coefficients (use representation='projection' or 'bernstein').")
+        if b["mode"] == "field":
+            sampler.condition(rows, b["values"], b["rng"], b["loc"], b["scale"])
+        else:
+            sampler.restrict(rows)
 
     def _convert(self, vals, output, discrete, keep64=False):
         output = output or self.output or ("torch" if self.device.type == "cuda" else "numpy")
@@ -558,7 +593,14 @@ class Generator:
         return args, size, output, out
 
     def sample(self, name, *args, **kwargs):
-        """Draw from the named distribution: ``rng.sample("gamma", 2.0, size=10)`` == ``rng.gamma(2.0, size=10)``."""
+        """Draw from the named distribution: ``rng.sample("gamma", 2.0, size=10)`` == ``rng.gamma(2.0, size=10)``.
+
+        ``bnd="name"`` restricts the draw to the DoFs of the named boundary: the sample is zero at every DoF whose
+        basis function vanishes there, and its trace is an exact draw of the boundary marginal of the field, for
+        every family and representation (ngsrng/boundary.py). ``bnd_mode="field"`` keeps the field random and
+        replaces only its trace by an independent draw of that marginal (affine Gaussian fields); with
+        ``bnd_values=g`` it draws the field conditioned on the prescribed trace g (an exact random Dirichlet datum).
+        """
         name = _canonical(name)
         args, size, output, out = self._split(name, args, kwargs)
         return self._draw(self._field(name, args, kwargs), size, output, name, out=out)
@@ -580,7 +622,8 @@ class Generator:
 
         An exact FE-space Gaussian with all the Gaussian machinery (priors, posteriors, fractional and apply-only
         precisions). With ``representation="quadrature"``/``"projection"``, a pointwise-standardised Gaussian
-        (exactly N(loc, scale^2) at every point, loc and scale may vary in space) instead.
+        (exactly N(loc, scale^2) at every point, loc and scale may vary in space) instead. ``bnd=`` and its two
+        companions restrict or prescribe the trace; see :meth:`sample`.
         """
         return self.sample("normal", loc, scale, size=size, **kwargs)
 
