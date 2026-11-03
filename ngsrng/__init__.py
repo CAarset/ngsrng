@@ -1,5 +1,10 @@
 """ngsrng: function-space random variables in NGSolve finite element spaces."""
 
+# torch before NGSolve: NGSolve loads its bundled libraries (OpenBLAS, the C++ runtime) on import, and torch loaded
+# after them has crashed; a GPU runtime may also fail to start (ngsrng.tuning.gpu_diagnosis
+# checks)
+import torch  # noqa: F401, I001
+
 from .boundary import BoundarySampler, boundary_covariance, boundary_dofs, boundary_mass  # [bnd] boundary sampling
 from .correlation import MaternCorrelation
 from .correlation import matern as matern_correlation

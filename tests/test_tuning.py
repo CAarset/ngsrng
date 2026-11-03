@@ -228,3 +228,42 @@ def test_amg_pcg_leaves_numpy_global_state_alone():
     np.random.seed(0)
     assert after0 == np.random.rand()  # the user's stream did not move
     np.testing.assert_array_equal(x0, x1)  # and did not matter
+
+
+def _fake_gpu_machine(monkeypatch, *, hip=None, cuda=None, amd=True, probes=None):
+    """Simulate a machine with a GPU device torch cannot use: torch build, device nodes, fresh-process probes."""
+    import os
+
+    import torch
+
+    monkeypatch.setattr("ngsrng.backend.cuda_usable", lambda: False)
+    monkeypatch.setattr(torch.version, "hip", hip, raising=False)
+    monkeypatch.setattr(torch.version, "cuda", cuda)
+    real = os.path.exists
+    nodes = {"/dev/kfd": amd, "/dev/nvidiactl": not amd, "/dev/nvidia0": not amd}
+    monkeypatch.setattr(os.path, "exists", lambda p: nodes[p] if p in nodes else real(p))
+    if probes is not None:
+        monkeypatch.setattr(tuning, "_probe", lambda *first: probes[bool(first)])
+
+
+def test_gpu_diagnosis_names_the_wrong_torch_build(monkeypatch):
+    _fake_gpu_machine(monkeypatch)
+    assert "CPU-only build" in tuning.gpu_diagnosis()[-1] and "ROCm" in tuning.gpu_diagnosis()[-1]
+    _fake_gpu_machine(monkeypatch, cuda="13.0")
+    assert "NVIDIA (CUDA) build" in tuning.gpu_diagnosis()[-1]
+
+
+def test_gpu_diagnosis_finds_the_import_order_conflict(monkeypatch):
+    ok = {"available": True, "count": 1, "error": None}
+    bad = {"available": False, "count": 0, "error": "RuntimeError: no HIP GPUs are available"}
+    _fake_gpu_machine(monkeypatch, hip="7.0", probes={False: ok, True: bad})
+    assert "not when NGSolve is imported first" in tuning.gpu_diagnosis()[-1]
+    _fake_gpu_machine(monkeypatch, hip="7.0", probes={False: bad, True: bad})
+    last = tuning.gpu_diagnosis()[-1]
+    assert "even on its own" in last and "render and video" in last
+
+
+def test_gpu_probe_runs():
+    """The fresh-process probe itself (on this machine, whatever it finds)."""
+    out = tuning._probe("ngsolve")
+    assert set(out) == {"available", "count", "error"}

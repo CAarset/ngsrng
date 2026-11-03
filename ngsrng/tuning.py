@@ -334,9 +334,102 @@ def _cpu_model():
     return platform.processor() or "unknown"
 
 
+def torch_build() -> str:
+    """The installed torch and the GPU platform it was built for."""
+    import torch
+
+    if getattr(torch.version, "hip", None):
+        return f"torch {torch.__version__} (ROCm {torch.version.hip} build)"
+    if torch.version.cuda:
+        return f"torch {torch.__version__} (CUDA {torch.version.cuda} build)"
+    return f"torch {torch.__version__} (CPU-only build)"
+
+
+_PROBE = """
+import json, sys
+for module in sys.argv[1:]:
+    __import__(module)
+import torch
+out = {"available": torch.cuda.is_available(), "count": torch.cuda.device_count(), "error": None}
+try:
+    torch.zeros(1, device="cuda")
+except Exception as err:
+    out["error"] = (type(err).__name__ + ": " + str(err)).splitlines()[0][:200]
+print(json.dumps(out))
+"""
+
+
+def _probe(*first) -> dict:
+    """Whether torch sees a usable GPU in a fresh process of this Python, after importing ``first``."""
+    import json
+    import subprocess
+
+    try:
+        run = subprocess.run([sys.executable, "-c", _PROBE, *first], capture_output=True, text=True, timeout=180)
+        return json.loads(run.stdout.strip().splitlines()[-1])
+    except Exception as err:  # noqa: BLE001 - a diagnosis must not fail
+        return {"available": False, "count": 0, "error": f"probe failed: {type(err).__name__}: {err}"[:200]}
+
+
+def gpu_diagnosis() -> list[str]:
+    """Why no GPU is usable in this process, as lines of text; empty if one is.
+
+    Checks the torch build against the GPU devices of the machine (/dev/kfd: AMD, /dev/nvidiactl: NVIDIA), and, for
+    a GPU build of torch, whether a fresh process of this Python sees the GPU with torch alone and after importing
+    NGSolve first (NGSolve loads its own bundled libraries)."""
+    import torch
+
+    from .backend import cuda_usable
+
+    if cuda_usable():
+        return []
+    lines = [f"{torch_build()}, from {os.path.dirname(torch.__file__)} (Python {sys.executable})"]
+    lines += [f"{v}={os.environ[v]}" for v in ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES",
+                                                "HSA_OVERRIDE_GFX_VERSION") if v in os.environ]
+    amd = os.path.exists("/dev/kfd")
+    nvidia = os.path.exists("/dev/nvidiactl") or os.path.exists("/dev/nvidia0")
+    rocm, cuda = bool(getattr(torch.version, "hip", None)), bool(torch.version.cuda)
+    if not (rocm or cuda):
+        if amd or nvidia:
+            kind, build = ("AMD", "ROCm") if amd else ("NVIDIA", "CUDA")
+            lines.append(f"this torch is a CPU-only build, but the machine has an {kind} GPU: install the {build} "
+                         "build of torch in this environment (pytorch.org lists the index URLs)")
+        else:
+            lines.append("no GPU device found")
+        return lines
+    if amd and not nvidia and not rocm:
+        lines.append("this torch is an NVIDIA (CUDA) build, but the machine's GPU is AMD: install the ROCm build of "
+                     "torch in this environment (installing a package that depends on torch may have replaced it "
+                     "with the default wheel)")
+        return lines
+    alone, after = _probe(), _probe("ngsolve")
+
+    def seen(p):
+        return p["available"] and p["error"] is None
+
+    if seen(alone) and not seen(after):
+        lines.append("torch finds the GPU on its own, but not when NGSolve is imported first: import torch before "
+                     f"ngsolve (ngsrng does; with NGSolve first: {after['error'] or 'no device'})")
+    elif seen(alone):
+        lines.append("a fresh process of this Python finds the GPU, also after NGSolve, but this process does not: "
+                     "something imported or done earlier here interferes")
+    else:
+        lines.append(f"torch finds no usable GPU in this Python even on its own ({alone['error'] or 'no device'}): "
+                     "check that this is the environment where the GPU works"
+                     + ("; ROCm also needs the user in the groups render and video, and a ROCm release that supports "
+                        "the card" if rocm else ""))
+    return lines
+
+
 def _show():
     m = machine()
     print(f"machine: {m['cpu']} ({m['threads']} threads); GPUs: {', '.join(m.get('gpus', [])) or 'none'}")
+    try:
+        if not m.get("gpus"):
+            for line in gpu_diagnosis():
+                print(f"  no GPU: {line}")
+    except Exception as err:  # noqa: BLE001 - informational only
+        print(f"  no GPU: diagnosis failed ({type(err).__name__}: {err})")
     env = os.environ.get(ENV_VAR)
     if env is not None:
         print(f"{ENV_VAR}={env}: " + ("built-in rules only" if env.strip().lower() in _DISABLED else "only this file"))

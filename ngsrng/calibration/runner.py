@@ -53,10 +53,12 @@ def environment() -> dict:
         "versions": {
             "ngsolve": ngsolve.__version__,
             "torch": torch.__version__,
+            "torch_build": _torch_build(),
             "numpy": numpy.__version__,
             "scipy": scipy.__version__,
         },
         "cuda": None,
+        "gpu_diagnosis": [],
         "git": _git(),
     }
     if _cuda_usable():
@@ -70,7 +72,17 @@ def environment() -> dict:
             "mem_free_gb": free / 2**30,
             "cuda": torch.version.cuda,
         }
+    else:
+        from ..tuning import gpu_diagnosis
+
+        env["gpu_diagnosis"] = gpu_diagnosis()
     return env
+
+
+def _torch_build():
+    from ..tuning import torch_build
+
+    return torch_build()
 
 
 def _cuda_usable():
@@ -409,6 +421,9 @@ def main(argv=None):
         f"run dir {run_dir}: profile {args.profile}, suites {args.suites}, devices {devices}, "
         f"{len(groups)} groups / {ntasks} tasks, worker memory limit {mem_limit:.1f} GB"
     )
+    log(f"{env['versions']['torch_build']}; GPU: {env['cuda']['device'] if env['cuda'] else 'none usable'}")
+    for line in env.get("gpu_diagnosis", []):  # why the GPU is missing: the CPU alone is calibrated
+        log(f"  no GPU: {line}")
     runner = Runner(run_dir, args.profile, mem_limit, log)
     t0 = time.time()
     for i, g in enumerate(groups):

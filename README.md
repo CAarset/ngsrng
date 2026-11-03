@@ -371,7 +371,8 @@ python -m ngsrng.calibrate               # 13 min on the A100 box; longer on sma
 python -m ngsrng.calibrate --quick       # a few minutes: checks that calibrating works here (installs nothing)
 python -m ngsrng.calibrate --large       # up to 1e6 dofs (an hour or more)
 python -m ngsrng.calibrate --resume DIR  # continue an interrupted calibration
-python -m ngsrng.tuning show             # this machine, the calibrations, and which tables apply here
+python -m ngsrng.tuning show             # this machine, the calibrations, which tables apply here, and why no
+                                         # GPU is used if none is (torch build, import order, environment)
 python -m ngsrng.tuning reset            # forget this machine's calibration
 ```
 
