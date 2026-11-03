@@ -283,9 +283,9 @@ class BoundarySampler:
         return np.asarray(self._src.sigma(y), dtype=np.float64)[self._int_pos].T
 
     def _interior_lift_torch(self, d):
-        """:meth:`_interior_lift` for a float64 torch tensor ``d``, computed on its device: cuDSS with the interior
-        block on a GPU (sparse precisions), the source's own pipeline (general Gaussians on the same device), else
-        through the host."""
+        """:meth:`_interior_lift` for a float64 torch tensor ``d``, computed on its device: the interior block solved by
+        cuDSS on NVIDIA GPUs or AMG-preconditioned CG elsewhere (sparse precisions), the source's own pipeline
+        (general Gaussians on the same device), else through the host."""
         if d.device.type == "cpu":
             return _torch.from_numpy(self._interior_lift(d.numpy()))
         ops = self._device(d.device)
@@ -312,12 +312,15 @@ class BoundarySampler:
 
         f64 = _torch.float64
         if self._sparse_form is not None:
-            from .solvers import CudssDirect, cudss_available
+            from .solvers import CudssDirect, TorchAMGPCG, cudss_available, pyamg_available
 
-            if not cudss_available():
-                return None
             q, ii, bb = self._q_free(), self._int_pos, self._pos
-            return "sparse", CudssDirect(q[ii][:, ii], dev, f64), sparse_to_torch(q[ii][:, bb].tocsr(), dev, f64)
+            qib = sparse_to_torch(q[ii][:, bb].tocsr(), dev, f64)
+            if cudss_available():
+                return "sparse", CudssDirect(q[ii][:, ii], dev, f64), qib
+            if pyamg_available():  # no GPU sparse direct solver (AMD): AMG-preconditioned CG, solved tightly
+                return "sparse", TorchAMGPCG(q[ii][:, ii], dev, f64, tol=1e-12), qib
+            return None
         self._factor_bb()
         if self._cols is not None:
             return "dense", _torch.from_numpy(np.ascontiguousarray(self._dense_lifting()[self._int_pos])).to(dev), None

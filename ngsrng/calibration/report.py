@@ -1,9 +1,10 @@
 """Turn a run directory into report.md, recommendations.json and plots.
 
-    python bench/report.py results/runs/<run>
+    python -m ngsrng.calibration.report <run dir>
 
-Validity rules used for "best" choices:
-- noise: the method must be exact by construction and pass its small-N covariance check (float64: 1e-10, float32: 1e-5);
+The recommendations come from ``recommend.py`` (plain Python); the full report needs pandas, tabulate and matplotlib
+and is replaced by a short one without them. Validity rules used for "best" choices:
+- noise: the method must be exact by construction and pass its covariance check (float64: 1e-10, float32: 1e-5);
 - prior: status ok, and the pathwise error against the float64 direct reference must be <= 1e-6 (float64 runs) or
   <= 1e-4 (float32 runs); the law error, where measured, must satisfy the same bound.
 """
@@ -12,15 +13,20 @@ import json
 import os
 import sys
 
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from cases import CPU_SOLVERS, GPU_SOLVERS, choose  # noqa: E402
+from . import recommend
+from .cases import CPU_SOLVERS, GPU_SOLVERS, choose
+
+try:  # the full report only
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import pandas as pd
+    import tabulate  # noqa: F401 - used by DataFrame.to_markdown
+except ImportError:  # pragma: no cover - exercised on installs without the report dependencies
+    plt = pd = None
 
 SOLVER_OPTIONS = {**CPU_SOLVERS, **GPU_SOLVERS}
 TOL = {"float64": 1e-6, "float32": 1e-4}
@@ -46,10 +52,11 @@ def load(run_dir):
 
 
 def platform(df):
+    backend = df.backend.fillna("cuda") if "backend" in df else "cuda"
     return np.where(
         df.engine == "ngsolve",
         "cpu-ngsolve",
-        np.where(df.device == "cpu", "cpu-torch", "cuda-" + df.dtype.str.replace("float", "f")),
+        np.where(df.device == "cpu", "cpu-torch", backend + "-" + df.dtype.str.replace("float", "f")),
     )
 
 
@@ -465,6 +472,13 @@ def failures_section(data):
 
 
 def write(run_dir):
+    recs_final = recommend.recommendations(run_dir)
+    with open(os.path.join(run_dir, "recommendations.json"), "w") as fh:
+        json.dump(recs_final, fh, indent=1, default=str)
+    if pd is None:
+        with open(os.path.join(run_dir, "report.md"), "w") as fh:
+            fh.write(recommend.short_report(run_dir, recs_final))
+        return
     data = load(run_dir)
     plots_dir = os.path.join(run_dir, "plots")
     os.makedirs(plots_dir, exist_ok=True)
@@ -505,8 +519,6 @@ def write(run_dir):
     parts.append("## 6. Plots\n\n" + "\n".join(f"![{p}](plots/{p})" for p in plots))
     with open(os.path.join(run_dir, "report.md"), "w") as fh:
         fh.write("\n".join(parts) + "\n")
-    with open(os.path.join(run_dir, "recommendations.json"), "w") as fh:
-        json.dump(recs, fh, indent=1, default=str)
 
 
 if __name__ == "__main__":

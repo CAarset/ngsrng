@@ -1,4 +1,3 @@
-import os
 import platform
 import time
 
@@ -6,8 +5,6 @@ import ngsolve as ngs
 import numpy as np
 import torch
 from ngsolve.meshes import Make1DMesh, MakeStructured2DMesh, MakeStructured3DMesh
-
-RESULTS = os.path.join(os.path.dirname(__file__), "..", "results")
 
 
 def structured_mesh(dim: int, n: int):

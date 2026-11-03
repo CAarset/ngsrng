@@ -10,7 +10,8 @@
 2. Throughput of ``rng.<family>(out=buffer)`` with a preallocated buffer on the device, repeated (in-place
    replacement), for 2D P2 and 3D P1 spaces of several sizes: torch engine with cuDSS at right-hand-side widths 32
    and 128 (float64 arithmetic, float32 output: the defaults); the CPU engine (threaded NGSolve) as reference. The
-   solver choice itself is calibrated by bench/run_all.py, which also rejects batched PCG and float32 arithmetic. With
+   solver choice itself is calibrated by python -m ngsrng.calibrate, which also rejects batched PCG and float32
+   arithmetic. With
    ``--work-values`` every configuration is repeated for each chunk size of the in-place fill
    (:mod:`ngsrng.inplace`); the peak device memory of every measurement is recorded.
 

@@ -24,7 +24,17 @@ from .backend import (
     sparse_to_torch,
 )
 from .inplace import InPlace, as_tensor, chunks, default_work_values, write
-from .solvers import INVERSES, PRECONDITIONERS, CudssDirect, NGSolveCG, NGSolveDirect, TorchPCG, cudss_available
+from .solvers import (
+    INVERSES,
+    PRECONDITIONERS,
+    CudssDirect,
+    NGSolveCG,
+    NGSolveDirect,
+    TorchAMGPCG,
+    TorchPCG,
+    cudss_available,
+    pyamg_available,
+)
 from .space import SpaceInfo, mass_form
 from .specs import AssembledPrecision, OperatorPrecision, PDEPrecision
 
@@ -37,7 +47,7 @@ DIRECT_LIMIT = {1: math.inf, 2: 2_000_000, 3: 200_000}
 NOISE_METHODS = ("auto", "diagonal", "local-gram", "local-gram-explicit", "quadrature", "dense-cholesky", "chebyshev",
                  "lumped")
 FORM_NOISE_METHODS = ("auto", "local-gram", "rational", "dense-cholesky")
-SOLVERS = ("auto", "direct", "cg", "cudss", "torch-pcg")
+SOLVERS = ("auto", "direct", "cg", "cudss", "amg-pcg", "torch-pcg")
 ENGINES = ("auto", "ngsolve", "torch")
 METHOD_KEYS = {
     "noise": NOISE_METHODS,
@@ -89,11 +99,12 @@ class Gaussian(InPlace):
         the route for odd powers and assembled precisions ("local-gram": precision-shaped noise, exact; "rational":
         white noise and a rational approximation of the square root, relative accuracy 1e-7, used automatically
         when the form couples elements; "dense-cholesky": exact, O(n^2) memory, only on request), "solver" one of
-        "direct" | "cg" | "cudss" | "torch-pcg" (with "inverse" / "precond" naming the NGSolve direct solver /
-        preconditioner), "engine" one of "ngsolve" (CPU default) | "torch" (CUDA
-        default; on CPU only useful for testing), "work_dtype" ("float64", the default, or "float32": the torch
-        engine's arithmetic; float32 solves are fast but inaccurate on fine meshes). Also "tuning" (False disables
-        the benchmark tuning, or a recommendations.json path), "noise_tol" (chebyshev noise), "cudss_width",
+        "direct" | "cg" | "cudss" | "amg-pcg" | "torch-pcg" (with "inverse" / "precond" naming the NGSolve direct
+        solver / preconditioner; "amg-pcg", AMG-preconditioned CG on the torch engine's device, is the GPU solver
+        where cuDSS is unavailable, e.g. on AMD GPUs, and needs pyamg), "engine" one of "ngsolve" (CPU default) |
+        "torch" (GPU default; on CPU only useful for testing), "work_dtype" ("float64", the default, or "float32":
+        the torch engine's arithmetic; float32 solves are fast but inaccurate on fine meshes). Also "tuning" (False
+        disables the calibration, or a recommendations.json path), "noise_tol" (chebyshev noise), "cudss_width",
         "threads" (CPU batches) and "cpu_blas_threads".
     device, dtype : torch device ("cpu", "cuda", "auto") and output dtype (default float32). Every engine computes in
         float64 and casts at the end, unless method={"work_dtype": "float32"}.
@@ -124,8 +135,7 @@ class Gaussian(InPlace):
         self.generator = make_generator(seed, self.device) if self.engine == "torch" else None
         self.stream = NormalStream(seed) if self.engine == "ngsolve" else None
         self.plan.update(engine=self.engine, device=str(self.device), dtype=str(self.dtype))
-        if self.tuning is not None:
-            self.plan["tuning"] = f"run {self.tuning.run}"
+        self.plan["tuning"] = "built-in rules"
         self._mean = self._build_mean(mean)
         self._check_trace_class()
         if isinstance(precision, PDEPrecision):
@@ -137,12 +147,24 @@ class Gaussian(InPlace):
         else:
             raise TypeError(f"unsupported specification {type(precision).__name__}")
         self._finalise()
+        if tun is None:  # the automatic layers (not an explicit choice): tell an uncalibrated machine how to calibrate
+            tn.notice(self._platform, self.tuning, self.plan)
 
     # ---------------------------------------------------------------- planning
 
     @property
     def _platform(self):
-        return tn.platform_of(self.engine, self.device.type, self._work_dtype)
+        name = tn.device_name(self.device) if self.device.type == "cuda" else None
+        return tn.platform_of(self.engine, self.device.type, self._work_dtype, name)
+
+    def _tuning_note(self, what, hit, used, why=None):
+        """Record in the plan which calibration a choice came from, or why a tuned suggestion was not used."""
+        note = f"{what}: {hit['_layer']} calibration (run {hit['_run']})" if used else \
+            f"{what}: built-in rule ({hit['_layer']} calibration's {why})"
+        notes = [n for n in self.plan.get("tuning", "").split("; ") if n and n != "built-in rules"]
+        if note not in notes:
+            notes.append(note)
+        self.plan["tuning"] = "; ".join(notes)
 
     def _power(self):
         return self.spec.power if isinstance(self.spec, PDEPrecision) else None
@@ -159,7 +181,8 @@ class Gaussian(InPlace):
         dev = resolve_device("auto")
         if dev.type == "cuda" and self.tuning is not None:
             cpu = self._tuned_prior("cpu-ngsolve")
-            gpu = self._tuned_prior(tn.platform_of("torch", "cuda", self.method.get("work_dtype", "float64")))
+            gpu = self._tuned_prior(tn.platform_of("torch", "cuda", self.method.get("work_dtype", "float64"),
+                                                   tn.device_name(dev)))
             if cpu and gpu and cpu["per_sample_s"] < gpu["per_sample_s"]:
                 dev = resolve_device("cpu")
             self.plan["device_choice"] = "tuning" if cpu and gpu else "first available"
@@ -314,25 +337,13 @@ class Gaussian(InPlace):
 
     def _mass_noise(self):
         s, choice = self.space, self.method.get("noise", "auto")
+        tuned = None
         if choice == "auto" and self.tuning is not None:
-            rec = self.tuning.noise(self._platform, s.dim, s.kind, s.order, s.nfree)
-            # exact samplers only; names a newer or older benchmark used but this version does not know are ignored
-            exact = rec in NOISE_METHODS and rec not in ("chebyshev", "lumped")
-            if exact and (rec != "diagonal" or s.mass_is_diagonal):
-                choice = rec
-                self.plan["noise_choice"] = "tuning"
-        if choice == "local-gram-explicit":
-            n = s.broken.ndof / max(s.mesh.ne, 1)
-            if s.mesh.ne * n * (n + 1) / 2 > 4e8:
-                choice = "local-gram"
-        if choice == "auto":
-            if s.mass_is_diagonal:
-                choice = "diagonal"
-            else:
-                # Explicit sparse factor: fastest exact option in the CPU benchmarks (results/summary.md) while its
-                # ~n^2/2 nonzeros per element fit the budget; the GEMM variant needs no per-element storage.
-                n = s.broken.ndof / max(s.mesh.ne, 1)
-                choice = "local-gram-explicit" if s.mesh.ne * n * (n + 1) / 2 <= 2e8 else "local-gram"
+            rec = self.tuning._lookup("noise", self._platform, s.dim, s.kind, s.order, s.nfree)
+            # exact samplers only; names a newer or older calibration used but this version does not know are ignored
+            if rec and rec["method"] in NOISE_METHODS and rec["method"] not in ("chebyshev", "lumped") \
+                    and (rec["method"] != "diagonal" or s.mass_is_diagonal):
+                tuned = rec
         builders = {
             "diagonal": lambda: nz.DiagonalNoise(s.mass_free),
             "local-gram": lambda: nz.LocalGramNoise(s),
@@ -342,7 +353,32 @@ class Gaussian(InPlace):
             "chebyshev": lambda: nz.ChebyshevNoise(s.mass_free, tol=self.method.get("noise_tol", 1e-6)),
             "lumped": lambda: nz.LumpedNoise(s.mass_free),
         }
-        noise = builders[choice]()
+
+        def bounded(name):
+            if name == "local-gram-explicit":
+                n = s.broken.ndof / max(s.mesh.ne, 1)
+                if s.mesh.ne * n * (n + 1) / 2 > 4e8:
+                    return "local-gram"
+            return name
+
+        noise = None
+        if tuned is not None:
+            try:  # a suggestion: if it cannot be built here (size limits, an exactness check), the rule decides
+                noise = builders[bounded(tuned["method"])]()
+                self.plan["noise_choice"] = "tuning"
+                self._tuning_note("noise", tuned, True)
+            except (MemoryError, RuntimeError, ValueError, NotImplementedError) as err:
+                self._tuning_note("noise", tuned, False, f"{tuned['method']} failed: {type(err).__name__}")
+        if noise is None:
+            if choice == "auto":
+                if s.mass_is_diagonal:
+                    choice = "diagonal"
+                else:
+                    # Explicit sparse factor: the fastest exact option while its ~n^2/2 nonzeros per element fit the
+                    # budget; the GEMM variant needs no per-element storage.
+                    n = s.broken.ndof / max(s.mesh.ne, 1)
+                    choice = "local-gram-explicit" if s.mesh.ne * n * (n + 1) / 2 <= 2e8 else "local-gram"
+            noise = builders[bounded(choice)]()
         if not noise.exact:
             accuracy = noise.accuracy()
             if self._work_dtype == torch.float32:
@@ -367,51 +403,88 @@ class Gaussian(InPlace):
             self.plan["form_noise_choice"] = f"rational ({err})"
             return None
 
+    def _solver_available(self, name) -> bool:
+        """Whether solver ``name`` runs on this Gaussian's engine and device (a tuned choice must, too)."""
+        if name in ("direct", "cg"):
+            return self.engine == "ngsolve"
+        if name == "cudss":
+            return (self.engine == "torch" and self.device.type == "cuda" and tn.gpu_backend() == "cuda"
+                    and cudss_available())
+        if name == "amg-pcg":
+            return self.engine == "torch" and pyamg_available()
+        return name == "torch-pcg" and self.engine == "torch"
+
+    def _rule_solver(self, form) -> str:
+        """The built-in rules: a sparse direct solver (cuDSS on NVIDIA GPUs) while it fits, else preconditioned CG."""
+        if self.engine == "torch":
+            if self._solver_available("cudss"):
+                return "cudss"
+            # no GPU sparse direct solver (ROCm, or no nvmath-python): AMG-preconditioned CG, whose cost grows
+            # linearly; Jacobi PCG only without pyamg
+            return "amg-pcg" if self._solver_available("amg-pcg") else "torch-pcg"
+        return "direct" if self.space.nfree <= DIRECT_LIMIT[self.space.dim] else "cg"
+
     def _solver(self, form, dtype=None, width=None):
         """Solver for the form's matrix on the free dofs; ``dtype`` overrides the work dtype of the torch engine (the
-        CPU engine is float64 anyway) and ``width`` the cuDSS right-hand-side width."""
+        CPU engine is float64 anyway) and ``width`` the cuDSS right-hand-side width. With solver "auto", a calibrated
+        choice is used if it is offered and available here and builds without error; otherwise the built-in rule."""
         s, choice = self.space, self.method.get("solver", "auto")
         dtype = self._work_dtype if dtype is None else dtype
-        rec = self._tuned_prior(self._platform) if choice == "auto" else None
-        m = rec["method"] if rec else {}
-        # tables of older versions may name a removed solver (pardiso, multigrid): such entries are ignored
-        if rec and m.get("engine", self.engine) == self.engine and m.get("solver") in SOLVERS \
-                and m.get("precond", "bddc") in PRECONDITIONERS and m.get("inverse", "umfpack") in INVERSES:
-            # Sparse direct factorisations in 3D are only trusted near the measured sizes (fill-in grows fast).
-            if not (m["solver"] == "direct" and s.dim == 3 and s.nfree > max(DIRECT_LIMIT[3], 2 * rec["_target"])):
-                choice = m["solver"]
-                for key in ("inverse", "precond"):
-                    if key in m:
-                        self.method.setdefault(key, m[key])
-                self.plan["solver_choice"] = "tuning"
-        if choice == "auto":
-            if self.engine == "torch":
-                choice = "cudss" if self.device.type == "cuda" and cudss_available() else "torch-pcg"
+        if choice != "auto":
+            return self._make_solver(choice, form, dtype, width)
+        rec = self._tuned_prior(self._platform)
+        if rec is not None:
+            m = rec["method"]
+            if m.get("engine", self.engine) != self.engine or m.get("solver") not in SOLVERS[1:] \
+                    or m.get("precond", "bddc") not in PRECONDITIONERS or m.get("inverse", "umfpack") not in INVERSES:
+                why = f"{m.get('solver')} is not offered by this version"  # tables may name removed solvers
+            elif not self._solver_available(m["solver"]):
+                why = f"{m['solver']} is not available here"
+            elif m["solver"] == "direct" and s.dim == 3 and s.nfree > max(DIRECT_LIMIT[3], 2 * rec["_target"]):
+                why = "direct solver beyond twice its calibrated size in 3D (fill-in)"
             else:
-                choice = "direct" if s.nfree <= DIRECT_LIMIT[s.dim] else "cg"
-        if choice == "direct":
+                try:
+                    sv = self._make_solver(m["solver"], form, dtype, width, m.get("inverse"), m.get("precond"))
+                    self.plan["solver_choice"] = "tuning"
+                    self._tuning_note("solver", rec, True)
+                    return sv
+                except Exception as err:  # noqa: BLE001 - a suggestion that cannot be built here yields to the rule
+                    why = f"{m['solver']} failed: {type(err).__name__}: {err}"[:200]
+            self._tuning_note("solver", rec, False, why)
+        return self._make_solver(self._rule_solver(form), form, dtype, width)
+
+    def _make_solver(self, name, form, dtype, width=None, inverse=None, precond=None):
+        s = self.space
+        if name == "direct":
             # NGSolve's sparsecholesky solve is ~45x slower than umfpack on 1D (chain) elimination trees, but
-            # 5-10x faster in 2D/3D (bench/bench_prior.py).
+            # 5-10x faster in 2D/3D
             default = "umfpack" if s.dim == 1 else "sparsecholesky"
-            return NGSolveDirect(s, form, inverse=self.method.get("inverse", default))
-        if choice == "cg":
+            return NGSolveDirect(s, form, inverse=self.method.get("inverse") or inverse or default)
+        if name == "cg":
             # h1amg for H1 P1, BDDC otherwise: in 3D at 1e5 dofs h1amg cost 350 ms (P1) and 1030 ms (P2) per sample
             # against 138 and 129 ms for BDDC (GPU-box calibration, 2026-11-03)
-            pre = self.method.get("precond", "h1amg" if (s.kind == "H1" and s.order == 1) else "bddc")
+            pre = self.method.get("precond") or precond or ("h1amg" if (s.kind == "H1" and s.order == 1) else "bddc")
             return NGSolveCG(s, form, precond=pre, tol=self.tol)
-        if choice == "cudss":
+        if name == "cudss":
             if self.device.type != "cuda":
                 raise ValueError("cudss needs a CUDA device")
-            # right-hand sides per cuDSS call (each width keeps its own factorisation); larger widths amortise the
-            # call overhead of big batches
+            if tn.gpu_backend() != "cuda" or not cudss_available():
+                raise RuntimeError("cuDSS is not available: it needs an NVIDIA GPU and nvmath-python "
+                                   "(pip install ngsrng[gpu]); on other GPUs, solver='amg-pcg' (pip install pyamg)")
+            # right-hand sides per cuDSS call; larger widths amortise the call overhead of big batches
             return CudssDirect(s.assemble_free(form), self.device, dtype,
                                width=int(width or self.method.get("cudss_width", 32)))
-        if choice == "torch-pcg":
+        if name in ("amg-pcg", "torch-pcg"):
             if self.engine != "torch":
-                raise ValueError("torch-pcg needs the torch engine")
+                raise ValueError(f"{name} needs the torch engine")
             tol = max(self.tol, 1e-6 if dtype == torch.float32 else 1e-14)
+            # a mass matrix is spectrally equivalent to its diagonal: Jacobi PCG converges in a few iterations
+            if name == "amg-pcg" and form is not mass_form:
+                if not pyamg_available():
+                    raise RuntimeError("pyamg is not available: amg-pcg needs it (pip install pyamg)")
+                return TorchAMGPCG(s.assemble_free(form), self.device, dtype, tol=tol)
             return TorchPCG(s.assemble_free(form), self.device, dtype, tol=tol)
-        raise ValueError(f"unknown solver {choice!r}")
+        raise ValueError(f"unknown solver {name!r}")
 
     def _build_mean(self, mean):
         gf = ngs.GridFunction(self.space.fes)

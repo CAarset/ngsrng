@@ -1,6 +1,8 @@
-"""Calibrate a machine for ngsrng in one command: tests, validation, solver/noise calibration, with logs and a summary.
+"""The developer's full check of a machine: tests, validation, calibration, boundary and GPU benchmarks, with logs and
+a summary. (Users calibrate with ``python -m ngsrng.calibrate``, which needs no repository; this script runs it as
+its calibration step.)
 
-    python bench/calibrate.py                     # everything below, ~30 min on the A100 box (estimate)
+    python bench/calibrate.py                     # everything below, 34 min on the A100 box (2026-11-03)
     python bench/calibrate.py --quick             # a few minutes: harness check (installs no tuning)
     python bench/calibrate.py --large             # calibration up to 1e6 dofs (large CPU/GPU boxes, an hour or more)
     python bench/calibrate.py --skip boundary,throughput   # tests, validation and calibration only (~20 min)
@@ -10,13 +12,13 @@ Steps, in order:
 
   env          environment snapshot: CPU, GPU, driver, CUDA, torch, cuDSS, NGSolve, report dependencies, git state
   tests        the pytest suite, CUDA variants included when a device is usable (junit.xml)
-  calibrate    bench/run_all.py --install: measures the white-noise samplers and solvers that can win on this machine,
-               rejects the inaccurate, failing and far slower ones, and installs the winners as the active tuning
-               (python -m ngsrng.tuning show); ~15 min on the A100 box
+  calibrate    python -m ngsrng.calibrate: measures the white-noise samplers and solvers that can win on this machine,
+               rejects the inaccurate, failing and far slower ones, and installs the winners as this machine's
+               tuning, overriding the shipped default (python -m ngsrng.tuning show); 13 min on the A100 box
   boundary     bench/boundary_scaling.py --profile calibrate: the cost of restricted and conditioned boundary draws
-               against plain ones, on the CPU and the GPU (~5 min)
+               against plain ones, on the CPU and the GPU (5 min)
   throughput   (GPU only) bench/gpu_batch.py --quick: device checks, fractional powers (accuracy, 1e6 dofs, float32
-               arithmetic), in-place batch throughput and the cost of float64 arithmetic (~5 min)
+               arithmetic), in-place batch throughput and the cost of float64 arithmetic (11 min)
 
 Each step runs as a subprocess with a time limit (enforced also while it prints nothing). Its output goes to the
 console and to logs/<step>.log, its status and duration to manifest.json, so an interrupted or failed run is continued
@@ -75,9 +77,8 @@ def steps(cfg, run):
     """(name, command, timeout in seconds, report path relative to the run directory) for the chosen options."""
     out = os.path.join(run, "out")
     cal_dir = os.path.join(out, "calibrate")
-    profile = "smoke" if cfg["quick"] else "large" if cfg["large"] else "calibrate"
-    # a quick run checks the harness at 2e3 dofs: its measurements are no tuning for this machine
-    calibrate = [PY, "bench/run_all.py", "--profile", profile, *([] if cfg["quick"] else ["--install"])]
+    # --quick checks the harness at 2e3 dofs and installs nothing: its measurements are no tuning for this machine
+    calibrate = [PY, "-m", "ngsrng.calibrate", *(["--quick"] if cfg["quick"] else ["--large"] if cfg["large"] else [])]
     calibrate += (["--resume", cal_dir] if os.path.exists(os.path.join(cal_dir, "config.json"))
                   else ["--out", cal_dir])
     tests = ["tests/test_gaussian.py", "tests/test_boundary.py", "tests/test_inplace.py"] if cfg["quick"] \

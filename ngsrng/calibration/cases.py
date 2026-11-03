@@ -62,8 +62,10 @@ CPU_SOLVERS = {
     "cg-bddc": {"solver": "cg", "precond": "bddc"},
     "cg-h1amg": {"solver": "cg", "precond": "h1amg"},
 }
-GPU_SOLVERS = {"cudss": {"solver": "cudss"}, "pcg-jacobi": {"solver": "torch-pcg"}}
-ITERATIVE = {"cg-bddc", "cg-h1amg", "pcg-jacobi"}
+# cuDSS exists only on NVIDIA GPUs (with nvmath-python); AMG-preconditioned CG (pyamg hierarchy, torch V-cycle) runs
+# on any torch device and is the candidate where cuDSS is missing (AMD GPUs). Unavailable candidates are recorded n/a.
+GPU_SOLVERS = {"cudss": {"solver": "cudss"}, "amg-pcg": {"solver": "amg-pcg"}, "pcg-jacobi": {"solver": "torch-pcg"}}
+ITERATIVE = {"cg-bddc", "cg-h1amg", "amg-pcg", "pcg-jacobi"}
 
 # Accuracy a measurement must reach to count (all calibrated arithmetic is float64): white noise reproduces M to
 # max|HH^T - M|/max|M| (or its probe estimate), priors match the float64 direct reference sample for sample.
@@ -80,6 +82,16 @@ GPU_BATCH = 256
 # exact solver (in the first calibration, batched PCG won a 4% batch tie while 11x slower for single samples).
 MODES = ("per_sample_s", "per_sample_batch_s")
 TIE = 1.10
+
+
+def accurate(rec) -> bool:
+    """Whether an ok record meets the accuracy threshold of its suite (records of other suites always do)."""
+    if rec.get("suite") == "noise":
+        return rec.get("cov_rel_err", 0.0) <= ACCURACY["noise"]
+    if rec.get("suite") == "prior":
+        return all(not (rec.get(k) is not None and rec[k] == rec[k] and rec[k] > ACCURACY["prior"])
+                   for k in ("pathwise_rel_err", "law_rel_fro"))
+    return True
 
 
 def mode_ratios(recs):

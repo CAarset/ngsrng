@@ -1,17 +1,17 @@
 """Calibrate this machine: measure the candidate white-noise samplers and solvers, reject the bad ones, and write
-the tuning that ngsrng.Gaussian uses for its automatic choices.
+the tuning that ngsrng.Gaussian uses for its automatic choices. Usually run as ``python -m ngsrng.calibrate``;
+directly:
 
-    python bench/run_all.py --install            # "calibrate" (default): 2D/3D, 1e4 and 1e5 dofs, all devices
-    python bench/run_all.py --profile smoke      # a few minutes: validates the harness end to end
-    python bench/run_all.py --profile large --install    # calibrate up to 1e6 dofs
-    python bench/run_all.py --profile research   # every suite (posteriors, distributions, ...): hours, not tuning
-    python bench/run_all.py --resume results/runs/<run>   # continue an interrupted run
+    python -m ngsrng.calibration.runner --install            # "calibrate": 2D/3D, 1e4 and 1e5 dofs, all devices
+    python -m ngsrng.calibration.runner --profile smoke      # a few minutes: validates the harness end to end
+    python -m ngsrng.calibration.runner --profile research   # every suite (posteriors, ...): hours, not tuning
+    python -m ngsrng.calibration.runner --resume <run dir>   # continue an interrupted run
 
 Each (suite, space, size) group runs in its own worker process, so crashes, out-of-memory kills and hangs are
 recorded as results instead of ending the run. A candidate is rejected -- not measured at larger sizes -- once it
 fails, exceeds its time budget, misses the accuracy threshold (cases.ACCURACY), or is RETIRE_RATIO times slower than
-the best accurate candidate on its platform. Results go to results/runs/<host>_<date>_<profile>/ as JSON lines,
-followed by report.md, recommendations.json, rejected.json and plots (see report.py).
+the best accurate candidate on its platform. Results go to ~/.cache/ngsrng/calibration/<host>_<date>_<profile>/ as
+JSON lines, followed by report.md, recommendations.json and rejected.json (see report.py).
 """
 
 import argparse
@@ -25,22 +25,12 @@ import sys
 import threading
 import time
 
+from .cases import ITERATIVE, PROFILES, RETIRE_RATIO, accurate, build_groups, mode_ratios
+
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)
-sys.path.insert(0, HERE)
-from cases import ACCURACY, ITERATIVE, PROFILES, RETIRE_RATIO, build_groups, mode_ratios  # noqa: E402
+PACKAGE_PARENT = os.path.dirname(os.path.dirname(HERE))  # importable root of ngsrng, for the worker processes
 
 FAILED = {"error", "timeout", "crash", "memlimit"}
-
-
-def accurate(rec) -> bool:
-    """Whether an ok record meets the accuracy threshold of its suite (records of other suites always do)."""
-    if rec.get("suite") == "noise":
-        return rec.get("cov_rel_err", 0.0) <= ACCURACY["noise"]
-    if rec.get("suite") == "prior":
-        return all(not (rec.get(k) is not None and rec[k] > ACCURACY["prior"])
-                   for k in ("pathwise_rel_err", "law_rel_fro"))
-    return True
 
 
 def environment() -> dict:
@@ -71,7 +61,10 @@ def environment() -> dict:
     }
     if _cuda_usable():
         free, total = torch.cuda.mem_get_info()
+        from ..tuning import gpu_backend
+
         env["cuda"] = {
+            "backend": gpu_backend(),
             "device": torch.cuda.get_device_name(0),
             "mem_total_gb": total / 2**30,
             "mem_free_gb": free / 2**30,
@@ -114,10 +107,11 @@ def _meminfo(key):
 def _git():
     try:
         rev = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"], cwd=ROOT, capture_output=True, text=True
+            ["git", "rev-parse", "--short", "HEAD"], cwd=PACKAGE_PARENT, capture_output=True, text=True
         ).stdout.strip()
         dirty = bool(
-            subprocess.run(["git", "status", "--porcelain"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
+            subprocess.run(["git", "status", "--porcelain"], cwd=PACKAGE_PARENT, capture_output=True,
+                           text=True).stdout.strip()
         )
         return f"{rev}{'+dirty' if dirty else ''}"
     except OSError:
@@ -208,7 +202,8 @@ class Runner:
             cmd = [
                 sys.executable,
                 "-u",
-                os.path.join(HERE, "worker.py"),
+                "-m",
+                "ngsrng.calibration.worker",
                 "--group",
                 gfile,
                 "--out",
@@ -216,7 +211,9 @@ class Runner:
                 "--mem-limit-gb",
                 str(self.mem_limit_gb),
             ]
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=HERE)
+            env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [PACKAGE_PARENT,
+                                                                             os.environ.get("PYTHONPATH")]))}
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
             lines = queue.Queue()
 
             def pump(stream=proc.stdout, q=lines):
@@ -330,7 +327,15 @@ def sibling(t):
     return lineage({**t, "power": "*"})
 
 
-def main():
+def runs_dir() -> str:
+    """Where calibration runs go by default: next to the installed tuning (works for a package installed as a
+    dependency, with no repository around it)."""
+    from ..tuning import default_path
+
+    return os.path.join(os.path.dirname(default_path()), "calibration")
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--profile", default="calibrate", choices=list(PROFILES))
     ap.add_argument("--suites", nargs="+", default=None,
@@ -345,14 +350,14 @@ def main():
     )
     ap.add_argument("--resume", default=None, help="run directory to continue")
     ap.add_argument("--out", default=None,
-                    help="run directory of a new run (default: results/runs/<host>_<date>_<profile>)")
+                    help="run directory of a new run (default: ~/.cache/ngsrng/calibration/<host>_<date>_<profile>)")
     ap.add_argument("--dry-run", action="store_true", help="list groups and task counts only")
     ap.add_argument(
         "--install",
         action="store_true",
         help="make this run's recommendations the active tuning for ngsrng.Gaussian (see ngsrng/tuning.py)",
     )
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     env = environment()
     args.suites = args.suites or PROFILES[args.profile]["suites"]
@@ -375,7 +380,7 @@ def main():
         ntasks = sum(len(g.tasks) for g in groups)
     else:
         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M")
-        run_dir = args.out or os.path.join(ROOT, "results", "runs", f"{env['host']}_{stamp}_{args.profile}")
+        run_dir = args.out or os.path.join(runs_dir(), f"{env['host']}_{stamp}_{args.profile}")
         os.makedirs(run_dir, exist_ok=True)
         with open(os.path.join(run_dir, "config.json"), "w") as fh:
             json.dump(
@@ -422,14 +427,15 @@ def main():
         json.dump(runner.rejected, fh, indent=1)
     log(f"benchmarks finished in {(time.time() - t0) / 60:.1f} min; {len(runner.rejected)} candidates rejected; "
         "writing report")
-    import report
+    from . import report
 
     report.write(run_dir)
     log(f"report: {os.path.join(run_dir, 'report.md')}")
     if args.install:
-        from ngsrng import tuning
+        from .. import tuning
 
         log(f"installed tuning: {tuning.install(run_dir)}")
+    return run_dir
 
 
 if __name__ == "__main__":

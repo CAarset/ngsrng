@@ -132,6 +132,9 @@ class NGSolveCG(_NGSolveBase):
 
 
 def cudss_available() -> bool:
+    """NVIDIA's cuDSS through nvmath-python, on an NVIDIA GPU (PyTorch's ROCm build also reports "cuda" devices)."""
+    if getattr(torch.version, "hip", None):
+        return False
     try:
         import nvmath.sparse.advanced  # noqa: F401
     except ImportError:
@@ -268,6 +271,97 @@ class TorchPCG(Solver):
     def info(self):
         its = self.iterations[-100:]
         return {**super().info(), "tol": self.tol, "mean_iterations": float(np.mean(its)) if its else None}
+
+
+def pyamg_available() -> bool:
+    try:
+        import pyamg  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+class TorchAMGPCG(Solver):
+    """Batched CG preconditioned by one smoothed-aggregation AMG V-cycle, every operation on the device.
+
+    The hierarchy is built once on the CPU (pyamg) and uploaded as sparse matrices. The V-cycle smooths with damped
+    Jacobi (the same sweeps before and after, weight 4/3 over the spectral radius of D^-1 A) and solves the coarsest
+    level with a dense Cholesky factor, so the preconditioner is symmetric positive definite and CG applies. All work
+    per iteration is sparse-dense products and elementwise operations on all right-hand sides together, so it runs on
+    any torch device -- also where no GPU sparse direct solver exists (ROCm) -- and its cost grows linearly with the
+    number of unknowns, without the fill-in of a factorisation.
+    """
+
+    exact = False
+
+    def __init__(self, a_free: sp.spmatrix, device, dtype, tol=1e-8, maxiter=1000, sweeps=2, max_coarse=500):
+        import pyamg
+        from pyamg.util.linalg import approximate_spectral_radius
+
+        self.name = "torch-pcg(amg)"
+        self.tol, self.maxiter, self.sweeps = tol, maxiter, sweeps
+        self.device, self.dtype = device, dtype
+        a = sp.csr_matrix(a_free, dtype=np.float64)
+        ml = pyamg.smoothed_aggregation_solver(a, symmetry="symmetric", max_coarse=max_coarse)
+        self.a = sparse_to_torch(a, device, dtype)
+        self.levels = []
+        for lvl in ml.levels[:-1]:
+            al = lvl.A.tocsr()
+            dinv = 1.0 / al.diagonal()
+            omega = 4.0 / (3.0 * approximate_spectral_radius(sp.diags(dinv) @ al))
+            self.levels.append((sparse_to_torch(al, device, dtype), sparse_to_torch(lvl.P.tocsr(), device, dtype),
+                                sparse_to_torch(lvl.P.T.tocsr(), device, dtype),
+                                torch.from_numpy(omega * dinv).to(device=device, dtype=dtype)[:, None]))
+        coarse = torch.from_numpy(ml.levels[-1].A.toarray()).to(device=device, dtype=torch.float64)
+        self.coarse = torch.linalg.cholesky(coarse).to(dtype)
+        self.nlevels = len(ml.levels)
+        self.iterations = []
+
+    def _vcycle(self, level, b):
+        if level == len(self.levels):
+            return torch.cholesky_solve(b, self.coarse)
+        a, p, r, wd = self.levels[level]
+        x = wd * b  # first sweep from x = 0
+        for _ in range(self.sweeps - 1):
+            x = x + wd * (b - a @ x)
+        x = x + p @ self._vcycle(level + 1, r @ (b - a @ x))
+        for _ in range(self.sweeps):
+            x = x + wd * (b - a @ x)
+        return x
+
+    def apply(self, b):
+        squeeze = b.ndim == 1
+        b = (b[:, None] if squeeze else b).to(self.dtype)
+        x = torch.zeros_like(b)
+        r = b.clone()
+        z = self._vcycle(0, r)
+        p = z.clone()
+        rz = (r * z).sum(0)
+        bnorm = torch.linalg.vector_norm(b, dim=0).clamp_min(torch.finfo(b.dtype).tiny)
+        it, res = 0, None
+        for it in range(1, self.maxiter + 1):
+            ap = self.a @ p
+            pap = (p * ap).sum(0)
+            alpha = torch.where(pap > 0, rz / pap, torch.zeros_like(rz))
+            x += alpha * p
+            r -= alpha * ap
+            res = (torch.linalg.vector_norm(r, dim=0) / bnorm).max()
+            if res <= self.tol:
+                break
+            z = self._vcycle(0, r)
+            rz_new = (r * z).sum(0)
+            p = z + torch.where(rz > 0, rz_new / rz, torch.zeros_like(rz)) * p
+            rz = rz_new
+        else:
+            warnings.warn(f"AMG-preconditioned CG did not converge in {self.maxiter} iterations (relative residual "
+                          f"{float(res):.1e} > tol {self.tol:.0e})", stacklevel=2)
+        self.iterations.append(it)
+        return x[:, 0] if squeeze else x
+
+    def info(self):
+        its = self.iterations[-100:]
+        return {**super().info(), "tol": self.tol, "levels": self.nlevels,
+                "mean_iterations": float(np.mean(its)) if its else None}
 
 
 class RationalSolver(Solver):

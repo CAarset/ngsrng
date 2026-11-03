@@ -1,4 +1,4 @@
-"""Run one benchmark group in an isolated process (invoked by run_all.py).
+"""Run one calibration group in an isolated process (``python -m ngsrng.calibration.worker``, started by runner).
 
 Protocol: for each task, prints ``START <task id>`` before and ``DONE <task id>`` after appending its JSON record to
 the output file. If the process dies or hangs, the orchestrator attributes the failure to the started task.
@@ -10,7 +10,6 @@ import argparse
 import json
 import math
 import os
-import sys
 import threading
 import time
 import traceback
@@ -21,17 +20,16 @@ import numpy as np
 import scipy.linalg as sla
 import torch
 
-# Benchmarks measure the built-in rule-based "auto" choices, never a previously installed tuning.
-os.environ["NGSRNG_TUNING"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "no-tuning.json")
-sys.path.insert(0, os.path.dirname(__file__))
-from cases import DENSE_LIMIT, GPU_BATCH, Task  # noqa: E402
-from common import make_space, structured_mesh  # noqa: E402
-
+# Calibrations measure the built-in rule-based "auto" choices, never a previously installed tuning.
+os.environ["NGSRNG_TUNING"] = "none"
 import ngsrng  # noqa: E402
 from ngsrng import noise as nz  # noqa: E402
 from ngsrng.backend import NormalStream  # noqa: E402
 from ngsrng.reference import covariance_errors, exact_covariance, sampler_covariance  # noqa: E402
 from ngsrng.space import SpaceInfo  # noqa: E402
+
+from .cases import DENSE_LIMIT, GPU_BATCH, Task  # noqa: E402
+from .common import make_space, structured_mesh  # noqa: E402
 
 KAPPA = 5.0
 EXACT_LIMIT = 1500
@@ -448,7 +446,7 @@ def _dist_check(case, name, args, x, gauss, rec):
 
 def run_distributions(task: Task, fes, rec: dict):
     """Setup and per-sample cost of every family and algorithm relative to its Gaussian, plus a validity check."""
-    from cases import DISTRIBUTION_CASES
+    from .cases import DISTRIBUTION_CASES
 
     name, args, opts = DISTRIBUTION_CASES[task.method]
     args = _dist_args(args)
@@ -494,7 +492,7 @@ class LowRankReference:
     """Dense KL eigenvalues of the default prior on a space (only below LOWRANK_DENSE_LIMIT free dofs)."""
 
     def __init__(self, fes, kind):
-        from cases import LOWRANK_DENSE_LIMIT
+        from .cases import LOWRANK_DENSE_LIMIT
 
         self.fes, self.kind, self.lam = fes, kind, None
         s = SpaceInfo(fes)
@@ -533,9 +531,9 @@ class CovarianceContext:
     exact variances and traces (below COVARIANCE_EXACT_LIMIT free dofs)."""
 
     def __init__(self, fes, kind):
-        from cases import COVARIANCE_EXACT_LIMIT
-
         from ngsrng.quadrature import QuadratureRule
+
+        from .cases import COVARIANCE_EXACT_LIMIT
 
         self.prior = ngsrng.Gaussian(fes, prior_spec(fes, kind, 2), dtype="float64", seed=0)
         lo, hi = 0.1, 0.9
@@ -556,7 +554,7 @@ class CovarianceContext:
 def run_covariance(task: Task, ctx: CovarianceContext, rec: dict):
     """Pointwise variance (relative errors at the quadrature points) or trace (relative error) of a prior or
     posterior covariance, with the cost in applications of the factor L or L^T."""
-    from cases import COVARIANCE_VARIANCE
+    from .cases import COVARIANCE_VARIANCE
 
     kind, name = task.method.split(":")
     source = task.solver.split("-p")[0]
@@ -692,6 +690,8 @@ def main():
             print(f"START {task.id}", flush=True)
             rec = {**task.to_dict(), "task_id": task.id, "lineage": task.lineage, "status": "ok"}
             rec.pop("options")
+            if task.device == "cuda":  # cuda or rocm: PyTorch's ROCm build presents AMD GPUs as "cuda" devices
+                rec["backend"] = ngsrng.tuning.gpu_backend()
             if space is not None or fes is not None:
                 s = space if space is not None else SpaceInfo(fes)
                 rec.update(ndof=s.ndof, nfree=s.nfree, ne=s.mesh.ne)

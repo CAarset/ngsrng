@@ -140,8 +140,8 @@ following:
     "fields"); ngsrng warns and suggests using it as a precision instead.
 11. Values of bounded distributions always stay strictly inside their range, also in single precision (a uniform
     value is never exactly 0 or 1).
-12. On a GPU (A100), cuDSS samples 25-80x faster than the threaded CPU engine; `python bench/calibrate.py`
-    measures it on your machine and installs the fastest accurate choices.
+12. On a GPU (A100), cuDSS samples 25-80x faster than the threaded CPU engine; `python -m ngsrng.calibrate`
+    measures your machine and installs the fastest accurate choices (see [Calibration](#calibration)).
 13. **Large batches:** on the CPU, samples are computed in parallel threads (one sample per thread; set the number
     with `method={"threads": k}`). Results do not depend on the number of threads. A batch and the same samples drawn
     one at a time agree to rounding (about 1e-14 relative), not bit for bit.
@@ -297,52 +297,97 @@ What to keep in mind:
 ## Repository layout
 | Path | Contents |
 |---|---|
-| `ngsrng/` | The package. `gaussian.py` (sampler and automatic selection), `noise.py` (white noise), `solvers.py`, `rational.py` (fractional powers), `observations.py`, `posterior.py`, `lowrank.py`, `randomized.py` (randomised subspace iteration), `covariance.py` (variance maps, traces, covariance functions, sample covariances), `quadrature.py`, `generator.py` (numpy-style API), `correlation.py`, `distributions/` (inversion, copula marginals, quadratic forms, scale mixtures, KL expansions), `tuning.py`, `reference.py` (dense ground truth), `space.py`, `backend.py`, `specs.py` |
+| `ngsrng/` | The package. `gaussian.py` (sampler and automatic selection), `noise.py` (white noise), `solvers.py`, `rational.py` (fractional powers), `observations.py`, `posterior.py`, `lowrank.py`, `randomized.py` (randomised subspace iteration), `covariance.py` (variance maps, traces, covariance functions, sample covariances), `quadrature.py`, `generator.py` (numpy-style API), `correlation.py`, `distributions/` (inversion, copula marginals, quadratic forms, scale mixtures, KL expansions), `tuning.py` (calibrated choices), `calibrate.py` and `calibration/` (the calibration), `data/default_tuning.json` (the shipped calibration), `reference.py` (dense ground truth), `space.py`, `backend.py`, `specs.py` |
 | `tests/` | One test file per module; `python -m pytest` |
-| `bench/` | Calibration: `calibrate.py` (one command), `run_all.py` (orchestrator), `cases.py` (candidates), `worker.py`, `report.py`; optional `boundary_scaling.py`, `gpu_batch.py` |
+| `bench/` | Developer checks: `calibrate.py` (tests, validation, calibration, boundary and GPU benchmarks in one run), `boundary_scaling.py`, `gpu_batch.py` |
 | `examples/` | `demo.ipynb`: the user tutorial; `stokes_inverse.ipynb`: advanced walkthrough of a linear Bayesian inverse problem with a Stokes forward model; `hydraulic_tomography_3d.ipynb`: nonlinear 3D problem with heavy-tailed noise, Laplace approximation and MCMC. All executed (interactive `Draw` views and static panels included) |
 | `results/` | `calibrate/` and `runs/` (generated, git-ignored), `gpu_box/` (the 2026-11-02 A100 run), `prototype/` (archived early results) |
 
 ## Installation
 ```bash
 uv pip install -e ".[test,bench]"     # core + tests + benchmark tooling
-uv pip install -e ".[gpu]"            # optional: cuDSS GPU direct solver (CUDA 13)
+uv pip install -e ".[gpu]"            # optional, NVIDIA GPUs: cuDSS sparse direct solver (CUDA 13)
+uv pip install -e ".[amg]"            # optional, other GPUs (AMD/ROCm): AMG-preconditioned CG on the device
 uv pip install -e ".[examples]"       # optional: Jupyter, anywidget (for Draw) and matplotlib, for the tutorial
 uv pip install -e /path/to/ngsplot     # optional: local package for the tutorial's side-by-side panels
 ```
 
-## Calibration (one command)
+## Calibration
+
+ngsrng chooses its white-noise sampler and linear solver automatically. Out of the box it uses
+**sensible defaults**:
+- the built-in rules;
+- refined by the calibration it ships with (`ngsrng/data/default_tuning.json`, measured on an NVIDIA A100 with a
+  32-thread EPYC CPU).
+
+**Calibrating your own machine** measures the candidates there and overrides the defaults. It is one command and
+works wherever ngsrng is installed, also as a (deep) dependency of another project installed from git:
+
 ```bash
-python bench/calibrate.py                  # tests, validation, calibration, boundary and GPU checks (~30 min)
-python bench/calibrate.py --skip boundary,throughput   # tests, validation and calibration only (~20 min)
-python bench/calibrate.py --quick          # a few minutes: harness check (installs no tuning)
-python bench/calibrate.py --large          # calibrate up to 1e6 dofs (an hour or more)
-python bench/calibrate.py --resume results/calibrate/<run>   # continue an interrupted run
-python bench/run_all.py --install          # the calibration step alone
-python bench/run_all.py --profile research # posteriors, distributions, low rank, ...: research data, hours
+python -m ngsrng.calibrate               # 13 min on the A100 box; longer on small machines
+python -m ngsrng.calibrate --quick       # a few minutes: checks that calibrating works here (installs nothing)
+python -m ngsrng.calibrate --large       # up to 1e6 dofs (an hour or more)
+python -m ngsrng.calibrate --resume DIR  # continue an interrupted calibration
+python -m ngsrng.tuning show             # this machine, the calibrations, and which tables apply here
+python -m ngsrng.tuning reset            # forget this machine's calibration
 ```
-- **Purpose:** choose this machine's white-noise sampler and linear solver, and reject the candidates that cannot win.
-  The calibration measures only exact samplers (diagonal, local Gram, quadrature) and the solvers that can win (NGSolve
-  sparse Cholesky and UMFPACK, CG with BDDC or h1amg, cuDSS and batched PCG on a GPU), in 2D and 3D at 1e4 and 1e5
-  dofs plus 3D P1 at 2.5e5 (1e6 with `--large`), on every available device. One recommendation serves single draws
-  and batches (one sample per CPU thread, 256 on a GPU), so candidates are ranked by their worst ratio to the best
-  time in either mode, and near-ties go to exact solvers. On the A100 box (2026-11-03) cuDSS was 16-94x faster than
-  the best CPU solver at 1e5 dofs.
-- **Accuracy first:** every measurement is checked, also at large sizes: white noise must reproduce the mass matrix
-  to 1e-10, priors must match a float64 direct reference sample for sample to 1e-6. A candidate is rejected for
-  larger sizes once it is inaccurate, fails, exceeds its time budget, or is 20x slower than the best accurate one on
-  its platform (iterative solvers in 3D excepted). The earlier exhaustive benchmark took days and ranked by speed
-  alone; the measured losers -- Chebyshev and lumped noise, Jacobi- and multigrid-preconditioned CG, PARDISO,
-  float32 GPU arithmetic -- are no longer candidates ([bench/cases.py](bench/cases.py)).
-- **Portability:** available devices and libraries are detected. Crashes, hangs and out-of-memory cases run in
-  isolated worker processes and are recorded as results. A memory watchdog keeps workers below 80% of available RAM.
-- **Output:** `results/calibrate/<host>_<date>/` holds `SUMMARY.md`, the step logs and, under `out/calibrate/`, the
-  raw JSON lines, `report.md` (accuracy, fastest accurate method per case, rejected candidates), `plots/`,
-  `recommendations.json` and `rejected.json`.
-- **Tuning:** the calibration installs its recommendations (`python -m ngsrng.tuning install <run dir>` does it by
-  hand): `Gaussian` then uses the measured fastest accurate noise sampler, solver and, with `device="auto"`, device
-  for the nearest calibrated case. `python -m ngsrng.tuning show` lists the active tuning. Without tuning, built-in
-  rules apply.
+
+It is modelled on FFTW's planner and wisdom:
+- the built-in rules are the estimate mode;
+- a calibration measures and keeps the winners;
+- this machine's calibration takes precedence over the shipped one.
+
+The precise behaviour:
+
+- **Where it applies:**
+  - CPU tables apply on any CPU, because they rank algorithms rather than chips.
+  - GPU tables apply only on the device they were measured on, so the shipped A100 table never steers an AMD card.
+  - An entry applies only near its calibrated case: same dimension and space type, order within one, size within a
+    factor of ten.
+  - Everywhere else the built-in rules decide.
+- **Only a suggestion:** a calibrated choice is used only if it is available on this machine and builds without
+  error; otherwise the built-in rule applies. `Gaussian(...).plan["tuning"]` says which, and why.
+- **The notice:** a machine without a calibration of its own gets one notice per terminal session (a
+  `CalibrationNotice` warning, never an error) with the command to run. `NGSRNG_QUIET=1` silences it.
+  `NGSRNG_TUNING=none` (or `method={"tuning": False}`) uses only the built-in rules, and `NGSRNG_TUNING=<file>` only
+  that file.
+- **What it measures:** only exact white-noise samplers (diagonal, local Gram, quadrature) and the solvers that can
+  win:
+  - on the CPU: NGSolve sparse Cholesky and UMFPACK, CG with BDDC or h1amg;
+  - on the GPU: cuDSS, AMG-preconditioned CG and Jacobi PCG;
+  - in 2D and 3D, at 1e4 and 1e5 dofs plus 3D P1 at 2.5e5.
+
+  One recommendation serves single draws and batches (one sample per CPU thread, 256 on a GPU). Candidates are
+  ranked by their worst ratio to the best time in either mode, and near-ties go to exact solvers.
+- **Accuracy first:** every measurement is checked: white noise must reproduce the mass matrix to 1e-10, and
+  priors must match a float64 direct reference sample for sample to 1e-6. A candidate is rejected for larger sizes
+  once it is inaccurate, fails, exceeds its time budget, or is 20x slower than the best accurate one on its platform
+  (iterative solvers in 3D excepted). Crashes, hangs and out-of-memory cases run in isolated worker processes and are
+  recorded as results.
+- **Output:** each run is stored under `~/.cache/ngsrng/calibration/<host>_<date>_<profile>/` and contains:
+  - `report.md` (in full with pandas, tabulate and matplotlib, in short without);
+  - `recommendations.json` and `rejected.json`;
+  - the raw JSON lines.
+
+  The installed calibration is `~/.cache/ngsrng/recommendations.json`.
+- **A100 results (2026-11-03):** cuDSS was 7-12x faster than the best CPU solver at 1e4 dofs, 10-93x at 1e5 and 140x
+  at 3D P1 with 2.6e5 dofs (in batches). On the CPU, sparse Cholesky stayed 2x faster per sample than CG-h1amg up to
+  2.6e5 dofs in 3D.
+
+**GPUs without cuDSS (AMD/ROCm).** cuDSS, NVIDIA's sparse direct solver, has no AMD counterpart with a Python
+interface. On such GPUs (and on NVIDIA GPUs without `nvmath-python`), ngsrng uses AMG-preconditioned CG on the
+device:
+- the multigrid hierarchy is built once on the CPU by pyamg (`pip install ngsrng[amg]`);
+- every iteration is sparse-dense products on all samples of a batch at once;
+- it converged in 16-27 iterations in our tests (2D and 3D, P1, P2 and DG, to the default solver tolerance of
+  1e-8), with an iteration count that does not grow with the mesh size.
+
+Without pyamg it falls back to Jacobi PCG, which needs 10-100x more iterations. Calibrate such a machine: the
+calibration decides between the GPU and the CPU engine case by case.
+
+The developer's full check of a machine (tests, validation, calibration, boundary and GPU benchmarks; about 35 minutes
+on the A100 box) is `python bench/calibrate.py`. The research suites (posteriors, distributions, low rank,
+covariance diagnostics, continuum accuracy) run with `python -m ngsrng.calibration.runner --profile research`.
 
 ## Development
 ```bash
