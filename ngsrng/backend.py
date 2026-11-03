@@ -74,17 +74,19 @@ def ngs_sparse(mat: sp.spmatrix, rows=None, nrows=None, cols=None, ncols=None):
 class NormalStream:
     """Fast, reproducible N(0,1) generation into NumPy buffers (CPU engine).
 
-    Chunks of 2^18 numbers each get their own SFC64 generator keyed by (seed, call counter, chunk index), so the
+    Chunks of 2^18 numbers each get their own SFC64 generator keyed by (stream, sample key, chunk index), so the
     stream does not depend on the number of threads. Threaded filling runs at several hundred M numbers/s;
-    torch's CPU generator manages ~40 M/s.
+    torch's CPU generator manages ~40 M/s. ``seed``: anything :class:`ngsrng.seeding.Source` accepts (None: torch's
+    global generator, read at each draw).
     """
 
     chunk = 1 << 18
     _pool = None
 
     def __init__(self, seed=None):
-        self.entropy = np.random.SeedSequence(seed).entropy
-        self.counter = 0
+        from .seeding import as_source
+
+        self.source = as_source(seed)
 
     @classmethod
     def pool(cls):
@@ -96,28 +98,30 @@ class NormalStream:
         return cls._pool
 
     def fill(self, out: np.ndarray):
-        key, self.counter = self.counter, self.counter + 1
+        """One sample's numbers (one key), chunks filled in parallel threads."""
+        ticket = self.reserve(1)
         nchunks = -(-len(out) // self.chunk)
         if nchunks == 1:
-            self._job(out, key, 0)
+            self._job(out, ticket, 0, 0)
         else:
-            list(self.pool().map(lambda j: self._job(out, key, j), range(nchunks)))
+            list(self.pool().map(lambda j: self._job(out, ticket, 0, j), range(nchunks)))
         return out
 
-    def reserve(self, n: int) -> int:
-        """Reserve the keys of the next n calls of ``fill`` (for :meth:`fill_keyed`): returns the first."""
-        key, self.counter = self.counter, self.counter + int(n)
-        return key
+    def reserve(self, n: int):
+        """Reserve the keys of the next n samples (for :meth:`fill_keyed`), in the calling thread: an opaque ticket.
+        Within one draw (:func:`ngsrng.seeding.one_draw`) consecutive reservations continue one another."""
+        return self.source.streams().reserve(n)
 
-    def fill_keyed(self, out: np.ndarray, key: int):
-        """The numbers ``fill`` would produce as its call number ``key``, generated in the calling thread (for
-        batches spread over threads: sample k of a batch gets key first + k, as in a loop of ``fill`` calls)."""
+    def fill_keyed(self, out: np.ndarray, ticket, k: int):
+        """The numbers of sample k of a reservation, generated in the calling thread (batches spread over threads:
+        every sample's numbers depend on its key only, not on the thread that makes them)."""
         for j in range(-(-len(out) // self.chunk)):
-            self._job(out, key, j)
+            self._job(out, ticket, k, j)
         return out
 
-    def _job(self, out, key, j):
-        ss = np.random.SeedSequence(self.entropy, spawn_key=(key, j))
+    def _job(self, out, ticket, k, j):
+        seq, first = ticket
+        ss = np.random.SeedSequence(seq.entropy, spawn_key=seq.spawn_key + (first + k, j))
         np.random.Generator(np.random.SFC64(ss)).standard_normal(out=out[j * self.chunk : (j + 1) * self.chunk])
 
 
@@ -128,6 +132,20 @@ def make_generator(seed, device) -> torch.Generator:
     else:
         gen.manual_seed(int(seed))
     return gen
+
+
+@contextmanager
+def fixed_numpy_global_rng(seed=0):
+    """Run third-party code that draws from NumPy's global (legacy) random state -- pyamg's spectral-radius
+    estimates start from ``np.random.rand`` -- with a fixed seed, and give the caller's state back afterwards: the
+    result does not depend on the user's ``np.random.seed``, and the user's ``np.random`` stream does not advance.
+    (Like any use of the global state, not isolated from other threads drawing from it at the same time.)"""
+    state = np.random.get_state()
+    np.random.seed(seed)
+    try:
+        yield
+    finally:
+        np.random.set_state(state)
 
 
 @contextmanager
@@ -209,6 +227,19 @@ _POOL = []
 _IN_WORKER = threading.local()
 
 
+def _forget_pools_after_fork():
+    """A forked child inherits the thread pools' bookkeeping but none of their threads: a pool that counts idle
+    threads starts no new ones, and the child's first threaded batch waits forever (e.g. in a DataLoader worker
+    forked after the parent sampled). The child starts new pools on first use instead."""
+    _POOL.clear()
+    NormalStream._pool = None
+    _IN_WORKER.__dict__.clear()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_forget_pools_after_fork)
+
+
 def parallel_ranges(n: int, work, threads: int | None = None):
     """Run ``work(lo, hi)`` on contiguous index ranges covering range(n), in a shared thread pool.
 
@@ -241,6 +272,34 @@ def parallel_ranges(n: int, work, threads: int | None = None):
         futures = [_POOL[0].submit(run, lo, hi) for lo, hi in zip(bounds[:-1], bounds[1:]) if hi > lo]
         for f in futures:
             f.result()  # re-raises a worker's exception
+
+
+class Rebuildable:
+    """Pickling for objects that hold what does not pickle: NGSolve sparse matrices, factorisations, preconditioners
+    and integration rules, cuDSS handles. Every ``_ngs_*`` attribute and those named in ``_transient`` are left out
+    when pickling, and ``_restore()`` rebuilds them after unpickling (so a worker process that receives a sampler
+    assembles and factorises once). ``copy.copy`` stays a plain shallow copy that shares them.
+
+    No lambda or nested function may be stored on such objects (they do not pickle): module-level functions, bound
+    methods or small callable classes instead (``tests/test_pickling.py`` checks every sampler).
+    """
+
+    _transient = ()
+
+    def __getstate__(self):
+        return {k: v for k, v in self.__dict__.items() if not (k.startswith("_ngs_") or k in self._transient)}
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._restore()
+
+    def _restore(self):
+        """Rebuild what ``__getstate__`` left out (default: nothing; lazily built attributes need nothing)."""
+
+    def __copy__(self):
+        new = object.__new__(type(self))
+        new.__dict__.update(self.__dict__)
+        return new
 
 
 class Scratch:

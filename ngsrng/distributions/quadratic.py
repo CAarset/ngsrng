@@ -21,6 +21,7 @@ explicit formulas (p <= 3) and broadcasting, so everything runs in NumPy and on 
 import numpy as np
 import scipy.stats as st
 
+from ..seeding import as_source
 from .inversion import Inversion
 from .pointwise import XP, GaussianAtPoints, PointwiseField, is_conditioned, warn_copies_of_posterior
 
@@ -130,7 +131,7 @@ class WishartField(_Copies):
     _pull_inside = staticmethod(_spd_inside)
 
     def __init__(self, points, df, scale, inverse=False, construction="process", representation="quadrature",
-                 rng=None, method="auto", tol=1e-10):
+                 seed=None, method="auto", tol=1e-10):
         scale = np.atleast_2d(np.asarray(scale, dtype=float))
         p = scale.shape[0]
         if construction == "process":
@@ -150,7 +151,7 @@ class WishartField(_Copies):
             self.chol = np.linalg.cholesky(np.linalg.inv(scale))
         else:
             self.chol = np.linalg.cholesky(scale)
-        self.rng = np.random.default_rng() if rng is None else rng
+        self.source = as_source(seed)  # the Haar rotations of the Bartlett construction (ngsrng.seeding)
         if construction == "bartlett":
             self.chi = [Inversion(st.chi2(df - i), method=method, tol=tol) for i in range(p)]
             self.torch_capable = all(c.torch_capable for c in self.chi)
@@ -193,7 +194,7 @@ class WishartField(_Copies):
             u = [[ti[j][i] for j in range(p)] for i in range(p)]  # transpose
         else:
             u = t
-        c = np.einsum("ab,bcn->acn", self.chol, haar_rotations(p, n, self.rng))  # (p, p, n): per-sample L O
+        c = np.einsum("ab,bcn->acn", self.chol, haar_rotations(p, n, self.source.streams().numpy()))  # per-sample L O
         c = tensor(c)
         # B = C U, then W = B B^T (sum over the inner index)
         b = [[sum(c[a, m][None, :] * u[m][j] for m in range(p)) for j in range(p)] for a in range(p)]

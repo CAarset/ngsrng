@@ -18,11 +18,14 @@ import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 import torch
 
-from .backend import Scratch, available_memory, ngs_sparse, sparse_to_torch, spmm
+from .backend import Rebuildable, Scratch, available_memory, ngs_sparse, sparse_to_torch, spmm
 from .space import SpaceInfo, assemble, mass_form
 
 
-class NoiseSampler:
+class NoiseSampler(Rebuildable):
+    """White-noise sampler. Its NGSolve objects (``_ngs_*``, made by ``ngs_setup``) do not pickle: they are made
+    again after unpickling."""
+
     name = "abstract"
     exact = True
     nrand: int
@@ -41,8 +44,13 @@ class NoiseSampler:
 
     def ngs_setup(self, space: SpaceInfo):
         """Default for samplers that store a sparse factor ``self.h`` (nfree x nrand)."""
+        self.ngs_space = space
         self._ngs_h = ngs_sparse(self.h, rows=space.free, nrows=space.ndof)
         return self
+
+    def _restore(self):
+        if getattr(self, "ngs_space", None) is not None:
+            self.ngs_setup(self.ngs_space)
 
     def ngs_apply(self, eta, out):
         """out (ndof) = H eta (nrand), as NGSolve BaseVectors."""
@@ -276,10 +284,14 @@ class ChebyshevNoise(NoiseSampler):
         return y[:, 0] if squeeze else y
 
     def ngs_setup(self, space: SpaceInfo):
+        self.ngs_space = space
         self._ngs_a = ngs_sparse(self.at)
         self._ngs_out = ngs_sparse(sp.diags(self.dsqrt).tocsr(), rows=space.free, nrows=space.ndof)
-        self._ngs_tmp = Scratch(lambda: [self._ngs_a.CreateColVector() for _ in range(4)])  # per thread
+        self._ngs_tmp = Scratch(self._new_tmp)  # per thread
         return self
+
+    def _new_tmp(self):
+        return [self._ngs_a.CreateColVector() for _ in range(4)]
 
     def ngs_apply(self, eta, out):
         alpha, beta = 2.0 / (self.hi - self.lo), (self.hi + self.lo) / (self.hi - self.lo)
@@ -467,14 +479,18 @@ class LocalGramNoise(NoiseSampler):
         return out
 
     def ngs_setup(self, space: SpaceInfo):
+        self.ngs_space = space
         self._ngs_ref = [
             (l, np.ascontiguousarray(sd.T), np.ascontiguousarray(rows.T)) for l, sd, rows in self.ref_parts
         ]
         self._ngs_hb = ngs_sparse(self.h_broken) if self.h_broken.nnz else None
         self._ngs_hg = ngs_sparse(self.h_boundary, rows=space.free, nrows=space.ndof) if self.h_boundary.nnz else None
         self._ngs_eft = ngs_sparse(self.eft, rows=space.free, nrows=space.ndof)
-        self._ngs_y = Scratch(lambda: ngs.la.BaseVector(self.nbroken))  # per thread
+        self._ngs_y = Scratch(self._new_broken_vector)  # per thread
         return self
+
+    def _new_broken_vector(self):
+        return ngs.la.BaseVector(self.nbroken)
 
     def ngs_apply(self, eta, out):
         e, y = eta.FV().NumPy(), self._ngs_y.get()

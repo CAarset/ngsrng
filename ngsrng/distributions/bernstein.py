@@ -27,7 +27,7 @@ import ngsolve as ngs
 import numpy as np
 import scipy.sparse as sp
 
-from ..backend import Scratch, ngs_sparse, parallel_ranges
+from ..backend import Rebuildable, Scratch, ngs_sparse, parallel_ranges
 from ..quadrature import QuadratureRule
 from ..space import SpaceInfo
 
@@ -200,17 +200,28 @@ class BernsteinForm:
         return c, resid
 
 
-class SymmetricFactor:
+class SymmetricFactor(Rebuildable):
     """Sparse Cholesky factorisation (NGSolve) of an SPD scipy matrix, applied to many right-hand sides in parallel
     threads. SciPy's SuperLU took ~30 ms per right-hand side for the Bernstein mass matrices of a 5k-dof P2 space;
     this takes ~1 ms single-threaded."""
 
+    _transient = ("mat", "inv")  # NGSolve objects: factorised again after unpickling
+
     def __init__(self, a):
-        self.mat = ngs_sparse(sp.csr_matrix(a))
-        everything = ngs.BitArray(a.shape[0])
+        self.a = sp.csr_matrix(a)
+        self._factorize()
+        self._vectors = Scratch(self._new_vectors)
+
+    def _factorize(self):
+        self.mat = ngs_sparse(self.a)
+        everything = ngs.BitArray(self.a.shape[0])
         everything.Set()
         self.inv = self.mat.Inverse(everything, "sparsecholesky")
-        self._vectors = Scratch(lambda: (self.mat.CreateColVector(), self.mat.CreateColVector()))
+
+    _restore = _factorize
+
+    def _new_vectors(self):
+        return self.mat.CreateColVector(), self.mat.CreateColVector()
 
     def solve(self, b):
         b = np.asarray(b, dtype=float)

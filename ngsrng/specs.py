@@ -85,14 +85,22 @@ def matern(kappa: float, power: float = 2, scale: float = 1.0, coef=None, robin=
     condition (coef grad u) . n + beta u = 0, i.e. the term beta * u * v * ds (``robin="auto"``: beta = kappa / 1.42,
     see ROBIN_FACTOR).
     """
-    beta = _robin(robin, kappa)
+    return PDEPrecision(MaternForm(kappa, coef, _robin(robin, kappa)), power, scale)
 
-    def form(u, v):
-        g = ngs.grad(u) * ngs.grad(v) if coef is None else ngs.InnerProduct(coef * ngs.grad(u), ngs.grad(v))
-        out = (g + kappa**2 * u * v) * ngs.dx
-        return out if beta is None else out + beta * u * v * ngs.ds
 
-    return PDEPrecision(form, power, scale)
+@dataclass(eq=False)  # compared and hashed by identity, as functions are
+class MaternForm:
+    """(coef grad u, grad v) + kappa^2 (u, v) [+ beta (u, v)_ds]: the form of :func:`matern`."""
+
+    kappa: float
+    coef: object = None
+    beta: float | None = None
+
+    def __call__(self, u, v):
+        c = self.coef
+        g = ngs.grad(u) * ngs.grad(v) if c is None else ngs.InnerProduct(c * ngs.grad(u), ngs.grad(v))
+        out = (g + self.kappa**2 * u * v) * ngs.dx
+        return out if self.beta is None else out + self.beta * u * v * ngs.ds
 
 
 def _robin(robin, kappa):
@@ -115,21 +123,30 @@ def matern_dg(fes, kappa: float, power: float = 2, scale: float = 1.0, penalty: 
         raise ValueError("the Matern operator on an L2 space is its interior-penalty (SIPG) discretisation, which "
                          "couples neighbouring elements: create the space with dgjumps=True, e.g. "
                          "L2(mesh, order=p, dgjumps=True)")
-    mesh, order = fes.mesh, max(fes.globalorder, 1)
-    beta = _robin(robin, kappa)
+    form = SipgMaternForm(kappa, fes.mesh.dim, max(fes.globalorder, 1), penalty, _robin(robin, kappa))
+    return PDEPrecision(form, power, scale)
 
-    def form(u, v):
-        n = ngs.specialcf.normal(mesh.dim)
+
+@dataclass(eq=False)  # compared and hashed by identity, as functions are
+class SipgMaternForm:
+    """Symmetric interior penalty form of kappa^2 - Laplace: the form of :func:`matern_dg`."""
+
+    kappa: float
+    dim: int
+    order: int
+    penalty: float = 4.0
+    beta: float | None = None
+
+    def __call__(self, u, v):
+        n = ngs.specialcf.normal(self.dim)
         h = ngs.specialcf.mesh_size
         ju, jv = u - u.Other(), v - v.Other()
         mu = 0.5 * n * (ngs.grad(u) + ngs.grad(u.Other()))
         mv = 0.5 * n * (ngs.grad(v) + ngs.grad(v.Other()))
-        out = (ngs.grad(u) * ngs.grad(v) + kappa**2 * u * v) * ngs.dx + (
-            penalty * order**2 / h * ju * jv - mu * jv - mv * ju
+        out = (ngs.grad(u) * ngs.grad(v) + self.kappa**2 * u * v) * ngs.dx + (
+            self.penalty * self.order**2 / h * ju * jv - mu * jv - mv * ju
         ) * ngs.dx(skeleton=True)
-        return out if beta is None else out + beta * u * v * ngs.ds(skeleton=True)
-
-    return PDEPrecision(form, power, scale)
+        return out if self.beta is None else out + self.beta * u * v * ngs.ds(skeleton=True)
 
 
 CONVENTIONS = ("dual->primal", "primal->primal", "primal->dual")
@@ -187,32 +204,61 @@ class OperatorCovariance:
     def sigma(self, space) -> Callable:
         """Sigma (dual -> primal) on free-dof coefficient blocks: NumPy (nfree x k) -> NumPy (nfree x k)."""
         op = self.apply.mat if isinstance(self.apply, ngs.BilinearForm) else self.apply
-        if isinstance(op, ngs.BaseMatrix):
-            raw = _base_matrix_apply(op, space)
-        else:
-            def raw(y):
-                out = op(torch.from_numpy(np.ascontiguousarray(y)))
-                return out.detach().cpu().double().numpy() if isinstance(out, torch.Tensor) else np.asarray(out)
+        raw = BaseMatrixApply(op, space) if isinstance(op, ngs.BaseMatrix) else CallableApply(op)
         if self.convention == "dual->primal":
             return raw
         if space.mass_is_diagonal:
-            dm = space.mass_free.diagonal()[:, None]
-            minv = lambda y: y / dm  # noqa: E731
+            minv = DiagonalSolve(space.mass_free.diagonal())
         else:
             from .distributions.bernstein import SymmetricFactor  # sparse Cholesky: SuperLU was 3-100x slower
 
             minv = SymmetricFactor(space.mass_free).solve
-        if self.convention == "primal->primal":
-            return lambda y: raw(minv(y))
-        return lambda y: minv(raw(minv(y)))
+        return MassScaled(raw, minv, both=self.convention == "primal->dual")
 
 
-def _base_matrix_apply(op, space):
-    """An NGSolve BaseMatrix on full coefficient vectors as a NumPy map on free-dof blocks."""
-    free = space.free
-    x, y = ngs.la.BaseVector(space.ndof), ngs.la.BaseVector(space.ndof)
+class CallableApply:
+    """A user's apply-only operator (torch in, torch or NumPy out) as a NumPy map on free-dof blocks."""
 
-    def apply(v):
+    def __init__(self, op):
+        self.op = op
+
+    def __call__(self, y):
+        out = self.op(torch.from_numpy(np.ascontiguousarray(y)))
+        return out.detach().cpu().double().numpy() if isinstance(out, torch.Tensor) else np.asarray(out)
+
+
+class DiagonalSolve:
+    """y -> D^-1 y for a diagonal matrix (its diagonal)."""
+
+    def __init__(self, diagonal):
+        self.d = np.asarray(diagonal, dtype=float)[:, None]
+
+    def __call__(self, y):
+        return y / (self.d if y.ndim == 2 else self.d[:, 0])
+
+
+class MassScaled:
+    """Sigma from a covariance operator given in another convention: raw(M^-1 y) (primal->primal) or
+    M^-1 raw(M^-1 y) (primal->dual, ``both``)."""
+
+    def __init__(self, raw, minv, both):
+        self.raw, self.minv, self.both = raw, minv, both
+
+    def __call__(self, y):
+        out = self.raw(self.minv(y))
+        return self.minv(out) if self.both else out
+
+
+class BaseMatrixApply:
+    """An NGSolve BaseMatrix on full coefficient vectors as a NumPy map on free-dof blocks. (The operator itself
+    must pickle for this to pickle; NGSolve inverses, for example, do not.)"""
+
+    def __init__(self, op, space):
+        self.op, self.space = op, space
+
+    def __call__(self, v):
+        free = self.space.free
+        x, y = ngs.la.BaseVector(self.space.ndof), ngs.la.BaseVector(self.space.ndof)
         v = v[:, None] if v.ndim == 1 else v
         out = np.empty((len(free), v.shape[1]))
         xn = x.FV().NumPy()
@@ -220,8 +266,6 @@ def _base_matrix_apply(op, space):
             for k in range(v.shape[1]):
                 xn[:] = 0.0
                 xn[free] = v[:, k]
-                y.data = op * x
+                y.data = self.op * x
                 out[:, k] = y.FV().NumPy()[free]
         return out
-
-    return apply

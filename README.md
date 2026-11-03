@@ -205,7 +205,10 @@ Precisions:
   rational route below with a relative accuracy of `rtol` (no global factorisation is ever formed). Real powers use
   a rational approximation with relative accuracy `rtol` (default 1e-7) on the discrete spectrum, i.e. 7–25 shifted
   solves $(K+tM)^{-1}$ per sample.
-- `PDEPrecision(form, power)`: any bilinear form.
+- `PDEPrecision(form, power)`: any bilinear form, given as a function `form(u, v)` returning it with its measures.
+  Write it with `def` at module level (or as a callable class), not as a lambda or nested function, if the sampler
+  is to go to worker processes: samplers pickle, but a lambda does not. The same holds for every function you pass
+  (`OperatorPrecision`'s `apply`, `transformed(func)`).
 - `AssembledPrecision(form)`: $\Sigma_h^{-1}=Q$, e.g. non-decoupling fourth-order operators. Exact via local Q-noise plus one solve.
 - `OperatorPrecision(apply, convention="primal->dual" | "dual->dual")`: a precision known only through its action.
   Sampled as $(M^{-1}Q)^{-1/2}M^{-1}z$ by a rational approximation whose shifted systems $Q+t_lM$ are all solved in one
@@ -294,10 +297,50 @@ What to keep in mind:
   uniform at every point, use `rng.uniform()`; its covariance is then that of the hidden Gaussian field, not the
   given one.
 
+## Seeding and reproducibility
+Every sampler takes `seed=` (details in [ngsrng/seeding.py](ngsrng/seeding.py)), with torch's and NumPy's conventions:
+
+- **`seed=None` (default) follows torch's global random state**, as `torch.randn` does. Each draw takes its randomness
+  from torch's default generator at the time of the draw. So `torch.manual_seed(...)` and Lightning's
+  `seed_everything(...)` reproduce ngsrng, also when called after the sampler was built, and an unseeded run differs
+  from the last. A process that reseeds torch (a DataLoader worker, a DDP rank) gets its own samples; ranks seeded
+  alike draw alike.
+- **DataLoader workers draw their own samples under every seed.** An explicitly seeded sampler (or a generator object)
+  copied or pickled into the workers is re-keyed with each worker's seed, base seed + worker id, as torch does for
+  its own generator: workers and epochs differ, and `torch.manual_seed` in the main process reproduces them.
+- **Samplers pickle** (worker processes started by `spawn` or `forkserver`, checkpoints): the random state travels
+  with them, and the NGSolve objects (matrices, factorisations) are rebuilt in the receiving process. See
+  known issue 16 for worker processes.
+- **A `torch.Generator` or `numpy.random.Generator`** passed as `seed` is read at every draw in the same way.
+- **An int or `SeedSequence` gives an own stream**, as `numpy.random.default_rng(seed)` does. Global seeds neither
+  affect it nor are advanced by it.
+- **Derived samplers inherit.** Posteriors, KL and low-rank samplers, sample covariances, the fields of a `Generator`
+  and `Generator.spawn` children get child streams of an explicitly seeded parent, or read the same generator.
+- **One call is one draw.** A draw advances torch's global generator by a fixed amount, whatever its size. Within a
+  draw, the CPU engine's samples do not depend on the thread count, the batch split or `out=` versus allocating.
+- **Algorithms are deterministic.** The randomised range finders and the trace, variance and spectrum estimates use
+  fixed seeds of their own.
+
+What is reproduced, and what is not:
+
+| Same seed, and … | Samples agree |
+|---|---|
+| the same sampler object, CPU engine | bit for bit |
+| another run or a separately built sampler, same machine and settings | to rounding (~1e-15; NGSolve's `sparsecholesky` rounds differently from one factorisation to the next, `inverse="umfpack"` does not) |
+| KL / low-rank expansions across runs | to rounding over the eigenvalue gap; on symmetric domains rounding chooses the basis of degenerate eigenspaces, which changes samples by O(1) |
+| an iterative solver, or another solver | to the solver tolerance (CG: 1e-8) |
+| another noise factor (e.g. a calibration that picks another white-noise method), engine, device, GPU model, or library version | in law only |
+| discrete or thresholded families | as their Gaussian, except where a value sits within rounding of a jump |
+
+Samples drawn with the same law but different random numbers are statistically equivalent; bitwise identity across
+machines, solvers or library versions is not attainable. To reproduce a study exactly, seed it, keep the machine and
+software, and pin `method` (or set `NGSRNG_TUNING=none`) so that a calibration cannot change the noise factor. Each
+Gaussian's `plan` records its algorithms and its `"randomness"`.
+
 ## Repository layout
 | Path | Contents |
 |---|---|
-| `ngsrng/` | The package. `gaussian.py` (sampler and automatic selection), `noise.py` (white noise), `solvers.py`, `rational.py` (fractional powers), `observations.py`, `posterior.py`, `lowrank.py`, `randomized.py` (randomised subspace iteration), `covariance.py` (variance maps, traces, covariance functions, sample covariances), `quadrature.py`, `generator.py` (numpy-style API), `correlation.py`, `distributions/` (inversion, copula marginals, quadratic forms, scale mixtures, KL expansions), `tuning.py` (calibrated choices), `calibrate.py` and `calibration/` (the calibration), `data/default_tuning.json` (the shipped calibration), `reference.py` (dense ground truth), `space.py`, `backend.py`, `specs.py` |
+| `ngsrng/` | The package. `gaussian.py` (sampler and automatic selection), `noise.py` (white noise), `solvers.py`, `rational.py` (fractional powers), `observations.py`, `posterior.py`, `lowrank.py`, `randomized.py` (randomised subspace iteration), `covariance.py` (variance maps, traces, covariance functions, sample covariances), `quadrature.py`, `generator.py` (numpy-style API), `correlation.py`, `distributions/` (inversion, copula marginals, quadratic forms, scale mixtures, KL expansions), `seeding.py` (seeds and generators), `tuning.py` (calibrated choices), `calibrate.py` and `calibration/` (the calibration), `data/default_tuning.json` (the shipped calibration), `reference.py` (dense ground truth), `space.py`, `backend.py`, `specs.py` |
 | `tests/` | One test file per module; `python -m pytest` |
 | `bench/` | Developer checks: `calibrate.py` (tests, validation, calibration, boundary and GPU benchmarks in one run), `boundary_scaling.py`, `gpu_batch.py` |
 | `examples/` | `demo.ipynb`: the user tutorial; `stokes_inverse.ipynb`: advanced walkthrough of a linear Bayesian inverse problem with a Stokes forward model; `hydraulic_tomography_3d.ipynb`: nonlinear 3D problem with heavy-tailed noise, Laplace approximation and MCMC. All executed (interactive `Draw` views and static panels included) |

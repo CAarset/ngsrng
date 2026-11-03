@@ -35,6 +35,7 @@ from .backend import Scratch, available_memory, numpy_blas_threads
 from .inplace import InPlace
 from .observations import CHUNK, observation_operator, whiten, whitener
 from .randomized import randomized_qr
+from .seeding import inherit
 from .space import coefficient_columns, coefficient_vector
 
 # ------------------------------------------------------------------ low-rank update maps
@@ -411,7 +412,7 @@ class MatheronPosterior(InPlace):
         if data is not None:
             resid = np.asarray(data, dtype=float) - obs.G @ self._mean
             self._mean[s.free] += self.bmat @ sla.cho_solve(self.kd_chol, resid)
-        self.rng = np.random.default_rng(seed)
+        self.source = inherit(seed, prior)  # seed=None: a child of the prior's randomness (ngsrng.seeding)
         self.space, self.device = s, torch.device("cpu")
         self.plan = {**prior.plan, "conditioning": [f"Matheron, {self.ma} observations"]}
 
@@ -448,7 +449,7 @@ class MatheronPosterior(InPlace):
         if out is not None:
             return self._sample_out(n, out)
         ns = 1 if n is None else int(n)
-        eta = torch.from_numpy(self.rng.standard_normal((ns, self.nrand)).T)  # sample by sample
+        eta = torch.from_numpy(self.source.streams().numpy().standard_normal((ns, self.nrand)).T)  # sample by sample
         x = np.repeat(self._mean[:, None], ns, axis=1)
         x[self.space.free] += self.apply(eta).numpy()
         if n is None:

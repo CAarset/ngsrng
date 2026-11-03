@@ -17,12 +17,13 @@ family and every Gaussian type):
   ``default_rng(..., work_values=...)``), so the transient memory does not grow with
   k; every chunk reaches the buffer in one copy (cast and device transfer included) or is written there directly
   (the CPU engine's worker threads write each sample into its row);
-- the values are those ``sample`` returns for the same random stream. Samplers draw their randomness sample by
-  sample, so on the CPU engine the result does not depend on the chunking, ``work_values`` or the thread count: bit
-  for bit where every sample is computed on its own (the Gaussian pipelines and everything built on their point
-  values), to rounding where dense products or solves act on a whole chunk (low-rank models, Matheron, the
-  Bernstein and projection coefficients). On the torch engine the random stream depends on the chunking, as torch's
-  own generators do.
+- the values are those ``sample`` returns for the same random stream (an identically seeded sampler, or the same
+  torch seed for the default draw-time randomness: a call is one draw, :mod:`ngsrng.seeding`). Samplers draw their
+  randomness sample by sample, so on the CPU engine the result does not depend on the chunking, ``work_values`` or
+  the thread count: bit for bit where every sample is computed on its own (the Gaussian pipelines and everything
+  built on their point values), to rounding where dense products or solves act on a whole chunk (low-rank models,
+  Matheron, the Bernstein and projection coefficients). On the torch engine the random stream depends on the
+  chunking, as torch's own generators do.
 
 :class:`InPlace` implements the chunked fill on top of a sampler's ``sample``; samplers with a direct path override
 ``_fill`` or ``sample_into``.
@@ -32,6 +33,7 @@ import numpy as np
 import torch
 
 from .backend import available_threads
+from .seeding import draw
 
 # Values per internal chunk of an in-place fill. The transient memory is a small multiple of a chunk (the point values
 # plus the transform's temporaries: measured 2-10x in float64). On the CPU the threads are busy with far smaller
@@ -73,9 +75,20 @@ def chunks(n: int, per_sample: int, work_values=WORK_VALUES, minimum=1):
 
 
 class InPlace:
-    """Mixin: ``sample_into(rows)`` as chunked ``sample`` calls (see the module docstring for the contract)."""
+    """Mixin: ``sample_into(rows)`` as chunked ``sample`` calls (see the module docstring for the contract).
+
+    Every ``sample`` and ``sample_into`` of a subclass is one draw (:func:`ngsrng.seeding.one_draw`): with draw-time
+    randomness (seed None or a generator) the whole call takes one key, so its chunks continue one stream as with an
+    explicit seed, and the values do not depend on the chunking on the CPU engine."""
 
     work_values = WORK_VALUES
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        for name in ("sample", "sample_into"):
+            fn = cls.__dict__.get(name)
+            if fn is not None and not getattr(fn, "__ngsrng_draw__", False):
+                setattr(cls, name, draw(fn))
 
     def _per_sample(self) -> int:
         """Values the sampler handles internally per sample (bounds the chunk size)."""
@@ -87,6 +100,7 @@ class InPlace:
         g = getattr(self, "gauss", None) or getattr(getattr(self, "points", None), "gauss", None) or self
         return available_threads() if getattr(g, "engine", None) == "ngsolve" else 1
 
+    @draw
     def sample_into(self, rows):
         rows = as_tensor(rows)
         for k0, k1 in chunks(rows.shape[0], self._per_sample(), self.work_values, self._min_chunk()):

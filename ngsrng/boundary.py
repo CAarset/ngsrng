@@ -74,7 +74,7 @@ import scipy.linalg as sla
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 
-from .backend import available_memory
+from .backend import Rebuildable, available_memory
 from .covariance import as_covariance, block_columns
 from .space import SpaceInfo, assemble, to_scipy
 
@@ -155,7 +155,7 @@ def boundary_covariance(source, name, fes=None):
     return BoundarySampler(source, name, fes=fes).sigma_bb
 
 
-class BoundarySampler:
+class BoundarySampler(Rebuildable):
     """Boundary (trace) machinery for one Gaussian-type source on one boundary.
 
     Only applications of the coefficient covariance are used, so it is matrix-free and works for fractional powers,
@@ -172,6 +172,12 @@ class BoundarySampler:
         coefficients on the boundary data. For ``power = 1`` its interior rows are ``-K_II^{-1} K_IB``, the
         ``K``-harmonic lifting of the Dirichlet data.
     """
+
+    # pickling: the per-device solvers and the interior factor are made again on first use
+    _transient = ("_device_ops", "_qblocks")
+
+    def _restore(self):
+        self._device_ops, self._qblocks = {}, None
 
     def __init__(self, source, name, fes=None):
         if name not in set(str(b) for b in _boundaries(source, fes)):
@@ -384,7 +390,7 @@ class BoundarySampler:
         """Assembled discrete Dirichlet-to-Neumann map ``S = K_BB - K_BI K_II^{-1} K_IB``.
 
         Provided to check ``sigma_bb == S^{-1}`` for a ``power = 1`` precision independently of this module;
-        ``form`` is the bilinear form of the precision (``lambda u, v: InnerProduct(grad(u), grad(v)) * dx``).
+        ``form(u, v)`` is the bilinear form of the precision (e.g. ``InnerProduct(grad(u), grad(v)) * dx``).
         """
         K = sp.csc_matrix(assemble(self.fes, form)[self.space.free][:, self.space.free])
         b, i = self._free, ~self._free

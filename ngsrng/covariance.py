@@ -130,32 +130,18 @@ def as_covariance(source, fes=None, convention=None) -> CovarianceSource:
         return source
     if isinstance(source, LowRankGaussian):
         s = source.space
-        w = source.b[s.free] @ source.rinv
-        return CovarianceSource(s, lambda y: w @ (w.T @ y), l=lambda e: w @ e, lt=lambda y: w.T @ y,
-                                nrand=w.shape[1], lowrank=w, mean=source.mean, owner=source,
-                                label=f"finite rank {w.shape[1]}")
+        ops = _FiniteRank(source.b[s.free] @ source.rinv)
+        return CovarianceSource(s, ops.sigma, l=ops.factor, lt=ops.factor_t, nrand=ops.w.shape[1], lowrank=ops.w,
+                                mean=source.mean, owner=source, label=f"finite rank {ops.w.shape[1]}")
     if hasattr(source, "apply") and hasattr(source, "apply_t") and hasattr(source, "space"):
         s = source.space
-
-        step = block_columns(source.nrand, s.nfree)
-
-        def factor(e):
-            return np.hstack([_np(source.apply(_t(e[:, i:i + step]))) for i in range(0, e.shape[1], step)])
-
-        def factor_t(y):
-            return np.hstack([_np(source.apply_t(_t(y[:, i:i + step]))) for i in range(0, y.shape[1], step)])
-
-        def sigma(y):  # block by block: never the whole nrand x k noise-space intermediate
-            return np.hstack([factor(factor_t(y[:, i:i + step])) for i in range(0, y.shape[1], step)])
-
+        ops = _Factored(source, block_columns(source.nrand, s.nfree))
         update = None
         if isinstance(source, MatheronPosterior):
-            def update():
-                d = -sla.cho_solve(source.kd_chol, np.eye(source.bmat.shape[1]))
-                return as_covariance(source.prior), source.bmat, d
+            update = _MatheronUpdate(source)
         elif getattr(source, "_prior", None) is not None and hasattr(source, "_maps"):
             update = _derived_update(source)
-        return CovarianceSource(s, sigma, l=factor, lt=factor_t, nrand=source.nrand,
+        return CovarianceSource(s, ops.sigma, l=ops.factor, lt=ops.factor_t, nrand=source.nrand,
                                 update=update,
                                 mean=source.mean, owner=source, label=type(source).__name__)
     if fes is None:
@@ -164,6 +150,74 @@ def as_covariance(source, fes=None, convention=None) -> CovarianceSource:
         source = OperatorCovariance(source, convention=convention)
     s = SpaceInfo(fes)
     return CovarianceSource(s, source.sigma(s), owner=source, label=f"operator ({source.convention})")
+
+
+class _FiniteRank:
+    """Sigma = W W^T with an explicit W (nfree x r)."""
+
+    def __init__(self, w):
+        self.w = w
+
+    def sigma(self, y):
+        return self.w @ (self.w.T @ y)
+
+    def factor(self, e):
+        return self.w @ e
+
+    def factor_t(self, y):
+        return self.w.T @ y
+
+
+class _Factored:
+    """Sigma = L L^T through a sampler's ``apply`` (L) and ``apply_t`` (L^T), ``step`` columns at a time."""
+
+    def __init__(self, source, step):
+        self.source, self.step = source, step
+
+    def factor(self, e):
+        st = self.step
+        return np.hstack([_np(self.source.apply(_t(e[:, i:i + st]))) for i in range(0, e.shape[1], st)])
+
+    def factor_t(self, y):
+        st = self.step
+        return np.hstack([_np(self.source.apply_t(_t(y[:, i:i + st]))) for i in range(0, y.shape[1], st)])
+
+    def sigma(self, y):  # block by block: never the whole nrand x k noise-space intermediate
+        st = self.step
+        return np.hstack([self.factor(self.factor_t(y[:, i:i + st])) for i in range(0, y.shape[1], st)])
+
+
+class _MatheronUpdate:
+    """Sigma = Sigma_prior - B K_d^-1 B^T of a Matheron posterior."""
+
+    def __init__(self, source):
+        self.source = source
+
+    def __call__(self):
+        src = self.source
+        return as_covariance(src.prior), src.bmat, -sla.cho_solve(src.kd_chol, np.eye(src.bmat.shape[1]))
+
+
+class _DerivedUpdate:
+    """Sigma - Sigma_prior = Q D Q^T for a Gaussian derived by low-rank maps (see :func:`_derived_update`)."""
+
+    def __init__(self, g, ranks):
+        self.g, self.ranks = g, ranks
+
+    def __call__(self):
+        g = self.g
+        prior = as_covariance(g._prior)
+        n = g.space.nfree
+        ell = min(int(sum(self.ranks)) + 10, n)
+
+        def diff(y):
+            return _sigma(g, y) - prior.sigma(y)
+
+        y = diff(np.random.default_rng(0).standard_normal((n, ell)))
+        u, sv, _ = np.linalg.svd(y, full_matrices=False)
+        q = u[:, sv > (sv[0] * 1e-11 if sv.size else 0.0)]
+        d = q.T @ diff(q)
+        return prior, q, 0.5 * (d + d.T)
 
 
 def _derived_update(g):
@@ -176,19 +230,7 @@ def _derived_update(g):
     ranks = [getattr(m, "rank", None) for m in g._maps] + [2 * getattr(m, "rank", np.nan) for m in g._post_maps]
     if any(r is None or not np.isfinite(r) for r in ranks):
         return None
-
-    def update():
-        prior = as_covariance(g._prior)
-        n = g.space.nfree
-        ell = min(int(sum(ranks)) + 10, n)
-        diff = lambda y: _sigma(g, y) - prior.sigma(y)  # noqa: E731
-        y = diff(np.random.default_rng(0).standard_normal((n, ell)))
-        u, sv, _ = np.linalg.svd(y, full_matrices=False)
-        q = u[:, sv > (sv[0] * 1e-11 if sv.size else 0.0)]
-        d = q.T @ diff(q)
-        return prior, q, 0.5 * (d + d.T)
-
-    return update
+    return _DerivedUpdate(g, ranks)
 
 
 def _sigma(g, y):
@@ -645,6 +687,7 @@ def sample_covariance(source, n=None, *, fes=None, mean=None, seed=None):
     supports everything a LowRankGaussian does (conditioning: an ensemble Kalman analysis; exact pointwise variance).
     """
     from .lowrank import LowRankGaussian
+    from .seeding import inherit
 
     if hasattr(source, "sample") and hasattr(source, "space"):
         space = source.space
@@ -671,7 +714,7 @@ def sample_covariance(source, n=None, *, fes=None, mean=None, seed=None):
     if df < 1:
         raise ValueError("need at least two samples with the sample mean")
     b = (x - m[:, None]) / np.sqrt(df)
-    out = LowRankGaussian(space.fes, b, np.eye(k), mean=m, seed=seed)
+    out = LowRankGaussian(space.fes, b, np.eye(k), mean=m, seed=inherit(seed, source))  # ngsrng.seeding
     out.df = df
     out.plan["structure"] = f"sample covariance of {k} samples (Wishart, {df} degrees of freedom)"
     return out

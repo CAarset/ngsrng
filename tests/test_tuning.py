@@ -206,3 +206,25 @@ def test_amg_pcg_matches_the_direct_solver():
     c, c0 = g.apply(eta).numpy(), ref.apply(eta).numpy()
     assert abs(c - c0).max() < 1e-9 * abs(c0).max()
     assert isinstance(g._make_solver("amg-pcg", ngsrng.space.mass_form, torch.float64), ngsrng.solvers.TorchPCG)
+
+
+@pytest.mark.skipif(not ngsrng.solvers.pyamg_available(), reason="needs pyamg")
+def test_amg_pcg_leaves_numpy_global_state_alone():
+    """pyamg draws its spectral-radius start vectors from np.random: the AMG solver neither depends on the user's
+    np.random.seed nor advances the user's np.random stream."""
+    import numpy as np
+    import torch
+
+    fes = ngs.H1(ngs.Mesh(ngs.unit_square.GenerateMesh(maxh=0.1)), order=2)
+
+    def build(np_seed):
+        np.random.seed(np_seed)
+        g = ngsrng.Gaussian(fes, ngsrng.matern(5.0, 2), dtype="float64", method={"engine": "torch", "tuning": False})
+        assert g.plan["solver"] == "torch-pcg(amg)"
+        eta = torch.randn(g.nrand, 3, generator=torch.Generator().manual_seed(0), dtype=torch.float64)
+        return g.apply(eta).numpy(), np.random.rand()
+
+    (x0, after0), (x1, _) = build(0), build(1)
+    np.random.seed(0)
+    assert after0 == np.random.rand()  # the user's stream did not move
+    np.testing.assert_array_equal(x0, x1)  # and did not matter

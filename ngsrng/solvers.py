@@ -9,7 +9,7 @@ import scipy.sparse as sp
 import torch
 from ngsolve.krylovspace import CGSolver
 
-from .backend import Scratch, parallel_ranges, sparse_to_torch
+from .backend import Rebuildable, Scratch, fixed_numpy_global_rng, parallel_ranges, sparse_to_torch
 from .space import SpaceInfo, mass_form
 
 
@@ -24,7 +24,10 @@ class Solver:
         return {"solver": self.name}
 
 
-class _NGSolveBase(Solver):
+class _NGSolveBase(Solver, Rebuildable):
+    """NGSolve matrices, factorisations and preconditioners do not pickle: they are rebuilt after unpickling
+    (``_assemble``)."""
+
     threadsafe = True  # concurrent solves on separate vectors (checked against sequential results in the tests)
 
     def __init__(self, space: SpaceInfo, form):
@@ -33,7 +36,19 @@ class _NGSolveBase(Solver):
         # mass solves on the dgjumps-free twin (same dofs): no facet couplings in the graph, hence no needless fill
         self.fes = space.plain if form is mass_form else space.fes
         self._vin = None
-        self._vectors = Scratch(lambda: (self.mat.CreateColVector(), self.mat.CreateColVector()))
+        self._vectors = Scratch(self._new_vectors)
+
+    def _new_vectors(self):
+        return self.mat.CreateColVector(), self.mat.CreateColVector()
+
+    def _bilinear_form(self):
+        u, v = self.fes.TnT()
+        a = ngs.BilinearForm(self.fes)
+        a += self.form(u, v)
+        return a
+
+    def _restore(self):
+        self._assemble()
 
     def _columns(self, x, solve_one):
         """Solve column by column; columns are spread over threads (NGSolve releases the GIL), or, for a single
@@ -74,12 +89,16 @@ class NGSolveDirect(_NGSolveBase):
             raise ValueError(f"unsupported direct solver {inverse!r}; valid: {', '.join(INVERSES)}")
         super().__init__(space, form)
         self.name = f"ngsolve-direct({inverse})"
-        u, v = self.fes.TnT()
-        a = ngs.BilinearForm(self.fes)
-        a += form(u, v)
+        self.inverse = inverse
+        self._assemble()
+
+    _transient = ("mat", "inv")
+
+    def _assemble(self):
+        a = self._bilinear_form()
         with ngs.TaskManager():
             a.Assemble()
-            self.inv = a.mat.Inverse(space.fes.FreeDofs(), inverse=inverse)
+            self.inv = a.mat.Inverse(self.space.fes.FreeDofs(), inverse=self.inverse)
         self.mat = a.mat
 
     def apply(self, x):
@@ -108,15 +127,19 @@ class NGSolveCG(_NGSolveBase):
         # threaded samples, 1e-10 sequentially); h1amg gave identical results either way; Jacobi is unverified.
         self.threadsafe = precond == "h1amg"
         self.name = f"ngsolve-cg({precond})"
+        self.precond = precond
         self.tol, self.maxiter = tol, maxiter
-        u, v = self.fes.TnT()
-        a = ngs.BilinearForm(self.fes)
-        a += form(u, v)
-        self.pre = ngs.Preconditioner(a, precond)
+        self._assemble()
+        self.iterations = []
+
+    _transient = ("mat", "pre")
+
+    def _assemble(self):
+        a = self._bilinear_form()
+        self.pre = ngs.Preconditioner(a, self.precond)
         with ngs.TaskManager():
             a.Assemble()
         self.mat = a.mat
-        self.iterations = []
 
     def apply(self, x):
         return self._columns(x, self.ngs_apply)
@@ -167,7 +190,7 @@ def _staging(n, width, device, dtype):
     return _STAGING[key]
 
 
-class CudssDirect(Solver):
+class CudssDirect(Solver, Rebuildable):
     """GPU sparse Cholesky (NVIDIA cuDSS via nvmath-python), factorised once and reused for every sample.
 
     cuDSS fixes the right-hand-side shape per solver object. One factorisation of width ``width`` is kept; batches
@@ -176,15 +199,25 @@ class CudssDirect(Solver):
     columns doubled the device memory of every solver).
     """
 
+    _transient = ("_solver", "_rhs")
+
     def __init__(self, a_free: sp.spmatrix, device, dtype, width=32):
+        self.name = "cudss"
+        self.width = int(width)
+        self.n, self.device, self.dtype = a_free.shape[0], device, dtype
+        self._a = sp.csr_matrix(a_free)  # host copy: the factorisation is redone after unpickling
+        self._factorize()
+
+    def _restore(self):
+        self._factorize()
+
+    def _factorize(self):
         import logging
 
         import nvmath.sparse.advanced as adv
 
-        self.name = "cudss"
-        self.width = int(width)
-        self.n, self.device, self.dtype = a_free.shape[0], device, dtype
-        a = sparse_to_torch(a_free, device, dtype)
+        device, dtype = self.device, self.dtype
+        a = sparse_to_torch(self._a, device, dtype)
         logger = logging.getLogger("ngsrng.cudss")
         logger.setLevel(logging.WARNING)
         options = adv.DirectSolverOptions(
@@ -302,13 +335,16 @@ class TorchAMGPCG(Solver):
         self.tol, self.maxiter, self.sweeps = tol, maxiter, sweeps
         self.device, self.dtype = device, dtype
         a = sp.csr_matrix(a_free, dtype=np.float64)
-        ml = pyamg.smoothed_aggregation_solver(a, symmetry="symmetric", max_coarse=max_coarse)
+        with fixed_numpy_global_rng():  # pyamg's spectral-radius estimates draw from np.random
+            ml = pyamg.smoothed_aggregation_solver(a, symmetry="symmetric", max_coarse=max_coarse)
+            radii = [approximate_spectral_radius(sp.diags(1.0 / lvl.A.diagonal()) @ lvl.A.tocsr())
+                     for lvl in ml.levels[:-1]]
         self.a = sparse_to_torch(a, device, dtype)
         self.levels = []
-        for lvl in ml.levels[:-1]:
+        for lvl, rho in zip(ml.levels[:-1], radii):
             al = lvl.A.tocsr()
             dinv = 1.0 / al.diagonal()
-            omega = 4.0 / (3.0 * approximate_spectral_radius(sp.diags(dinv) @ al))
+            omega = 4.0 / (3.0 * rho)
             self.levels.append((sparse_to_torch(al, device, dtype), sparse_to_torch(lvl.P.tocsr(), device, dtype),
                                 sparse_to_torch(lvl.P.T.tocsr(), device, dtype),
                                 torch.from_numpy(omega * dinv).to(device=device, dtype=dtype)[:, None]))
@@ -364,7 +400,7 @@ class TorchAMGPCG(Solver):
                 "mean_iterations": float(np.mean(its)) if its else None}
 
 
-class RationalSolver(Solver):
+class RationalSolver(Solver, Rebuildable):
     """R = c0 M^-1 + sum_l c_l (K + t_l M)^-1, a rational function of M^-1 K applied to a dual vector (symmetric).
 
     With r(lambda) ~ lambda^-theta (``ngsrng.rational``), R z = r(M^-1 K) M^-1 z ~ (M^-1 K)^-theta M^-1 z.
@@ -376,6 +412,11 @@ class RationalSolver(Solver):
         self.name = f"rational(theta={rational.theta:g}, {rational.degree} shifts, {shifted[0].name})"
         self.exact = all(sv.exact for sv in shifted)
         self.threadsafe = all(getattr(sv, "threadsafe", True) for sv in [*shifted, mass_inv])
+        self._tmp = None
+
+    _transient = ("_tmp",)  # per-thread NGSolve vectors, made on first use
+
+    def _restore(self):
         self._tmp = None
 
     def apply(self, x):

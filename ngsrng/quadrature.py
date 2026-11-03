@@ -22,21 +22,21 @@ import numpy as np
 import scipy.sparse as sp
 from ngsolve.comp import IntegrationRuleSpace
 
+from .backend import Rebuildable
 from .space import SpaceInfo, to_scipy
 
 
-class QuadratureRule:
+class QuadratureRule(Rebuildable):
+    _transient = ("rule",)  # an NGSolve IntegrationRule: made again after unpickling
+
     def __init__(self, space: SpaceInfo, order: int | None = None, max_nnz: float = 4e8):
         self.space = space
         self.order = 2 * space.order if order is None else order
         mesh = space.mesh
         if not space.single_element_type:
             raise NotImplementedError("quadrature representations currently need a single element type")
-        et = next(iter(mesh.Elements(ngs.VOL))).type
         self.irs = IntegrationRuleSpace(mesh, order=self.order)
-        # IntegrationRuleSpace uses IntegrationRule(et, 2 * order) for every element type, but does not report its 1D
-        # rule.
-        self.rule = ngs.IntegrationRule(et, 2 * self.order) if et == ngs.ET.SEGM else self.irs.GetIntegrationRules()[et]
+        self.rule = self._make_rule()
         if self.irs.ndof != len(self.rule.points) * mesh.ne:
             raise RuntimeError("could not match the IntegrationRuleSpace points")
         nnz = mesh.ne * len(self.rule.points) * (space.broken.ndof / mesh.ne)
@@ -55,6 +55,15 @@ class QuadratureRule:
         if (self.weights <= 0).any():
             raise RuntimeError("non-positive quadrature weights")
         self.b = to_scipy(b.mat)  # ndof x nq
+
+    def _make_rule(self):
+        # IntegrationRuleSpace uses IntegrationRule(et, 2 * order) for every element type, but does not report its 1D
+        # rule.
+        et = next(iter(self.space.mesh.Elements(ngs.VOL))).type
+        return ngs.IntegrationRule(et, 2 * self.order) if et == ngs.ET.SEGM else self.irs.GetIntegrationRules()[et]
+
+    def _restore(self):
+        self.rule = self._make_rule()
 
     @property
     def npoints(self) -> int:

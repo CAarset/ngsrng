@@ -12,7 +12,7 @@ import numpy as np
 import scipy.special as sps
 import torch
 
-from ..backend import ngs_sparse, sparse_to_torch
+from ..backend import Rebuildable, ngs_sparse, sparse_to_torch
 from ..covariance import EXACT_LIMIT
 from ..inplace import InPlace
 from ..observations import observation_operator
@@ -87,7 +87,7 @@ def point_values(gauss) -> str:
     return "not verified"
 
 
-class GaussianAtPoints:
+class GaussianAtPoints(Rebuildable):  # pickles; the NGSolve evaluation matrix is made on first use
     """Values of a Gaussian random function at points: the quadrature points of its space (default), any physical
     ``points`` (m x dim), or the domain points of a :class:`~ngsrng.distributions.bernstein.BernsteinForm`
     (``bernstein=``).
@@ -197,9 +197,14 @@ class GaussianAtPoints:
                 f"~{1 / np.sqrt(2 * mc_samples):.1%}); pass std='exact' or an array for exact marginals",
                 stacklevel=3,
             )
+            # fixed probes: a deterministic estimate that leaves the sampler's own randomness alone (ngsrng.seeding)
+            ref, probes = self.reference, np.random.default_rng(0)
             acc = np.zeros(self.npoints)
             for k0 in range(0, mc_samples, 500):
-                full = self.reference.sample(min(500, mc_samples - k0)).double().cpu().numpy()
+                k = min(500, mc_samples - k0)
+                eta = torch.from_numpy(probes.standard_normal((k, ref.nrand)).T)
+                full = np.repeat(ref.mean[:, None], k, axis=1)
+                full[ref.space.free] += ref.apply(eta).double().cpu().numpy()
                 x = self.eval_full @ full - self.center[:, None]
                 acc += (x**2).sum(axis=1)
             return np.sqrt(acc / mc_samples)

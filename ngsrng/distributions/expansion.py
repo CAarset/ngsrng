@@ -14,14 +14,38 @@ rotation invariant), which is why the KL basis is used. The sample is an FE func
 import numpy as np
 import torch
 
+from ..seeding import as_source
 from .mixtures import _FEField
 
-STANDARD = {
-    "normal": lambda rng, shape: rng.standard_normal(shape),
-    "uniform": lambda rng, shape: rng.uniform(-np.sqrt(3.0), np.sqrt(3.0), shape),
-    "rademacher": lambda rng, shape: 2.0 * rng.integers(0, 2, shape) - 1.0,
-    "laplace": lambda rng, shape: rng.laplace(0.0, 1.0 / np.sqrt(2.0), shape),
-}
+
+def _normal(rng, shape):
+    return rng.standard_normal(shape)
+
+
+def _uniform(rng, shape):
+    return rng.uniform(-np.sqrt(3.0), np.sqrt(3.0), shape)
+
+
+def _rademacher(rng, shape):
+    return 2.0 * rng.integers(0, 2, shape) - 1.0
+
+
+def _laplace(rng, shape):
+    return rng.laplace(0.0, 1.0 / np.sqrt(2.0), shape)
+
+
+# standardised (mean 0, variance 1) coefficient laws; named functions, since fields store them and must pickle
+STANDARD = {"normal": _normal, "uniform": _uniform, "rademacher": _rademacher, "laplace": _laplace}
+
+
+class ScipyLaw:
+    """Standardised draws from a frozen scipy.stats distribution."""
+
+    def __init__(self, dist):
+        self.dist, self.mean, self.std = dist, float(dist.mean()), float(dist.std())
+
+    def __call__(self, rng, shape):
+        return (self.dist.rvs(size=shape, random_state=rng) - self.mean) / self.std
 
 
 def coefficient_law(coefficients):
@@ -32,11 +56,11 @@ def coefficient_law(coefficients):
                              "with finite variance, or a callable (rng, shape) -> standardised values")
         return STANDARD[coefficients], coefficients
     if hasattr(coefficients, "rvs") and hasattr(coefficients, "std"):
-        mean, std = float(coefficients.mean()), float(coefficients.std())
-        if not np.isfinite(std) or std <= 0:
+        law = ScipyLaw(coefficients)
+        if not np.isfinite(law.std) or law.std <= 0:
             raise ValueError("the coefficient distribution needs a finite, positive variance")
         name = getattr(getattr(coefficients, "dist", None), "name", "scipy")
-        return (lambda rng, shape: (coefficients.rvs(size=shape, random_state=rng) - mean) / std), f"{name} (scipy)"
+        return law, f"{name} (scipy)"
     if callable(coefficients):
         return coefficients, getattr(coefficients, "__name__", "custom")
     raise TypeError("unsupported coefficients")
@@ -50,7 +74,7 @@ class KLField(_FEField):
         self.gauss = gauss  # mean and space of the output
         self.space = gauss.space
         self.law, name = coefficient_law(coefficients)
-        self.rng = np.random.default_rng(seed)
+        self.source = as_source(seed)  # ngsrng.seeding
         self.scaled_modes = kl.modes[self.space.free] * np.sqrt(kl.eigenvalues)[None, :]
         self.rank = len(kl.eigenvalues)
         cov = f"the rank-{self.rank} truncation of the Gaussian's" if truncated else "the Gaussian's"
@@ -59,6 +83,6 @@ class KLField(_FEField):
                      "gaussian": gauss.plan, "kl": kl.plan.get("structure", "")}
 
     def _coefficients(self, ns):
-        xi = np.asarray(self.law(self.rng, (ns, self.rank)), dtype=float).T  # sample by sample
+        xi = np.asarray(self.law(self.source.streams().numpy(), (ns, self.rank)), dtype=float).T  # sample by sample
         return torch.from_numpy(self.scaled_modes @ xi)
 

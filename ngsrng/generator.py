@@ -32,7 +32,7 @@ import numpy as np
 import scipy.stats as st
 import torch
 
-from .backend import ngs_sparse, resolve_device, resolve_dtype
+from .backend import Rebuildable, ngs_sparse, resolve_device, resolve_dtype
 from .boundary import attach_boundary  # [bnd] boundary (trace) sampling: ngsrng/boundary.py
 from .correlation import MaternCorrelation, matern
 from .distributions.bernstein import BernsteinForm, default_ok
@@ -54,6 +54,7 @@ from .inplace import InPlace, as_tensor, chunks, default_work_values
 from .lowrank import LowRankGaussian, karhunen_loeve
 from .observations import observation_operator
 from .posterior import MatheronPosterior
+from .seeding import Source, as_source, draw
 from .space import SpaceInfo, mass_form
 from .specs import AssembledPrecision, OperatorCovariance, OperatorPrecision, PDEPrecision
 
@@ -109,6 +110,18 @@ def _nparams(name) -> int:
             "standard_gamma": 1, "karhunen_loeve": 1}.get(name, 0)
 
 
+def _field_key(name, args, kwargs, corr, opts):
+    return name, _freeze(args), _freeze(kwargs), tuple(sorted((k, id(v)) for k, v in corr.items())), _freeze(opts)
+
+
+def _rekey_gaussian(key, value):
+    if key[0] == "id":
+        return ("id", id(value[0]))
+    if key[0] == "kl":
+        return ("kl", id(value[0]), key[2])
+    return key
+
+
 def _freeze(v):
     """A hashable stand-in for a parameter (arrays by content, other unhashables by identity)."""
     if isinstance(v, np.ndarray):
@@ -138,7 +151,7 @@ def _as_spec(key, value):
     return value
 
 
-class _NormalField(InPlace):
+class _NormalField(InPlace, Rebuildable):  # pickles; the NGSolve evaluation matrix is made on first use
     """loc + scale (g - mean_g): an exact FE-space Gaussian (scale must be a number), optionally evaluated at
     ``points``."""
 
@@ -257,7 +270,11 @@ class Generator:
     Parameters
     ----------
     fes : FE space (H1 or L2)
-    seed : int, SeedSequence or None. Every Gaussian and mixing stream the generator creates gets its own child seed.
+    seed : None (default), a torch.Generator or numpy Generator, or an int / SeedSequence (:mod:`ngsrng.seeding`).
+        None follows torch's global random state at every draw, as ``torch.randn`` does: ``torch.manual_seed`` (or
+        Lightning's ``seed_everything``) reproduces the draws, and copies in DataLoader workers differ. A generator
+        object is read at every draw the same way. An int or SeedSequence gives an own stream, numpy style; every
+        Gaussian and mixing stream the generator creates then gets its own child stream.
     correlation (or precision, covariance) : default spatial structure: a correlation length (Matern, nu = 1), a dict of
         :func:`ngsrng.matern_correlation` arguments, a :class:`MaternCorrelation`, a precision spec (PDEPrecision,
         AssembledPrecision, OperatorPrecision), a Gaussian, LowRankGaussian or MatheronPosterior object (e.g. a
@@ -287,7 +304,7 @@ class Generator:
                  method=None, tol=1e-8, representation="quadrature", std="auto", order=None, output=None,
                  standardize_by="prior", work_values=None):
         self.fes = fes
-        self.seed_sequence = seed if isinstance(seed, np.random.SeedSequence) else np.random.SeedSequence(seed)
+        self.source = as_source(seed)
         given = [(k, v) for k, v in zip(CORRELATION_KEYS, (correlation, precision, covariance)) if v is not None]
         if len(given) > 1:
             raise ValueError("give at most one of correlation, precision, covariance")
@@ -298,21 +315,37 @@ class Generator:
         self.representation, self.std, self.order, self.output = representation, std, order, output
         self.standardize_by = standardize_by
         self.work_values = default_work_values(self.device) if work_values is None else int(work_values)
-        self._np = np.random.default_rng(self.seed_sequence.spawn(1)[0])
         self._gaussians, self._points, self._fields, self._bernstein = {}, {}, {}, {}
 
     # ------------------------------------------------------------------ plumbing
 
-    def _seed(self) -> int:
-        return int(self.seed_sequence.spawn(1)[0].generate_state(1, np.uint64)[0] >> np.uint64(2))
+    def __setstate__(self, state):
+        """After unpickling: caches keyed by object identity get the new objects' identities."""
+        self.__dict__.update(state)
+        self._gaussians = {_rekey_gaussian(k, v): v for k, v in self._gaussians.items()}
+        self._points = {(id(v[0]), k[1], k[2] if isinstance(v[1], str) or v[1] is None else id(v[1]), *k[3:]): v
+                        for k, v in self._points.items()}
+        self._bernstein = {id(v[0]): v for v in self._bernstein.values()}
+        self._fields = {_field_key(k[0], *v[0]): v for k, v in self._fields.items()}
+
+    @property
+    def seed_sequence(self):
+        """The SeedSequence of an explicitly seeded generator (None for draw-time randomness)."""
+        return self.source.seq
+
+    def _seed(self) -> Source:
+        """The randomness of a new Gaussian or stream: a child stream, or the same draw-time generator."""
+        return self.source.spawn()
 
     def spawn(self, n):
-        """n independent child generators with the same settings (numpy's ``Generator.spawn``)."""
-        return [Generator(self.fes, s, correlation=self.correlation, device=self.device, dtype=self.dtype,
+        """n child generators with the same settings (numpy's ``Generator.spawn``): independent streams for an
+        explicitly seeded generator; for draw-time randomness (seed None or a generator) children read the same
+        generator, and their draws are independent because every draw takes a new key."""
+        return [Generator(self.fes, self._seed(), correlation=self.correlation, device=self.device, dtype=self.dtype,
                           method=self.method, tol=self.tol, representation=self.representation, std=self.std,
                           order=self.order, output=self.output, standardize_by=self.standardize_by,
                           work_values=self.work_values)
-                for s in self.seed_sequence.spawn(n)]
+                for _ in range(n)]
 
     def gaussian(self, correlation=None, precision=None, covariance=None):
         """The (cached) Gaussian random function behind a correlation specification."""
@@ -391,7 +424,7 @@ class Generator:
     def _field(self, name, args, kwargs):
         corr = {k: kwargs.pop(k) for k in CORRELATION_KEYS if k in kwargs}
         opts = {k: kwargs.pop(k) for k in FIELD_KEYS if k in kwargs}
-        key = (name, _freeze(args), _freeze(kwargs), tuple(sorted((k, id(v)) for k, v in corr.items())), _freeze(opts))
+        key = _field_key(name, args, kwargs, corr, opts)
         if key not in self._fields:  # values are kept alive with the entry, so identity keys stay valid
             field = self._build(name, args, dict(kwargs), corr, dict(opts))
             field.out_dtype = torch.empty(0, dtype=self.dtype).numpy().dtype  # bounded families clamp in it
@@ -483,7 +516,7 @@ class Generator:
             p = params({"df": REQUIRED, "scale": REQUIRED})
             return WishartField(pts(), p["df"], p["scale"], inverse=name == "inverse_wishart",
                                 construction=construction or "process", representation=rep,
-                                rng=np.random.default_rng(self._seed()), method=method, tol=tol)
+                                seed=self._seed(), method=method, tol=tol)
         if name == "matrix_lognormal":
             p = params({"p": REQUIRED, "sigma": 1.0, "mean": None})
             return MatrixLogNormalField(pts(), p["p"], p["sigma"], p["mean"], representation=rep)
@@ -507,6 +540,7 @@ class Generator:
 
     # ------------------------------------------------------------------ output
 
+    @draw
     def _draw_into(self, field, size, name, out):
         """Fill ``out`` (NumPy array or torch tensor, shape (*size, *value shape)) in place: ``field.sample_into``,
         which works in chunks of ``work_values`` values (:mod:`ngsrng.inplace`)."""
@@ -529,6 +563,7 @@ class Generator:
             self._apply_bnd(field, flat)
         return out
 
+    @draw
     def _draw(self, field, size, output, name, out=None):
         if out is not None:
             return self._draw_into(field, size, name, out)

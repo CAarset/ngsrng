@@ -95,8 +95,7 @@ def test_wishart_marginal_law(points, construction, df, inverse):
     if inverse and df < 3:
         df = 3.5  # IW needs df > p - 1 as well; keep a finite mean
     scale = np.array([[2.0, 0.5], [0.5, 1.0]])
-    w = WishartField(points, df, scale, inverse=inverse, construction=construction,
-                     rng=np.random.default_rng(5)).sample(2000)
+    w = WishartField(points, df, scale, inverse=inverse, construction=construction, seed=5).sample(2000)
     mats = np.moveaxis(w, -1, 1)  # (npoints, n, 2, 2)
     assert np.abs(mats - np.swapaxes(mats, -1, -2)).max() < 1e-10 and np.linalg.eigvalsh(mats).min() > 0
     s = np.linalg.inv(scale) if inverse else scale
@@ -162,7 +161,9 @@ def test_type_g_keeps_covariance_and_has_heavy_tails(prior, mixing):
     wf = w[prior.space.free]
     assert abs(var / (wf @ exact_covariance(prior) @ wf) - 1) < 5 * np.sqrt(2 / N)
     pts = GaussianAtPoints(prior, std=None)
-    assert st.kurtosis(pts.rule.values(np.asarray(x))[len(pts.mean) // 2]) > 0.3
+    # heavy tails: the median over points of the excess kurtosis (nig over 12 seeds: 0.79 +- 0.04; the Gaussian
+    # prior: 0.00 +- 0.03). A single point's estimate (sd ~0.15) failed for a third of the seeds at threshold 0.3.
+    assert np.median(st.kurtosis(pts.rule.values(np.asarray(x)), axis=1)) > 0.4
 
 
 def test_type_g_needs_white_noise():
@@ -190,17 +191,14 @@ def test_torch_path_matches_numpy(prior):
                         method={"engine": "torch"})
     for make in (lambda p: named_marginal(p, "gamma", 2.0, method="table"),
                  lambda p: named_marginal(p, "laplace"),
-                 lambda p: WishartField(p, 3, np.eye(2), construction="bartlett", rng=np.random.default_rng(0),
-                                        method="table"),
+                 lambda p: WishartField(p, 3, np.eye(2), construction="bartlett", seed=0, method="table"),
                  lambda p: MatrixLogNormalField(p, 2, 0.5)):
         outs = []
         for device_path in (False, True):
             g.generator.manual_seed(11)
             pts = GaussianAtPoints(g, std=GaussianAtPoints(prior).std)
             pts.device_capable = device_path
-            field = make(pts)
-            if hasattr(field, "rng"):
-                field.rng = np.random.default_rng(0)
+            field = make(pts)  # a fresh own stream (seed=0) where the field has randomness of its own
             v = field.sample(5)
             outs.append(v.numpy() if hasattr(v, "numpy") and not isinstance(v, np.ndarray) else v)
         np.testing.assert_allclose(outs[1], outs[0], rtol=1e-8, atol=1e-10)

@@ -32,61 +32,82 @@ def _triangular(z, xp, left, mode, right):
 
 INF = np.inf
 
-# name -> (quantile map of z, parameters with defaults (None = required), support(**parameters) -> (lo, hi)).
-# Upper tails use Phi(-z) (log_ndtr(-z)) so that they keep full relative accuracy.
+def _normal(z, xp, loc, scale):
+    return loc + scale * z
+
+
+def _uniform(z, xp, low, high):
+    return low + (high - low) * xp.ndtr(z)
+
+
+def _lognormal(z, xp, mean, sigma):
+    return xp.m.exp(mean + sigma * z)
+
+
+def _exponential(z, xp, scale):
+    return -scale * xp.log_ndtr(-z)
+
+
+def _weibull(z, xp, a):
+    return (-xp.log_ndtr(-z)) ** (1.0 / a)
+
+
+def _laplace(z, xp, loc, scale):
+    return xp.where(z < 0, loc + scale * (np.log(2.0) + xp.log_ndtr(z)), loc - scale * (np.log(2.0) + xp.log_ndtr(-z)))
+
+
+def _gumbel(z, xp, loc, scale):
+    return loc - scale * xp.m.log(-xp.log_ndtr(z))
+
+
+def _logistic(z, xp, loc, scale):
+    return loc + scale * (xp.log_ndtr(z) - xp.log_ndtr(-z))
+
+
+def _rayleigh(z, xp, scale):
+    return scale * xp.m.sqrt(-2.0 * xp.log_ndtr(-z))
+
+
+def _lomax(z, xp, a):  # numpy's pareto is the Lomax distribution
+    return xp.m.expm1(-xp.log_ndtr(-z) / a)
+
+
+def _power(z, xp, a):
+    return xp.m.exp(xp.log_ndtr(z) / a)
+
+
+def _halfnormal(z, xp, scale):
+    return -scale * xp.ndtri(0.5 * xp.ndtr(-z))
+
+
+def _between_low_high(low, high):
+    return low, high
+
+
+def _between_left_right(left, mode, right):
+    return left, right
+
+
+REAL, POSITIVE, UNIT = (-INF, INF), (0.0, INF), (0.0, 1.0)
+
+# name -> (quantile map of z, parameters with defaults (None = required), support: (lo, hi), or a function of the
+# parameters returning it). Upper tails use Phi(-z) (log_ndtr(-z)) so that they keep full relative accuracy. Named
+# functions, not lambdas: fields store the map, and stored functions must pickle.
 CLOSED = {
-    "normal": (lambda z, xp, loc, scale: loc + scale * z, {"loc": 0.0, "scale": 1.0}, lambda **p: (-INF, INF)),
-    "uniform": (
-        lambda z, xp, low, high: low + (high - low) * xp.ndtr(z),
-        {"low": 0.0, "high": 1.0},
-        lambda low, high: (low, high),
-    ),
-    "lognormal": (
-        lambda z, xp, mean, sigma: xp.m.exp(mean + sigma * z),
-        {"mean": 0.0, "sigma": 1.0},
-        lambda **p: (0.0, INF),
-    ),
-    "exponential": (lambda z, xp, scale: -scale * xp.log_ndtr(-z), {"scale": 1.0}, lambda **p: (0.0, INF)),
-    "weibull": (lambda z, xp, a: (-xp.log_ndtr(-z)) ** (1.0 / a), {"a": None}, lambda **p: (0.0, INF)),
-    "laplace": (
-        lambda z, xp, loc, scale: xp.where(
-            z < 0, loc + scale * (np.log(2.0) + xp.log_ndtr(z)), loc - scale * (np.log(2.0) + xp.log_ndtr(-z))
-        ),
-        {"loc": 0.0, "scale": 1.0},
-        lambda **p: (-INF, INF),
-    ),
-    "gumbel": (
-        lambda z, xp, loc, scale: loc - scale * xp.m.log(-xp.log_ndtr(z)),
-        {"loc": 0.0, "scale": 1.0},
-        lambda **p: (-INF, INF),
-    ),
-    "logistic": (
-        lambda z, xp, loc, scale: loc + scale * (xp.log_ndtr(z) - xp.log_ndtr(-z)),
-        {"loc": 0.0, "scale": 1.0},
-        lambda **p: (-INF, INF),
-    ),
-    "rayleigh": (
-        lambda z, xp, scale: scale * xp.m.sqrt(-2.0 * xp.log_ndtr(-z)),
-        {"scale": 1.0},
-        lambda **p: (0.0, INF),
-    ),
-    "pareto": (  # numpy's pareto is the Lomax distribution
-        lambda z, xp, a: xp.m.expm1(-xp.log_ndtr(-z) / a),
-        {"a": None},
-        lambda **p: (0.0, INF),
-    ),
-    "power": (lambda z, xp, a: xp.m.exp(xp.log_ndtr(z) / a), {"a": None}, lambda **p: (0.0, 1.0)),
-    "standard_cauchy": (_cauchy, {}, lambda **p: (-INF, INF)),
-    "triangular": (
-        _triangular,
-        {"left": None, "mode": None, "right": None},
-        lambda left, mode, right: (left, right),
-    ),
-    "halfnormal": (
-        lambda z, xp, scale: -scale * xp.ndtri(0.5 * xp.ndtr(-z)),
-        {"scale": 1.0},
-        lambda **p: (0.0, INF),
-    ),
+    "normal": (_normal, {"loc": 0.0, "scale": 1.0}, REAL),
+    "uniform": (_uniform, {"low": 0.0, "high": 1.0}, _between_low_high),
+    "lognormal": (_lognormal, {"mean": 0.0, "sigma": 1.0}, POSITIVE),
+    "exponential": (_exponential, {"scale": 1.0}, POSITIVE),
+    "weibull": (_weibull, {"a": None}, POSITIVE),
+    "laplace": (_laplace, {"loc": 0.0, "scale": 1.0}, REAL),
+    "gumbel": (_gumbel, {"loc": 0.0, "scale": 1.0}, REAL),
+    "logistic": (_logistic, {"loc": 0.0, "scale": 1.0}, REAL),
+    "rayleigh": (_rayleigh, {"scale": 1.0}, POSITIVE),
+    "pareto": (_lomax, {"a": None}, POSITIVE),
+    "power": (_power, {"a": None}, UNIT),
+    "standard_cauchy": (_cauchy, {}, REAL),
+    "triangular": (_triangular, {"left": None, "mode": None, "right": None}, _between_left_right),
+    "halfnormal": (_halfnormal, {"scale": 1.0}, POSITIVE),
 }
 
 
@@ -196,7 +217,7 @@ def named_marginal(points, name, *args, method="auto", tol=1e-10, representation
     if name in CLOSED and method in ("auto", "closed"):
         func, defaults, support = CLOSED[name]
         params = {k: points.parameter(v) for k, v in _bind(defaults, args, kwargs, name).items()}
-        transform = ClosedForm(func, params, support=support(**params))
+        transform = ClosedForm(func, params, support=support(**params) if callable(support) else support)
     elif name in SCIPY:
         params = _bind(SCIPY[name][1], args, kwargs, name)
         params = {k: points.parameter(v) for k, v in params.items()}
@@ -217,16 +238,30 @@ def marginal(points, dist, method="auto", tol=1e-10, representation="quadrature"
 
 def indicator(points, level=0.0, standardize=True, representation="quadrature"):
     """Excursion indicator 1{g > level} (``standardize=True``: level in units of the pointwise standard deviation)."""
-    transform = ClosedForm(lambda g, xp, level: (g > level) * 1.0, {"level": points.parameter(level)}, {},
-                           closed_range=(0.0, 1.0))
+    transform = ClosedForm(_exceeds, {"level": points.parameter(level)}, {}, closed_range=(0.0, 1.0))
     return MarginalField(points, transform, standardize=standardize, representation=representation,
                          label="indicator")
 
 
 def transformed(points, func, standardize=False, representation="quadrature"):
     """General pointwise map f = func(g) of NumPy point values (``standardize=True``: of z)."""
-    return MarginalField(points, lambda x, xp: func(x), standardize=standardize, representation=representation,
+    return MarginalField(points, PointMap(func), standardize=standardize, representation=representation,
                          label="transformed")
+
+
+def _exceeds(g, xp, level):
+    return (g > level) * 1.0
+
+
+class PointMap:
+    """A user's pointwise map of NumPy values, as a transform (it pickles if ``func`` does: a module-level function,
+    not a lambda)."""
+
+    def __init__(self, func):
+        self.func = func
+
+    def __call__(self, x, xp):
+        return self.func(x)
 
 
 class DirichletField(PointwiseField):

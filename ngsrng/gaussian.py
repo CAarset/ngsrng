@@ -13,9 +13,9 @@ from . import noise as nz
 from . import tuning as tn
 from .backend import (
     NormalStream,
+    Rebuildable,
     Scratch,
     available_threads,
-    make_generator,
     ngs_sparse,
     numpy_blas_threads,
     parallel_ranges,
@@ -24,6 +24,7 @@ from .backend import (
     sparse_to_torch,
 )
 from .inplace import InPlace, as_tensor, chunks, default_work_values, write
+from .seeding import as_source, inherit
 from .solvers import (
     INVERSES,
     PRECONDITIONERS,
@@ -85,7 +86,7 @@ def check_method(method) -> dict:
     return dict(method)
 
 
-class Gaussian(InPlace):
+class Gaussian(InPlace, Rebuildable):
     """N(mean, C) as a random function in ``fes``.
 
     Parameters
@@ -109,6 +110,9 @@ class Gaussian(InPlace):
     device, dtype : torch device ("cpu", "cuda", "auto") and output dtype (default float32). Every engine computes in
         float64 and casts at the end, unless method={"work_dtype": "float32"}.
     tol : relative tolerance for iterative solvers
+    seed : None (default: torch's global generator, read at each draw, so ``torch.manual_seed`` reproduces the
+        samples), a ``torch.Generator`` or ``numpy.random.Generator`` (read at each draw), or an int / SeedSequence
+        (an own stream). Posteriors and other derived samplers inherit it; see :mod:`ngsrng.seeding`.
     """
 
     def __init__(self, fes, precision, mean=None, method=None, device="cpu", dtype=None, tol=1e-8, seed=None):
@@ -132,9 +136,10 @@ class Gaussian(InPlace):
         self.tol = tol
         self.seed = seed
         self._prior = None  # set on Gaussians derived by conditioning: the prior they came from
-        self.generator = make_generator(seed, self.device) if self.engine == "torch" else None
-        self.stream = NormalStream(seed) if self.engine == "ngsolve" else None
+        self.source = as_source(seed)
+        self.stream = NormalStream(self.source) if self.engine == "ngsolve" else None
         self.plan.update(engine=self.engine, device=str(self.device), dtype=str(self.dtype))
+        self.plan["randomness"] = self.source.describe()
         self.plan["tuning"] = "built-in rules"
         self._mean = self._build_mean(mean)
         self._check_trace_class()
@@ -240,7 +245,7 @@ class Gaussian(InPlace):
             del est_k, est_m
         rational = fractional_power(theta, lmin, lmax, rtol=spec.rtol)
         width = self._shifted_width(rational.degree)
-        shifted = [self._solver(_shifted_form(spec.form, t), width=width) for t in rational.shifts]
+        shifted = [self._solver(ShiftedForm(spec.form, t), width=width) for t in rational.shifts]
         self.first = RationalSolver(rational, shifted, mass_inv)
         self.n_mass_steps = n
         self.plan["structure"] = (
@@ -273,7 +278,7 @@ class Gaussian(InPlace):
         dev, wd = self._solver_device, self._work_dtype
         mass_t = sparse_to_torch(s.mass_free, dev, wd)
         if spec.convention == "dual->dual":
-            apply_q = lambda c: spec.apply(mass_t @ c)  # noqa: E731
+            apply_q = DualToDual(spec.apply, mass_t)
         else:
             apply_q = spec.apply
         self._apply_q = apply_q  # Sigma^-1 * scale^2 (primal -> dual), for apply_precision
@@ -317,8 +322,7 @@ class Gaussian(InPlace):
             self.noise.ngs_setup(s)
             self._ngs_mass = ngs_sparse(s.mass) if self.n_mass_steps else None
             # work vectors (eta, z, c, tmp, result) per thread: samples run in parallel threads
-            self._work = Scratch(lambda: (ngs.la.BaseVector(self.nrand),
-                                          *(ngs.la.BaseVector(s.ndof) for _ in range(4))))
+            self._work = Scratch(self._new_work)
         self._maps = []  # noise-space maps, applied to eta before the pipeline
         self._post_maps = []  # FE-space maps, applied to the pipeline's output
         # CPU engine: float64 torch copies of the noise sampler and the mass matrix (for apply_t). Shared with derived
@@ -327,6 +331,17 @@ class Gaussian(InPlace):
         # NumPy BLAS threads inside the NGSolve engine (see backend.numpy_blas_threads); None = unchanged.
         self._cpu_blas_threads = self.method.get("cpu_blas_threads", 1)
         self.plan.update(**self.noise.info(), **self.first.info())
+
+    def _new_work(self):
+        return (ngs.la.BaseVector(self.nrand), *(ngs.la.BaseVector(self.space.ndof) for _ in range(4)))
+
+    # pickling (ngsrng.backend.Rebuildable): the NGSolve mass matrix is made again; the solvers and noise samplers
+    # rebuild their own NGSolve objects; the device copy of the mean is made on first use
+    _transient = ("_mean_t",)
+
+    def _restore(self):
+        if self.engine != "torch":
+            self._ngs_mass = ngs_sparse(self.space.mass) if self.n_mass_steps else None
 
     @property
     def _work_dtype(self):
@@ -546,7 +561,7 @@ class Gaussian(InPlace):
         equal a sequential loop of single samples, for any number of threads, and every thread writes its row of
         ``out`` directly (one cast at the end, no intermediate).
         """
-        key0 = self.stream.reserve(n) if eta is None else None
+        ticket = self.stream.reserve(n) if eta is None else None
         mean, free = self._mean, self.space.free
 
         def work(lo, hi):
@@ -556,7 +571,7 @@ class Gaussian(InPlace):
             ev = evaluate.CreateColVector() if evaluate is not None else None
             for k in range(lo, hi):
                 if eta is None:
-                    self.stream.fill_keyed(e, key0 + k)
+                    self.stream.fill_keyed(e, ticket, k)
                 else:
                     e[:] = eta[:, k]
                 self._ngs_one(w, res)
@@ -678,11 +693,17 @@ class Gaussian(InPlace):
         new._mean = self._mean.copy() if mean is None else mean
         new._prior = self if self._prior is None else self._prior
         new.plan = {**self.plan, "conditioning": self.plan.get("conditioning", []) + [label]}
-        if self.engine == "torch":
-            new.generator = make_generator(seed, self.device)
-        else:
-            new.stream = NormalStream(seed)
+        new.source = inherit(seed, self)  # seed=None: a child stream of this one (or the same draw-time generator)
+        new.plan["randomness"] = new.source.describe()
+        if self.engine != "torch":
+            new.stream = NormalStream(new.source)
         return new
+
+    @property
+    def generator(self):
+        """Torch engine: the torch.Generator of the current draw (the own stream's, which persists, for an explicit
+        seed)."""
+        return self.source.streams().torch(self.device) if self.engine == "torch" else None
 
     @property
     def mean(self) -> np.ndarray:
@@ -784,5 +805,21 @@ class Gaussian(InPlace):
         return "Gaussian(\n" + "\n".join(f"  {k}: {v}" for k, v in self.plan.items()) + "\n)"
 
 
-def _shifted_form(form, t):
-    return lambda u, v: form(u, v) + float(t) * u * v * ngs.dx
+class ShiftedForm:
+    """The form a(u, v) + t (u, v): the shifted systems of fractional powers (a class, not a closure: it pickles)."""
+
+    def __init__(self, form, t):
+        self.form, self.t = form, float(t)
+
+    def __call__(self, u, v):
+        return self.form(u, v) + self.t * u * v * ngs.dx
+
+
+class DualToDual:
+    """Sigma^-1 c = Q_dd (M c) for a precision given as a dual-space operator Q_dd (apply-only specs)."""
+
+    def __init__(self, apply, mass):
+        self.apply, self.mass = apply, mass
+
+    def __call__(self, c):
+        return self.apply(self.mass @ c)

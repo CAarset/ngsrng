@@ -14,6 +14,7 @@ import torch
 
 from ..inplace import InPlace
 from ..noise import DiagonalNoise
+from ..seeding import as_source
 from .pointwise import is_conditioned
 
 
@@ -96,7 +97,7 @@ class StudentTField(_FEField):
                 stacklevel=3,
             )
         self.gauss, self.nu = gauss, float(nu)
-        self.rng = np.random.default_rng(seed)
+        self.source = as_source(seed)  # ngsrng.seeding
         self.space = gauss.space
         self.info = {"law": f"Student-t process (elliptical, nu={nu})", "gaussian": gauss.plan}
 
@@ -104,7 +105,7 @@ class StudentTField(_FEField):
         g = self.gauss
         c = g.sample(ns)
         c = c[torch.from_numpy(g.space.free).to(c.device)] - torch.from_numpy(g.mean[g.space.free]).to(c)[:, None]
-        scale = torch.from_numpy(np.sqrt(self.nu / self.rng.chisquare(self.nu, ns))).to(c)
+        scale = torch.from_numpy(np.sqrt(self.nu / self.source.streams().numpy().chisquare(self.nu, ns))).to(c)
         return c * scale[None, :]
 
 
@@ -133,8 +134,8 @@ class TypeGField(_FEField):
             raise ValueError("mixing must be 'nig' or 'gamma'")
         self.gauss, self.mixing, self.nu = gauss, mixing, float(nu)
         self.space = gauss.space
-        self.rng = np.random.default_rng(seed)
-        self.rng_mix = self.rng.spawn(1)[0]  # mixing and white noise in separate streams, each sample by sample
+        self.source = as_source(seed)  # ngsrng.seeding
+        self.source_mix = self.source.spawn()  # mixing and white noise in separate streams, each sample by sample
         self.element_of_column = _element_map(gauss)
         self.volumes = ngs.Integrate(ngs.CoefficientFunction(1.0), self.space.mesh, element_wise=True).NumPy().copy()
         self.on_device = gauss.engine == "torch"
@@ -142,7 +143,7 @@ class TypeGField(_FEField):
             from ..backend import make_generator
 
             dev = gauss.device
-            self.tgen = make_generator(self.rng.integers(2**62) if torch_seed is None else torch_seed, dev)
+            self._torch_seeded = None if torch_seed is None else make_generator(torch_seed, dev)
             self.t_shape = torch.as_tensor(self.volumes / self.nu, device=dev, dtype=torch.float64)
             self.t_emap = torch.as_tensor(self.element_of_column, device=dev)
         self.info = {
@@ -152,29 +153,39 @@ class TypeGField(_FEField):
             "gaussian": gauss.plan,
         }
 
+    @property
+    def tgen(self) -> torch.Generator:
+        """The device generator of the current draw (mixing and noise): ``torch_seed``'s, or the source's."""
+        if self._torch_seeded is not None:
+            return self._torch_seeded
+        return self.source.streams().torch(self.gauss.device)
+
     def mixing_variables(self, n) -> np.ndarray:
         """V_e for every element and sample (ne x n): mean 1, variance nu / |e|. Drawn sample by sample (so a
         sample does not depend on how a batch is split)."""
         shape = np.broadcast_to(self.volumes / self.nu, (n, len(self.volumes)))
+        rng = self.source_mix.streams().numpy()
         if self.mixing == "nig":
-            return self.rng_mix.wald(1.0, shape).T
-        return self.rng_mix.gamma(shape, 1.0 / shape).T
+            return rng.wald(1.0, shape).T
+        return rng.gamma(shape, 1.0 / shape).T
 
-    def _device_mixing(self, n):
+    def _device_mixing(self, n, gen):
         shape = self.t_shape[:, None].expand(-1, n).contiguous()
         if self.mixing == "nig":
-            return torch_inverse_gaussian(torch.ones_like(shape), shape, self.tgen)
-        return torch_gamma(shape, self.tgen) / shape
+            return torch_inverse_gaussian(torch.ones_like(shape), shape, gen)
+        return torch_gamma(shape, gen) / shape
 
     def _coefficients(self, ns):
         g = self.gauss
         if self.on_device:
-            v = self._device_mixing(ns).to(g._work_dtype)
-            eta = torch.randn(g.nrand, ns, generator=self.tgen, device=g.device, dtype=g._work_dtype)
+            gen = self.tgen
+            v = self._device_mixing(ns, gen).to(g._work_dtype)
+            eta = torch.randn(g.nrand, ns, generator=gen, device=g.device, dtype=g._work_dtype)
             c = g.apply(eta * torch.sqrt(v[self.t_emap]))
         else:
             v = self.mixing_variables(ns)
-            eta = self.rng.standard_normal((ns, g.nrand)).T * np.sqrt(v[self.element_of_column])  # sample by sample
+            eta = (self.source.streams().numpy().standard_normal((ns, g.nrand)).T
+                   * np.sqrt(v[self.element_of_column]))  # sample by sample
             c = g.apply(torch.from_numpy(eta))
         return c.to(g.dtype)
 

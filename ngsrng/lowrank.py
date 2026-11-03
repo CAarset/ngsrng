@@ -12,6 +12,7 @@ from .backend import available_memory, numpy_blas_threads
 from .inplace import InPlace
 from .observations import observation_operator, whiten, whitener
 from .randomized import gram_orth, randomized_svd
+from .seeding import as_source, inherit
 from .space import SpaceInfo, coefficient_columns, coefficient_vector
 
 
@@ -24,7 +25,7 @@ class LowRankGaussian(InPlace):
     vanish at Dirichlet dofs (those are fixed to the mean).
     """
 
-    def __init__(self, fes, b, k, mean=None, d=None, seed=None):
+    def __init__(self, fes, b, k, mean=None, d=None, seed=None):  # seed: see ngsrng.seeding
         self.space = SpaceInfo(fes)
         self.b = coefficient_columns(b, fes.ndof)
         free = self.space.free
@@ -37,7 +38,7 @@ class LowRankGaussian(InPlace):
             if not any(np.allclose(d, ref, rtol=1e-8, atol=1e-12 * np.abs(ref).max()) for ref in ops.values()):
                 raise ValueError("D is neither the L2 adjoint B^T M nor the transpose B^T of B")
         self._mean = np.zeros(fes.ndof) if mean is None else coefficient_vector(mean, self.space)
-        self.rng = np.random.default_rng(seed)
+        self.source = as_source(seed)
         self.device = torch.device("cpu")
         self.plan = {"space": self.space.describe(), "structure": f"finite rank {self.b.shape[1]}: B K^-1/2 zeta"}
         self._prior = None  # set on conditioned low-rank Gaussians and on KL expansions of posteriors
@@ -66,7 +67,7 @@ class LowRankGaussian(InPlace):
         if out is not None:
             return self._sample_out(n, out)
         ns = 1 if n is None else int(n)
-        zeta = self.rng.standard_normal((ns, self.nrand)).T  # sample by sample: chunked fills give the same samples
+        zeta = self.source.streams().numpy().standard_normal((ns, self.nrand)).T  # sample by sample: chunking-free
         x = self._mean[:, None] + self.b @ (self.rinv @ zeta)
         if n is None:
             gf = ngs.GridFunction(self.space.fes)
@@ -88,13 +89,13 @@ class LowRankGaussian(InPlace):
         if data is not None:
             resid = whiten(kind, data_w, np.asarray(data, dtype=float) - g @ mean)
             mean = mean + self.b @ np.linalg.solve(k_post, f.T @ resid)
-        post = LowRankGaussian(self.space.fes, self.b, k_post, mean=mean, seed=seed)
+        post = LowRankGaussian(self.space.fes, self.b, k_post, mean=mean, seed=inherit(seed, self))
         post._prior = self if self._prior is None else self._prior
         return post
 
 
-def karhunen_loeve(gauss, rank=None, oversampling=None, power_iterations=None, seed=0,
-                   method="auto") -> LowRankGaussian:
+def karhunen_loeve(gauss, rank=None, oversampling=None, power_iterations=None, seed=None,
+                   method="auto", sketch_seed=0) -> LowRankGaussian:
     """Truncated Karhunen-Loeve expansion: the best rank-``rank`` L2 approximation of a Gaussian's covariance.
 
     The modes are eigenfunctions of the covariance operator C (L2-self-adjoint), i.e. of C_h = Sigma M with
@@ -117,9 +118,12 @@ def karhunen_loeve(gauss, rank=None, oversampling=None, power_iterations=None, s
 
     For a finite-rank Gaussian (:class:`LowRankGaussian`: KL expansions, sample covariances, operator covariances,
     their posteriors) the expansion is computed exactly from its r x r Gram matrix, and ``rank=None`` keeps all modes.
+
+    ``seed``: the randomness of the returned sampler (default: inherited from ``gauss``, see :mod:`ngsrng.seeding`).
+    ``sketch_seed``: the fixed seed of the randomised range finder, so that the modes are deterministic.
     """
     if isinstance(gauss, LowRankGaussian):
-        return _exact_kl(gauss, rank)
+        return _exact_kl(gauss, rank, seed)
     if rank is None:
         raise ValueError("karhunen_loeve needs a rank (it is exact, without truncation, only for finite-rank "
                          "Gaussians)")
@@ -146,12 +150,12 @@ def karhunen_loeve(gauss, rank=None, oversampling=None, power_iterations=None, s
         if method == "subspace":
             nrand = gauss.nrand
             u, sv, _ = randomized_svd(apply_l, lambda y: apply_lt(mass @ y), nrand, min(rank, s.nfree, nrand),
-                                      power_iterations=power_iterations, oversampling=oversampling, seed=seed,
+                                      power_iterations=power_iterations, oversampling=oversampling, seed=sketch_seed,
                                       orth=orth, rtol=1e-7)
             lam, vecs = sv**2, u
         else:
             ell = min(rank + oversampling, s.nfree)
-            y = apply_l(apply_lt(mass @ np.random.default_rng(seed).standard_normal((s.nfree, ell))))
+            y = apply_l(apply_lt(mass @ np.random.default_rng(sketch_seed).standard_normal((s.nfree, ell))))
             for _ in range(power_iterations):
                 y = apply_l(apply_lt(mass @ orth(y)))
             q = orth(y)
@@ -168,14 +172,14 @@ def karhunen_loeve(gauss, rank=None, oversampling=None, power_iterations=None, s
         warnings.warn(f"karhunen_loeve: rank {len(lam)} instead of {rank} ({why})", stacklevel=2)
     modes = np.zeros((s.ndof, len(lam)))
     modes[s.free] = vecs
-    out = LowRankGaussian(s.fes, modes, np.diag(1.0 / lam), mean=gauss.mean, seed=seed)
+    out = LowRankGaussian(s.fes, modes, np.diag(1.0 / lam), mean=gauss.mean, seed=inherit(seed, gauss))
     out.eigenvalues, out.modes = lam, modes
     out._prior = getattr(gauss, "_prior", None)  # a KL expansion of a posterior is still referred to its prior
     out.plan["structure"] = f"Karhunen-Loeve truncation ({method}), rank {out.nrand}"
     return out
 
 
-def _exact_kl(g, rank=None) -> LowRankGaussian:
+def _exact_kl(g, rank=None, seed=None) -> LowRankGaussian:
     """Exact KL expansion of Sigma = W W^T (W = B K^-1/2): with W^T M W = V Lambda V^T, the M-orthonormal modes are
     W V Lambda^-1/2 and the eigenvalues Lambda."""
     s = g.space
@@ -190,27 +194,28 @@ def _exact_kl(g, rank=None) -> LowRankGaussian:
     lam, v = lam[keep], v[:, keep]
     modes = np.zeros((s.ndof, len(lam)))
     modes[s.free] = (w @ v) / np.sqrt(lam)
-    out = LowRankGaussian(s.fes, modes, np.diag(1.0 / lam), mean=g.mean, seed=g.rng.integers(2**62))
+    out = LowRankGaussian(s.fes, modes, np.diag(1.0 / lam), mean=g.mean, seed=inherit(seed, g))
     out.eigenvalues, out.modes = lam, modes
     out._prior = getattr(g, "_prior", None)
     out.plan["structure"] = f"Karhunen-Loeve expansion (exact), rank {len(lam)}"
     return out
 
 
-def operator_kl(fes, cov, mean=None, seed=0) -> LowRankGaussian:
+def operator_kl(fes, cov, mean=None, seed=None, sketch_seed=0) -> LowRankGaussian:
     """Adaptive truncated KL expansion of an apply-only covariance (:class:`ngsrng.specs.OperatorCovariance`).
 
     Eigenpairs of C_h = Sigma M (M-orthonormal modes) by a randomised range finder with power iterations and
     Rayleigh-Ritz on Q^T M Sigma M Q. The rank doubles until the uncaptured trace tr(Sigma M) - sum(lambda), estimated
     by Hutchinson with white-noise probes z ~ N(0, M) on the deflated covariance, is at most ``cov.tol`` times the
     total. The result records ``eigenvalues``, ``modes`` and ``trace_residual`` (the estimated relative error in
-    trace norm).
+    trace norm). ``seed``: the randomness of the returned sampler (:mod:`ngsrng.seeding`); ``sketch_seed``: the fixed
+    seed of the range finder and the trace probes, so that the modes are deterministic.
     """
     from .noise import DiagonalNoise, LocalGramNoise
 
     s = SpaceInfo(fes)
     mass = s.mass_free
-    rng = np.random.default_rng(seed)
+    rng = np.random.default_rng(sketch_seed)
     apply_sigma = cov.sigma(s)
 
     def apply_a(x):  # C_h = Sigma M
