@@ -8,8 +8,8 @@ Mathematical content of each check:
   Dirichlet-to-Neumann (Schur complement) matrix, and the regression coefficient Sigma_IB Sigma_BB^-1 is the
   K-harmonic lifting -- test_dtn_theorem, test_lifting_is_harmonic;
 * the boundary marginal of the sampler has the covariance Sigma_BB (Monte Carlo) -- test_boundary_moments;
-* mode "field" rewrites the trace by u* = u - Sigma_B Sigma_BB^-1 (R u - g) with g ~ N(0, Sigma_BB) independent,
-  which leaves the joint law of (u*, R u*) = (u, g) at the prior, and imposes g exactly -- test_field_mode_*;
+* bnd_values=g conditions the field on its trace, u* = u - Sigma_B Sigma_BB^-1 (R u - g): g is imposed exactly and
+  the interior has the conditional law -- test_conditioning_*;
 * non-Gaussian (copula) families act pointwise, so the same restriction is exact for them -- test_copula_marginal.
 """
 
@@ -95,10 +95,33 @@ def test_quadrature_representation_raises(mesh):
     rng = ngsrng.default_rng(h1(mesh, 1), seed=3, correlation=0.25)
     with pytest.raises(ValueError, match="representation"):
         rng.uniform(size=3, bnd="left", representation="quadrature")
-    # with the generator-level default (never asked for), bnd= switches to the coefficient representation and says so
+    # with the generator-level default (never asked for), bnd= switches to the Bernstein representation and says so
     info = rng.info("uniform", bnd="left")
     assert info["bnd"]["mode"] == "restrict"
-    assert info["representation"] == "projection"
+    assert info["representation"] == "bernstein"
+
+
+@pytest.mark.parametrize("order", [1, 2])
+def test_default_boundary_draws_respect_the_range(mesh, order):
+    """Without representation=, bnd= draws of non-Gaussian families are Bernstein fields: the boundary data stay in
+    the family's range at every point of Gamma (checked at the trace's domain points), for any order."""
+    fes = h1(mesh, order)
+    rng = rng_for(fes)
+    vals = np.asarray(rng.uniform(size=200, bnd="left"), dtype=float)
+    # values on Gamma = {x = 0} only: off Gamma the restricted function has zeroed coefficients and no guarantee
+    G = ngsrng.observation_operator(fes, points=np.column_stack([np.zeros(41), np.linspace(0, 1, 41)]))
+    on_gamma = G @ vals.T
+    assert on_gamma.min() >= -1e-6 and on_gamma.max() <= 1 + 1e-6, (on_gamma.min(), on_gamma.max())
+    assert rng.info("uniform", representation="projection", bnd="left")["representation"] == "projection"
+
+
+def test_default_boundary_representation_falls_back_on_variable_order(mesh):
+    """Bernstein needs a uniform order; on a variable-order space the bnd= default stays the L2 projection."""
+    fes = h1(mesh, 2)
+    fes.SetOrder(ngs.NodeId(ngs.EDGE, 0), 3)  # one cubic edge: 86 dofs instead of 85
+    fes.Update()
+    assert ngsrng.default_rng(fes, seed=1, correlation=0.25).info("uniform", bnd="left")["representation"] \
+        == "projection"
 
 
 # ------------------------------------------------------------------ exact marginal: restrict
@@ -193,29 +216,11 @@ def test_conditional_covariance_is_homogeneous_dirichlet(mesh):
     assert np.abs(sam.residual_covariance - Kii_inv).max() < 1e-8 * np.abs(Kii_inv).max()
 
 
-# ------------------------------------------------------------------ field mode
+# ------------------------------------------------------------------ conditioning on the trace
 
 
-def test_field_mode_is_prior_consistent(mesh):
-    """Field mode keeps the joint law: full covariance equals the plain sampler's, trace equals the drawn g."""
-    fes = h1(mesh, 1)
-    d = boundary_dofs(fes, "left")
-    other = np.setdiff1d(np.arange(fes.ndof), d)
-    rng = rng_for(fes)
-    plain = rng_for(fes).normal(size=MC)
-    field = rng.normal(size=MC, bnd="left", bnd_mode="field")
-    tol = 10 * np.abs(np.cov(plain.T, bias=False)).max() / np.sqrt(MC)
-    assert np.abs(np.cov(field.T, bias=False) - np.cov(plain.T, bias=False)).max() < tol
-    # the trace is a fresh independent draw with the right marginal, not a copy of the original trace
-    assert np.abs(field[:, d] - plain[:, d]).max() > 1e-6
-    assert np.abs(np.cov(field[:, d].T, bias=False) - boundary_covariance(rng.gaussian(), "left", fes=fes)).max() \
-        < 8 * np.abs(np.cov(plain[:, d].T, bias=False)).max() / np.sqrt(MC)
-    # and the field is not supported on the boundary (interior still random)
-    assert np.abs(field[:, other]).max() > 0
-
-
-def test_field_mode_prescribes_data(mesh):
-    """Given boundary data, field mode is exact hard Dirichlet conditioning."""
+def test_conditioning_prescribes_data(mesh):
+    """Given boundary data, bnd_values= is exact hard Dirichlet conditioning."""
     fes = h1(mesh, 2)
     # float64: the prescribed data must survive the delivered array's dtype untouched (the default float32 would
     # round it at 1e-7, which is not a failure of the conditioning). power = 1 makes the conditional mean exactly
@@ -235,13 +240,17 @@ def test_field_mode_prescribes_data(mesh):
         < 8 * np.abs(sam.lifting).max() * np.sqrt(np.abs(sam.residual_covariance).max()) / np.sqrt(20)
 
 
-def test_field_mode_mean_shift(mesh):
-    """The prior mean on the boundary is respected when no data is prescribed."""
+def test_bnd_mode_is_gone_and_values_need_a_gaussian(mesh):
+    """bnd= restricts and bnd_values= conditions; there is no third mode, and a stale bnd_mode= is an error rather
+    than a silently ignored keyword. Conditioning is linear, so it needs an affine (Gaussian) field."""
     fes = h1(mesh, 1)
-    d = boundary_dofs(fes, "left")
-    rng = ngsrng.default_rng(fes, seed=11, correlation=0.25)
-    vals = rng.normal(loc=2.0, size=600, bnd="left", bnd_mode="field")
-    assert np.abs(vals[:, d].mean(axis=0) - 2.0).max() < 0.25
+    rng = rng_for(fes)
+    with pytest.raises(TypeError, match="bnd_mode"):
+        rng.normal(size=2, bnd="left", bnd_mode="field")
+    with pytest.raises(NotImplementedError, match="nonlinear"):
+        rng.uniform(size=2, bnd="left", bnd_values=np.full(boundary_dofs(fes, "left").size, 0.5))
+    n_bnd = boundary_dofs(fes, "left").size
+    assert rng.info("normal", bnd="left", bnd_values=np.zeros(n_bnd))["bnd"]["mode"] == "condition"
 
 
 # ------------------------------------------------------------------ other families

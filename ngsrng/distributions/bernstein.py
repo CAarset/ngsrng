@@ -53,6 +53,29 @@ def _reference_vertices(mesh, et):
     return verts
 
 
+def unsupported(space: SpaceInfo):
+    """Why ``space`` has no Bernstein-Bezier description, or None if it has one."""
+    if space.fes.type not in ("h1ho", "l2ho"):
+        return "Bernstein representation: H1 and L2 spaces only"
+    if not space.single_element_type:
+        return "Bernstein representation: one element type per mesh"
+    et = next(iter(space.mesh.Elements(ngs.VOL))).type
+    if et not in SIMPLICES + TENSOR:
+        return f"Bernstein representation: {et} elements are not supported"
+    return None
+
+
+def default_ok(space: SpaceInfo) -> bool:
+    """Whether the Bernstein representation can be chosen by default: a supported space of uniform order, checked
+    cheaply (the broken space has the full local P_p / Q_p count on every element) before any set-up."""
+    if unsupported(space) is not None:
+        return False
+    p, d = int(space.order), space.dim
+    simplex = next(iter(space.mesh.Elements(ngs.VOL))).type in SIMPLICES
+    nloc = math.comb(p + d, d) if simplex else (p + 1) ** d
+    return space.broken.ndof == space.mesh.ne * nloc
+
+
 class BernsteinForm:
     """Bernstein-Bezier description of ``space`` (see the module docstring).
 
@@ -62,13 +85,10 @@ class BernsteinForm:
 
     def __init__(self, space: SpaceInfo):
         mesh, fes = space.mesh, space.fes
-        if fes.type not in ("h1ho", "l2ho"):
-            raise NotImplementedError("Bernstein representation: H1 and L2 spaces only")
-        if not space.single_element_type:
-            raise NotImplementedError("Bernstein representation: one element type per mesh")
+        reason = unsupported(space)
+        if reason is not None:
+            raise NotImplementedError(reason)
         et = next(iter(mesh.Elements(ngs.VOL))).type
-        if et not in SIMPLICES + TENSOR:
-            raise NotImplementedError(f"Bernstein representation: {et} elements are not supported")
         self.space, self.p, self.simplex, self.dim = space, int(space.order), et in SIMPLICES, mesh.dim
         p, d = self.p, self.dim
         self.ref_vertices = _reference_vertices(mesh, et)

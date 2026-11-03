@@ -38,23 +38,20 @@ for any power the same *regression* quantities ``Sigma_BB`` and ``P = Sigma_{.,B
 boundary sampler needs, and both come from ``n_B`` applications of ``Sigma_h`` (matrix-free, so also for fractional
 powers, posteriors and GPU sources).
 
-The two modes of ``bnd="name"``
-------------------------------
-``"restrict"`` (default)
+Restricting and conditioning
+----------------------------
+``bnd="name"``
     Sample, then keep the trace (DoFs off ``Gamma`` zeroed). The result is a finite element function supported on
     ``Gamma``, i.e. a usable random Dirichlet datum, and its law is the exact marginal for every family.
-``"field"``
-    Keep the whole field but replace its trace by an independent draw ``g ~ N(m_B, Sigma_BB)``, or by prescribed
-    data: ``u* = u - P (R u - g)``. Since ``(u, Ru)`` is jointly Gaussian and
-    ``Cov(u - P R u, R u) = Sigma_{.,B} - P Sigma_BB = 0``, the pair ``(u*, R u*) = (u - P R u + P g, g)`` has the
-    same joint law as ``(u, R u)``: the field remains an exact prior draw whose trace is an independent draw of the
-    boundary marginal. With prescribed ``g`` it is exact hard Dirichlet conditioning (the Matheron / Gibbs form).
-    With a drawn ``g`` the result has the law of a plain prior draw (that is the content of the identity), so the
-    mode only matters with prescribed data. ``P`` is never formed: for a sparse precision ``Q`` (power 1, assembled
-    precisions) ``P d`` is the discrete harmonic lifting ``(d, -Q_II^-1 Q_IB d)``, one sparse solve; otherwise it is
-    ``Sigma E Sigma_BB^-1 d``, one application of ``Sigma_h`` plus a Cholesky solve with the ``n_B x n_B`` block.
-    For copula families the latent Gaussian must be conditioned before the pointwise map, so only ``"restrict"`` is
-    offered there.
+``bnd="name", bnd_values=g``
+    The whole field conditioned on its trace being ``g``: ``u* = u - P (R u - g)``. Since ``(u, Ru)`` is jointly
+    Gaussian and ``Cov(u - P R u, R u) = Sigma_{.,B} - P Sigma_BB = 0``, ``u - P R u`` is independent of the trace,
+    and ``u*`` is exact hard Dirichlet conditioning (the Matheron / Gibbs form). There is no mode with a *drawn*
+    ``g``: conditioning on an independent draw of the trace marginal reproduces the law of a plain draw. ``P`` is
+    never formed: for a sparse precision ``Q`` (power 1, assembled precisions) ``P d`` is the discrete harmonic
+    lifting ``(d, -Q_II^-1 Q_IB d)``, one sparse solve; otherwise it is ``Sigma E Sigma_BB^-1 d``, one application
+    of ``Sigma_h`` plus a Cholesky solve with the ``n_B x n_B`` block. For copula families the latent Gaussian must
+    be conditioned before the pointwise map, so only restriction is offered there.
 
 Regularity
 ----------
@@ -86,11 +83,8 @@ try:  # torch rows arrive from the GPU engine; the algebra below is written to r
 except ImportError:  # pragma: no cover
     _torch = None
 
-__all__ = ["boundary_mass", "boundary_dofs", "boundary_covariance", "BoundarySampler", "attach_boundary",
-           "RESTRICT", "FIELD", "MODES"]
+__all__ = ["boundary_mass", "boundary_dofs", "boundary_covariance", "BoundarySampler", "attach_boundary"]
 
-RESTRICT, FIELD = "restrict", "field"
-MODES = (RESTRICT, FIELD)
 _TOL = 1e-13
 # Largest dense lifting P (n_free x n_bnd entries) kept for the correction of a general source: below it a product
 # with P is cheaper than an application of Sigma_h; above it, P (which grows like N^((2d-1)/d) under refinement, unlike
@@ -202,7 +196,6 @@ class BoundarySampler:
         self._free = np.zeros(free.size, dtype=bool)
         self._free[self._pos] = True
         self._off = np.setdiff1d(np.arange(self.fes.ndof), self.dofs)
-        self._root = None          # symmetric square root of sigma_bb (trace draws)
         self._chol = None          # Cholesky factor of sigma_bb (correction of general sources)
         self._residual = None
         self._src = as_covariance(source, self.fes)
@@ -365,20 +358,6 @@ class BoundarySampler:
 
     # ----------------------------------------------------------------------- sampling
 
-    def sample_trace(self, n, rng, loc=None, scale=1.0):
-        """``n`` independent draws of the boundary marginal ``N(loc_B, scale^2 Sigma_BB)`` as (n, n_bnd) rows."""
-        if self._root is None:
-            w, V = np.linalg.eigh(self.sigma_bb)
-            if w.min() <= -1e-8 * max(w.max(), 1e-300):
-                raise np.linalg.LinAlgError("the boundary covariance block is not positive semidefinite")
-            self._root = V * np.sqrt(np.clip(w, 0.0, None))
-        # drawn sample by sample, so in-place fills in chunks give the draws of one call (ngsrng.inplace)
-        out = float(scale) * (rng.standard_normal((int(n), self.n_bnd)) @ self._root.T)
-        loc = _vector(loc)
-        if loc is not None:
-            out += loc[self.dofs]
-        return out
-
     def lift(self, loc, values):
         """Full coefficient vector of ``loc`` plus the lifting of the boundary data ``values`` (the conditional mean).
 
@@ -396,24 +375,16 @@ class BoundarySampler:
             rows[:, off] = 0
         return rows
 
-    def condition(self, rows, values=None, rng=None, loc=None, scale=1.0):
-        """Rewrite the trace of ``rows`` (samples by DoFs, in place) to ``values``.
-
-        ``values=None`` draws the trace independently from its marginal (needs ``rng``), which leaves the field an
-        exact prior sample; with values given, ``rows`` becomes exact conditioning on ``u_h|Gamma = values``.
-        """
+    def condition(self, rows, values):
+        """Condition the samples ``rows`` (samples by DoFs, in place) on their trace being ``values``: ``rows``
+        becomes an exact draw of the field given ``u_h|Gamma = values`` (one set of values, or one per sample)."""
         one = rows.ndim == 1
         r = rows.reshape(1, -1) if one else rows
-        if values is None:
-            if rng is None:
-                raise ValueError("field mode without prescribed boundary values needs an rng to draw them")
-            g = self.sample_trace(r.shape[0], rng, loc, scale)
-        else:
-            g = np.asarray(values, dtype=np.float64).reshape(-1, self.n_bnd)
-            if g.shape[0] == 1 and r.shape[0] != 1:
-                g = np.broadcast_to(g, (r.shape[0], self.n_bnd))
-            if g.shape[0] != r.shape[0]:
-                raise ValueError(f"bnd_values has {g.shape[0]} rows for {r.shape[0]} samples")
+        g = np.asarray(values, dtype=np.float64).reshape(-1, self.n_bnd)
+        if g.shape[0] == 1 and r.shape[0] != 1:
+            g = np.broadcast_to(g, (r.shape[0], self.n_bnd))
+        if g.shape[0] != r.shape[0]:
+            raise ValueError(f"bnd_values has {g.shape[0]} rows for {r.shape[0]} samples")
         dofs = _index(r, self.dofs)
         trace = r[:, dofs]
         trace = trace.detach().double().cpu().numpy() if _torch is not None and isinstance(trace, _torch.Tensor) \
@@ -427,7 +398,7 @@ def _latent(field):
     """``(Gaussian, affine)`` behind a built field: the Gaussian whose DoFs the field's samples are built from.
 
     ``affine`` says whether the field is an affine function of that Gaussian (loc + scale g), which is what
-    ``bnd_mode="field"`` needs; copula families, mixtures and quadratic fields are nonlinear in it.
+    conditioning (``bnd_values=``) needs; copula families, mixtures and quadratic fields are nonlinear in it.
     """
     points = getattr(field, "points", None)  # GaussianAtPoints: the latent Gaussian of a pointwise family
     if points is not None and hasattr(points, "gauss"):
@@ -441,54 +412,38 @@ def _latent(field):
                               "whose DoFs are the sample's finite element coefficients")
 
 
-def attach_boundary(field, name, mode=None, values=None, generator=None):
+def attach_boundary(field, name, values=None):
     """Attach the ``bnd=`` specification of a freshly built field (called by :class:`ngsrng.Generator`).
 
     Sets ``field.bnd`` (what :meth:`ngsrng.Generator._apply_bnd` needs) and adds the boundary block to
-    ``field.info``. Raises for the combinations that have no boundary interpretation rather than silently
+    ``field.info``: without ``values`` the draws are restricted to the boundary, with ``values`` the field is
+    conditioned on that trace. Raises for the combinations that have no boundary interpretation rather than silently
     changing what the user asked for.
     """
-    if mode is None:  # prescribed data needs the field mode; a plain bnd= draw is a restriction
-        mode = FIELD if values is not None else RESTRICT
-    if mode not in MODES:
-        raise ValueError(f"bnd_mode must be one of {MODES}, got {mode!r}")
     if getattr(field, "evaluation", None) is not None or getattr(field, "coords", None) is not None:
         raise ValueError(f'bnd="{name}" restricts finite element DoFs; this field delivers values at given points. '
                          "Drop points= to sample the field itself.")
     rep = getattr(field, "representation", None)
     if rep not in (None, "projection", "bernstein"):
         raise ValueError(f'bnd="{name}" restricts finite element DoFs; representation="{rep}" delivers values at '
-                         "quadrature points, which have no DoF trace. Use representation='projection' (or "
-                         "'bernstein'), which returns coefficients.")
+                         "quadrature points, which have no DoF trace. Use representation='bernstein' (or "
+                         "'projection'), which returns coefficients.")
     gauss, affine = _latent(field)
     sampler = BoundarySampler(gauss, name)
-    loc, scale = (None, 1.0)
-    if affine:
-        loc, scale = getattr(field, "loc", None), float(getattr(field, "scale", 1.0))
-    if mode == FIELD:
+    if values is not None:
         if not affine:
             raise NotImplementedError(
-                f'bnd_mode="field" replaces the trace of an affine (Gaussian) field by an independent draw of its '
-                f'boundary marginal; {type(field).__name__} is a nonlinear function of its Gaussian. Use '
-                'bnd_mode="restrict" (exact for every family), or condition the Gaussian itself and build the family '
-                "on the conditioned Gaussian.")
-        if values is None and generator is None:
-            raise ValueError("bnd_mode='field' without bnd_values needs a generator to draw the boundary data from")
-    elif values is not None:
-        raise ValueError('bnd_values needs bnd_mode="field": bnd_mode="restrict" draws from the field and then '
-                         "restricts it, so its trace is random and prescribed data would be silently dropped.")
-    if values is not None:
+                f"bnd_values conditions an affine (Gaussian) field on its trace; {type(field).__name__} is a "
+                "nonlinear function of its Gaussian. Condition the Gaussian itself and build the family on the "
+                "conditioned Gaussian, or use bnd= alone (restriction, exact for every family).")
         values = _vector(values)
         if values.size == sampler.fes.ndof:  # a GridFunction (or coefficient vector) of the boundary data
             values = values[sampler.dofs]
         if values.size != sampler.n_bnd:
             raise ValueError(f"bnd_values has {values.size} entries; the boundary '{name}' has {sampler.n_bnd} DoFs "
                              "(in increasing DoF order)")
-    field.bnd = {"sampler": sampler, "mode": mode, "values": values,
-                 "rng": np.random.default_rng(generator._seed()) if generator is not None else None,
-                 "loc": loc, "scale": scale,
-                 "info": {**sampler.info, "mode": mode,
-                          "data": "prescribed" if values is not None else "drawn from the marginal"}}
+    field.bnd = {"sampler": sampler, "values": values,
+                 "info": {**sampler.info, "mode": "restrict" if values is None else "condition"}}
 
 
 def _dense_guard(rows, cols, what):

@@ -35,7 +35,7 @@ import torch
 from .backend import ngs_sparse, resolve_device, resolve_dtype
 from .boundary import attach_boundary  # [bnd] boundary (trace) sampling: ngsrng/boundary.py
 from .correlation import MaternCorrelation, matern
-from .distributions.bernstein import BernsteinForm
+from .distributions.bernstein import BernsteinForm, default_ok
 from .distributions.expansion import KLField
 from .distributions.mixtures import StudentTField, TypeGField
 from .distributions.pointwise import GaussianAtPoints
@@ -80,7 +80,7 @@ ALIASES = {
 
 CORRELATION_KEYS = ("correlation", "precision", "covariance")
 FIELD_KEYS = ("representation", "method", "tol", "std", "order", "construction", "points", "standardize_by",
-              "bnd", "bnd_mode", "bnd_values")  # [bnd] boundary (trace) sampling: see ngsrng/boundary.py
+              "bnd", "bnd_values")  # [bnd] boundary (trace) sampling: see ngsrng/boundary.py
 
 
 def _canonical(name: str) -> str:
@@ -269,7 +269,9 @@ class Generator:
     representation : for pointwise-defined families: "quadrature" (default; values at the quadrature points, exact
         marginals there), "bernstein" (an FE function whose values stay inside the family's range at every point:
         Bernstein-Bezier convex hull property; float64 coefficients) or "projection" (L2 projection; no range
-        guarantee). Per call, ``points=`` (m x dim coordinates) gives values at any points instead
+        guarantee). With ``bnd=`` the default is "bernstein" ("projection" where it is unsupported: mixed element
+        types or variable order).
+        Per call, ``points=`` (m x dim coordinates) gives values at any points instead
     order : quadrature order of the "quadrature" representation (use the order your forms integrate with)
     std : pointwise standardisation of copula families ("auto" | "exact" | "lowrank" | "mc" | array), see
         GaussianAtPoints and :func:`ngsrng.local_covariance`
@@ -394,7 +396,7 @@ class Generator:
             field = self._build(name, args, dict(kwargs), corr, dict(opts))
             field.out_dtype = torch.empty(0, dtype=self.dtype).numpy().dtype  # bounded families clamp in it
             if opts.get("bnd") is not None:  # [bnd] boundary (trace) sampling: ngsrng/boundary.py
-                attach_boundary(field, opts["bnd"], opts.get("bnd_mode"), opts.get("bnd_values"), self)
+                attach_boundary(field, opts["bnd"], opts.get("bnd_values"))
             field.work_values = self.work_values  # chunk size of in-place fills (out=)
             self._fields[key] = ((args, kwargs, corr, opts), field)
         return self._fields[key][1]
@@ -403,7 +405,8 @@ class Generator:
         explicit_rep = "representation" in opts
         rep = opts.pop("representation", self.representation)
         if opts.get("bnd") is not None and not explicit_rep:  # [bnd] boundary DoFs only exist for a representation
-            rep = "projection"  # [bnd] whose samples are finite element coefficients
+            # whose samples are finite element coefficients; Bernstein keeps the boundary values in the family's range
+            rep = "bernstein" if default_ok(SpaceInfo(self.fes)) else "projection"
         method, tol = opts.pop("method", "auto"), opts.pop("tol", 1e-10)
         construction = opts.pop("construction", None)
         std, order = opts.pop("std", None), opts.pop("order", None)
@@ -419,6 +422,9 @@ class Generator:
             names = list(defaults)
             out = dict(zip(names, args))
             out.update(kw)
+            unknown = [k for k in out if k not in defaults]
+            if unknown:
+                raise TypeError(f"{name}() got an unexpected parameter {unknown[0]!r}")
             for k, v in defaults.items():
                 if k not in out:
                     if v is REQUIRED:
@@ -427,14 +433,16 @@ class Generator:
             return out
 
         if name in ("normal", "standard_normal"):
-            p = params({"loc": None, "scale": 1.0}) if name == "normal" else {"loc": 0.0, "scale": 1.0}
+            p = params({"loc": None, "scale": 1.0}) if name == "normal" else {**params({}), "loc": 0.0, "scale": 1.0}
             if explicit_rep or not isinstance(p["scale"], numbers.Real):  # pointwise-standardised normal marginals
                 loc = 0.0 if p["loc"] is None else p["loc"]
                 return named_marginal(pts(), "normal", loc, p["scale"], representation=rep)
             return _NormalField(self.gaussian(**corr), p["loc"], p["scale"], points=points)
         if name == "white_noise":
+            params({})
             return _NormalField(self.gaussian(precision=self._mass_precision()), None, 1.0)
         if name == "standard_exponential":
+            params({})
             return named_marginal(pts(), "exponential", 1.0, representation=rep)
         if name == "standard_gamma":
             return named_marginal(pts(), "gamma", params({"shape": REQUIRED})["shape"], 1.0, method=method, tol=tol,
@@ -552,8 +560,8 @@ class Generator:
     def _apply_bnd(self, field, rows):
         """Boundary (trace) step of a ``bnd=`` draw, on ``rows`` (samples by DoFs, in place, NumPy or torch).
 
-        See :mod:`ngsrng.boundary`: ``"restrict"`` keeps the exact marginal of the boundary DoFs, ``"field"``
-        replaces the trace by an independent draw of that marginal, or by prescribed Dirichlet data.
+        See :mod:`ngsrng.boundary`: without ``bnd_values`` the draw is restricted to the boundary DoFs (their exact
+        marginal); with them it is conditioned on that trace.
         """
         b = field.bnd
         sampler = b["sampler"]
@@ -561,8 +569,8 @@ class Generator:
             raise ValueError(f'bnd="{sampler.name}" restricts the DoFs of the samples: expected {sampler.fes.ndof} '
                              f'values per sample, got {rows.shape[-1]}. This distribution does not deliver finite '
                              "element coefficients (use representation='projection' or 'bernstein').")
-        if b["mode"] == "field":
-            sampler.condition(rows, b["values"], b["rng"], b["loc"], b["scale"])
+        if b["values"] is not None:
+            sampler.condition(rows, b["values"])
         else:
             sampler.restrict(rows)
 
@@ -606,9 +614,8 @@ class Generator:
 
         ``bnd="name"`` restricts the draw to the DoFs of the named boundary: the sample is zero at every DoF whose
         basis function vanishes there, and its trace is an exact draw of the boundary marginal of the field, for
-        every family and representation (ngsrng/boundary.py). ``bnd_mode="field"`` keeps the field random and
-        replaces only its trace by an independent draw of that marginal (affine Gaussian fields); with
-        ``bnd_values=g`` it draws the field conditioned on the prescribed trace g (an exact random Dirichlet datum).
+        every family and representation (ngsrng/boundary.py). With ``bnd_values=g`` it instead draws the whole field
+        conditioned on the prescribed trace g (affine Gaussian fields), exactly.
         """
         name = _canonical(name)
         args, size, output, out = self._split(name, args, kwargs)
