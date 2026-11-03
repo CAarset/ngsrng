@@ -39,6 +39,9 @@ KAPPA2 = 25.0
 PROFILES = {
     "quick": {"sizes": {"2D-P1": [32, 64], "2D-P2": [16], "3D-P1": [6, 10]}, "batch": 50, "repeats": 2,
               "timeout": 600},
+    # bench/calibrate.py: the sizes at which conditioning cost 7.5x (CPU) and 22x (GPU) a plain draw on 2026-11-02
+    "calibrate": {"sizes": {"2D-P1": [128, 512], "2D-P2": [256], "3D-P1": [16, 32]}, "batch": 100, "repeats": 2,
+                  "timeout": 900},
     "standard": {"sizes": {"2D-P1": [64, 128, 256, 512], "2D-P2": [32, 64, 128, 256], "3D-P1": [8, 16, 24, 32]},
                  "batch": 200, "repeats": 3, "timeout": 1800},
     "full": {"sizes": {"2D-P1": [64, 128, 256, 512, 1024], "2D-P2": [32, 64, 128, 256, 512],

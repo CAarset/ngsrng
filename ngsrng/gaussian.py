@@ -395,9 +395,9 @@ class Gaussian(InPlace):
             default = "umfpack" if s.dim == 1 else "sparsecholesky"
             return NGSolveDirect(s, form, inverse=self.method.get("inverse", default))
         if choice == "cg":
-            # h1amg for every H1 order: accurate, as fast as BDDC for p = 2, 3, and thread-safe (concurrent BDDC
-            # applications corrupt each other, so BDDC pipelines draw their samples one at a time); L2 needs BDDC
-            pre = self.method.get("precond", "h1amg" if s.kind == "H1" else "bddc")
+            # h1amg for H1 P1, BDDC otherwise: in 3D at 1e5 dofs h1amg cost 350 ms (P1) and 1030 ms (P2) per sample
+            # against 138 and 129 ms for BDDC (GPU-box calibration, 2026-11-03)
+            pre = self.method.get("precond", "h1amg" if (s.kind == "H1" and s.order == 1) else "bddc")
             return NGSolveCG(s, form, precond=pre, tol=self.tol)
         if choice == "cudss":
             if self.device.type != "cuda":

@@ -28,7 +28,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
-from cases import ACCURACY, ITERATIVE, PROFILES, RETIRE_RATIO, build_groups  # noqa: E402
+from cases import ACCURACY, ITERATIVE, PROFILES, RETIRE_RATIO, build_groups, mode_ratios  # noqa: E402
 
 FAILED = {"error", "timeout", "crash", "memlimit"}
 
@@ -41,11 +41,6 @@ def accurate(rec) -> bool:
         return all(not (rec.get(k) is not None and rec[k] > ACCURACY["prior"])
                    for k in ("pathwise_rel_err", "law_rel_fro"))
     return True
-
-
-def best_time(rec) -> float:
-    times = [rec.get(k) for k in ("per_sample_s", "per_sample_batch_s")]
-    return min(t for t in times if t is not None) if any(t is not None for t in times) else float("inf")
 
 
 def environment() -> dict:
@@ -174,17 +169,20 @@ class Runner:
 
     def retire_slow(self, recs):
         """Reject the candidates of one group that are RETIRE_RATIO x slower than the best accurate one on their
-        platform (iterative solvers in 3D excepted: their cost grows more slowly than a factorisation's)."""
+        platform in every mode, single samples and batches (iterative solvers in 3D excepted: their cost grows more
+        slowly than a factorisation's)."""
         ok = [r for r in recs if r.get("status") == "ok" and r["suite"] in ("noise", "prior") and accurate(r)]
-        best = {}
+        platforms = {}
         for r in ok:
-            key = (r["suite"], r.get("power"), r["engine"], r["device"])
-            best[key] = min(best.get(key, float("inf")), best_time(r))
-        for r in ok:
-            ratio = best_time(r) / best[(r["suite"], r.get("power"), r["engine"], r["device"])]
-            if ratio > RETIRE_RATIO and not (r["dim"] == 3 and r.get("solver") in ITERATIVE):
+            platforms.setdefault((r["suite"], r.get("power"), r["engine"], r["device"]), []).append(r)
+        for same in platforms.values():
+            for r, q in mode_ratios(same):
+                ratio = min(q.values(), default=1.0)
+                if ratio <= RETIRE_RATIO or (r["dim"] == 3 and r.get("solver") in ITERATIVE):
+                    continue
                 self.retired.add(r["lineage"])
-                self.rejected.setdefault(r["lineage"], f"{ratio:.0f}x slower than the best at {int(r['target'])} dofs")
+                self.rejected.setdefault(
+                    r["lineage"], f"{ratio:.0f}x slower than the best at {int(r['target'])} dofs, in every mode")
 
     def is_retired(self, t):
         return lineage(t) in self.retired or sibling(t) in self.retired

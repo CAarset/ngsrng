@@ -110,6 +110,52 @@ def checks(device, log):
     return out
 
 
+def fractional_checks(device, log, n=100_000, big=1_000_000):
+    """Fractional powers on the device (C = A^-1.6 on 1D meshes, the hardest case: cond ~ h^-2): accuracy against the
+    CPU engine at 1e5 dofs, the 1e6-dof case that ran out of 40 GB before the shared cuDSS buffers, and float32
+    arithmetic, whose spectral-interval estimate failed before it was moved to float64."""
+    from ngsolve.meshes import Make1DMesh
+
+    out = {}
+    spec = ngsrng.matern(5.0, 1.6)
+    fes = ngs.H1(Make1DMesh(n), order=1)
+    t0 = time.perf_counter()
+    ref = ngsrng.Gaussian(fes, spec, dtype="float64")
+    out["frac_cpu_setup_s"] = time.perf_counter() - t0
+    eta = torch.randn(ref.nrand, 4, generator=torch.Generator().manual_seed(0), dtype=torch.float64)
+    c_ref = ref.apply(eta).numpy()
+    for label, method in (("f64", None), ("f32work", {"work_dtype": "float32"})):
+        try:
+            t0 = time.perf_counter()
+            g = ngsrng.Gaussian(fes, spec, device=device, dtype="float64", method=method)
+            out[f"frac_{label}_setup_s"] = time.perf_counter() - t0
+            c = g.apply(eta.to(device)).double().cpu().numpy()
+            out[f"frac_{label}_pathwise_rel_err"] = float(np.linalg.norm(c - c_ref) / np.linalg.norm(c_ref))
+        except Exception as err:  # noqa: BLE001 - a failure is the result
+            out[f"frac_{label}_error"] = f"{type(err).__name__}: {err}"[:200]
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+    try:
+        t0 = time.perf_counter()
+        g = ngsrng.Gaussian(ngs.H1(Make1DMesh(big), order=1), spec, device=device, dtype="float64")
+        out["frac_1e6_setup_s"] = time.perf_counter() - t0
+        out["frac_1e6_plan"] = {k: g.plan.get(k) for k in ("structure", "shifted_width")}
+        sync(device)
+        t0 = time.perf_counter()
+        g.sample(32)
+        sync(device)
+        out["frac_1e6_per_sample_s"] = (time.perf_counter() - t0) / 32
+        if device.type == "cuda":
+            out["frac_1e6_gpu_peak_gb"] = torch.cuda.max_memory_allocated() / 1e9
+    except Exception as err:  # noqa: BLE001
+        out["frac_1e6_error"] = f"{type(err).__name__}: {err}"[:200]
+    out["frac_passed"] = (out.get("frac_f64_pathwise_rel_err", 1.0) < 1e-5 and "frac_f32work_setup_s" in out
+                          and "frac_1e6_per_sample_s" in out)
+    log(f"fractional checks: {out}")
+    return out
+
+
 # ------------------------------------------------------------------ timings
 
 
@@ -172,13 +218,19 @@ def main():
 
     warnings.simplefilter("ignore")
     check = checks(device, log)
+    if device.type == "cuda":  # the CPU engine's fractional powers are covered by the tests
+        check.update(fractional_checks(device, log))
     record({"kind": "checks", **check})
 
-    sizes = {"2D-P2": [0.03, 0.012] if args.quick else [0.03, 0.012, 0.006],
-             "3D-P1": [0.1] if args.quick else [0.1, 0.05]}
+    # quick: the sizes of the 2026-11-02 throughput numbers (32k and 129k dofs 2D P2, 7k 3D P1)
+    sizes = {"2D-P2": [0.012, 0.006] if args.quick else [0.03, 0.012, 0.006],
+             "3D-P1": [0.05] if args.quick else [0.1, 0.05]}
     families = [("normal", None), ("lognormal", None), ("uniform", None)]
     if device.type == "cuda":
-        solvers = ([{"solver": "cudss", "cudss_width": w} for w in (32, 128)] if cudss_available()
+        # the defaults (float64 arithmetic, float32 output) at two widths, and the float32-arithmetic opt-in: what the
+        # accuracy of the default costs
+        solvers = ([{"solver": "cudss", "cudss_width": w} for w in (32, 128)]
+                   + [{"solver": "cudss", "cudss_width": 32, "work_dtype": "float32"}] if cudss_available()
                    else [{"solver": "torch-pcg"}])
         dtypes = [torch.float32]
     else:
@@ -196,7 +248,7 @@ def main():
                 cpu = method.get("engine") == "ngsolve"
                 dev = torch.device("cpu") if cpu else device
                 label = "cpu-ngsolve" if cpu else "+".join(f"{k}={v}" for k, v in method.items())
-                if cpu and fes.ndof > 2e5:
+                if cpu and fes.ndof > (5e4 if args.quick else 2e5):
                     continue  # the reference is too slow at this size
                 for family, where in families:
                     for wv in args.work_values or [None]:

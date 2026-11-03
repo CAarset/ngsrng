@@ -24,7 +24,7 @@ import torch
 # Benchmarks measure the built-in rule-based "auto" choices, never a previously installed tuning.
 os.environ["NGSRNG_TUNING"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "no-tuning.json")
 sys.path.insert(0, os.path.dirname(__file__))
-from cases import DENSE_LIMIT, Task  # noqa: E402
+from cases import DENSE_LIMIT, GPU_BATCH, Task  # noqa: E402
 from common import make_space, structured_mesh  # noqa: E402
 
 import ngsrng  # noqa: E402
@@ -137,7 +137,7 @@ def run_noise(task: Task, space: SpaceInfo, rec: dict):
     else:
         dev, sync = torch.device(task.device), sync_for(task.device)
         gen = torch.Generator(device=dev).manual_seed(0)
-        batch = int(task.options.get("batch", 32))
+        batch = int(task.options.get("batch", GPU_BATCH))
         rng1, eta1 = timeit(lambda: torch.randn(smp.nrand, 1, generator=gen, device=dev, dtype=dtype), sync)
         app1, _ = timeit(lambda: smp.apply(eta1), sync)
         rngb, etab = timeit(lambda: torch.randn(smp.nrand, batch, generator=gen, device=dev, dtype=dtype), sync)
@@ -254,7 +254,9 @@ def run_prior(task: Task, fes, rec: dict, ref: Reference):
                work_dtype=str(g._work_dtype).replace("torch.", ""))
     sync = sync_for(task.device)
     rec["per_sample_s"], _ = timeit(lambda: g.sample(1), sync, min_time=0.5, max_reps=5)
-    batch = 4 if task.engine == "ngsolve" else int(task.options.get("batch", 32))
+    # one sample per CPU thread (the CPU engine's unit of parallelism), a realistic batch on a GPU
+    batch = int(task.options.get("batch", ngsrng.backend.available_threads() if task.engine == "ngsolve"
+                                 else GPU_BATCH))
     tb, _ = timeit(lambda: g.sample(batch), sync, min_time=0.0, max_reps=1, min_reps=1)
     rec.update(batch=batch, per_sample_batch_s=tb / batch)
     its = getattr(g.solver, "iterations", None) or getattr(getattr(g.solver, "cg", None), "iterations", None)

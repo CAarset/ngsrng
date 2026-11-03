@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from cases import CPU_SOLVERS, GPU_SOLVERS  # noqa: E402
+from cases import CPU_SOLVERS, GPU_SOLVERS, choose  # noqa: E402
 
 SOLVER_OPTIONS = {**CPU_SOLVERS, **GPU_SOLVERS}
 TOL = {"float64": 1e-6, "float32": 1e-4}
@@ -92,17 +92,18 @@ def noise_section(df, plots_dir, recs):
         if len(bad):
             out.append(md(bad[["dim", "kind", "order", "ndof", "platform", "method", "cov_rel_err"]]))
 
-    out.append("\n### 1.2 Fastest exact method per space and size (time per sample, single sample)\n")
+    out.append("\n### 1.2 Recommended exact method per space and size (time per sample; ranked by the worst ratio "
+               "to the best single-sample and batch time)\n")
     rows, best_map = [], {}
     for key, sub in ok[ok.valid].groupby(["dim", "kind", "order", "target"]):
         row = dict(zip(["dim", "kind", "order", "target"], key))
         row["ndof"] = int(sub.ndof.max())
         for plat, s in sub.groupby("platform"):
-            b = s.loc[s.per_sample_s.idxmin()]
-            row[plat] = f"{b.method} ({fmt_time(b.per_sample_s)})"
+            b = choose(s.to_dict("records"))
+            row[plat] = f"{b['method']} ({fmt_time(b['per_sample_s'])})"
             best_map.setdefault(plat, {})[f"{key[0]}|{key[1]}|{key[2]}|{int(key[3])}"] = {
-                "method": b.method,
-                "per_sample_s": float(b.per_sample_s),
+                "method": b["method"],
+                "per_sample_s": float(b["per_sample_s"]),
             }
         rows.append(row)
     recs["noise"] = best_map
@@ -167,7 +168,9 @@ def prior_section(df, plots_dir, recs):
     law_ok = ok.law_rel_fro.isna() | (ok.law_rel_fro <= tol) if "law_rel_fro" in ok else True
     ok["valid"] = path_ok & law_ok
 
-    out.append("### 2.1 Fastest valid configuration per case (time per sample; batched where faster)\n")
+    out.append("### 2.1 Recommended configuration per case: the smallest worst ratio to the best single-sample and the "
+               "best batch time (one choice serves both); near-ties (10%) go to exact solvers. Times: single sample / "
+               "per sample in a batch (one sample per CPU thread, 256 on a GPU)\n")
     ok["best_time"] = (
         ok[["per_sample_s", "per_sample_batch_s"]].min(axis=1) if "per_sample_batch_s" in ok else ok.per_sample_s
     )
@@ -177,20 +180,21 @@ def prior_section(df, plots_dir, recs):
         row["ndof"] = int(sub.ndof.max())
         for label, s in (("cpu", sub[sub.device == "cpu"]), ("gpu", sub[sub.device == "cuda"])):
             if len(s):
-                b = s.loc[s.best_time.idxmin()]
-                row[f"best {label}"] = f"{b.config} ({fmt_time(b.best_time)})"
-                row[f"{label}_s"] = b.best_time
-        if "cpu_s" in row and "gpu_s" in row:
-            row["gpu speedup"] = f"{row['cpu_s'] / row['gpu_s']:.2g}x"
+                b = choose(s.to_dict("records"))
+                row[f"{label}"] = (f"{b['solver']} ({fmt_time(b['per_sample_s'])} / "
+                                   f"{fmt_time(b.get('per_sample_batch_s'))})")
+                row[f"{label}_s"] = b.get("per_sample_batch_s")
+        if row.get("cpu_s") and row.get("gpu_s"):
+            row["gpu speedup (batches)"] = f"{row['cpu_s'] / row['gpu_s']:.2g}x"
         for plat, s in sub.groupby("platform"):
-            b = s.loc[s.best_time.idxmin()]
+            b = choose(s.to_dict("records"))
             best_map.setdefault(plat, {})[f"{key[0]}|{key[1]}|{key[2]}|{key[3]:g}|{int(key[4])}"] = {
-                "solver": b.solver,
-                "method": {**SOLVER_OPTIONS.get(b.solver, {}), "engine": b.engine},
+                "solver": b["solver"],
+                "method": {**SOLVER_OPTIONS.get(b["solver"], {}), "engine": b["engine"]},
                 "noise": b.get("noise"),
-                "device": b.device,
-                "dtype": b.dtype,
-                "per_sample_s": float(b.per_sample_s),
+                "device": b["device"],
+                "dtype": b["dtype"],
+                "per_sample_s": float(b["per_sample_s"]),
                 "per_sample_batch_s": float(b.get("per_sample_batch_s", np.nan)),
             }
         rows.append({k: v for k, v in row.items() if not k.endswith("_s")})

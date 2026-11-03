@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 import scipy.sparse as sp
 import scipy.sparse.linalg as sla
+from conftest import cuda_usable
 
 import ngsrng
 from ngsrng.boundary import BoundarySampler, boundary_covariance, boundary_dofs
@@ -432,3 +433,34 @@ def test_correction_paths_agree(mesh, monkeypatch, power):
     for r in results[1:]:
         np.testing.assert_allclose(r, results[0], rtol=1e-8, atol=1e-10 * np.abs(results[0]).max())
     assert np.all(results[0][:, sam.dofs] == data)
+
+
+@pytest.mark.skipif(not cuda_usable(), reason="needs a CUDA device")
+@pytest.mark.parametrize("power", [1, 2])
+def test_conditioning_on_the_device(mesh, monkeypatch, power):
+    """Torch rows on a GPU are conditioned there -- cuDSS with the interior block for a sparse precision, the source's
+    own pipeline otherwise -- and agree with the same rows conditioned on the host."""
+    import torch
+
+    import ngsrng.boundary as bmod
+
+    monkeypatch.setattr(bmod, "DENSE_LIFTING_VALUES", 0)  # power 2: the matrix-free path, not the small dense lifting
+    fes = h1(mesh, 2)
+    form = lambda u, v: (ngs.InnerProduct(ngs.grad(u), ngs.grad(v)) + 4.0 * u * v) * ngs.dx
+    g = ngsrng.Gaussian(fes, ngsrng.PDEPrecision(form, power=power), device="cuda", dtype="float64", seed=0)
+    rows = g.sample(5).T.contiguous()
+    sam = BoundarySampler(g, "left")
+    data = np.linspace(-1.0, 1.0, sam.n_bnd)
+    on_device = sam.condition(rows.clone(), data)
+    assert on_device.device.type == "cuda"
+    assert sam._device(rows.device)[0] == ("sparse" if power == 1 else "sigma")
+    on_host = sam.condition(rows.cpu().numpy().copy(), data)
+    np.testing.assert_allclose(on_device.cpu().numpy(), on_host, rtol=1e-8, atol=1e-10 * np.abs(on_host).max())
+    assert np.all(on_device.cpu().numpy()[:, sam.dofs] == data)
+    # through the generator, filled in place on the device
+    rng = ngsrng.default_rng(fes, seed=1, device="cuda", dtype="float64",
+                             precision=ngsrng.PDEPrecision(form, power=power))
+    buf = torch.empty((6, fes.ndof), device="cuda", dtype=torch.float64)
+    rng.normal(bnd="left", bnd_values=data, out=buf)
+    assert torch.equal(buf[:, torch.as_tensor(sam.dofs, device="cuda")].cpu(),
+                       torch.from_numpy(data).expand(6, -1))

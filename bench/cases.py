@@ -36,9 +36,12 @@ PROFILES = {
                   powers=[2], method_timeout=120, timeout_floor=30, setup_budget=30, sample_budget=2.0,
                   torch_cpu_max_ndof=0, continuum_max_ndof=5e3, posterior_obs=[10]),
     # the default: calibrates this machine's automatic choices (2D and 3D, the common orders, 1e4 and 1e5 dofs)
+    # plus one probe at 2.5e5 dofs (prior only) where an iterative solver could overtake a factorisation: 3D H1 P1,
+    # just above the built-in direct limit (2e5 in 3D)
     "calibrate": dict(_RESEARCH, suites=CALIBRATION_SUITES, targets=[1e4, 1e5], dims=[2, 3],
-                      orders={"H1": [1, 2], "L2": [1]}, powers=[2], method_timeout=300, timeout_floor=30,
-                      setup_budget=60, sample_budget=2.0, torch_cpu_max_ndof=0),
+                      orders={"H1": [1, 2], "L2": [1]}, powers=[2], probes=[(3, "H1", 1, 2.5e5)],
+                      method_timeout=300, timeout_floor=30, setup_budget=60, sample_budget=2.0,
+                      torch_cpu_max_ndof=0),
     # calibrate, extended to 1e6 dofs (large CPU/GPU boxes)
     "large": dict(_RESEARCH, suites=CALIBRATION_SUITES, targets=[1e4, 1e5, 1e6], dims=[2, 3],
                   orders={"H1": [1, 2], "L2": [1]}, powers=[2], method_timeout=900, timeout_floor=60,
@@ -65,9 +68,39 @@ ITERATIVE = {"cg-bddc", "cg-h1amg", "pcg-jacobi"}
 # Accuracy a measurement must reach to count (all calibrated arithmetic is float64): white noise reproduces M to
 # max|HH^T - M|/max|M| (or its probe estimate), priors match the float64 direct reference sample for sample.
 ACCURACY = {"noise": 1e-10, "prior": 1e-6}
-# A candidate slower than RETIRE_RATIO x the best accurate one of its group is not measured at larger sizes. Iterative
-# solvers in 3D are exempt: their cost grows more slowly than a factorisation's, so they may win at larger sizes.
+# A candidate slower than RETIRE_RATIO x the best accurate one of its group, in every mode (single samples and
+# batches), is not measured at larger sizes. Iterative solvers in 3D are exempt: their cost grows more slowly than a
+# factorisation's, so they may win at larger sizes.
 RETIRE_RATIO = 20.0
+# Samples per timed batch: one per CPU thread (the CPU engine runs one sample per thread; 4 left 32 cores idle and
+# understated batch throughput), and 256 on a GPU (realistic batches; 32 is a single cuDSS block).
+GPU_BATCH = 256
+# One recommendation serves single samples and batches alike, so candidates are ranked by their worst ratio to the
+# best single-sample and the best batch time. Candidates within TIE of the best score are tied, and a tie goes to an
+# exact solver (in the first calibration, batched PCG won a 4% batch tie while 11x slower for single samples).
+MODES = ("per_sample_s", "per_sample_batch_s")
+TIE = 1.10
+
+
+def mode_ratios(recs):
+    """Each record of one case and platform with its time ratio to the best one, per mode it measured."""
+    def val(r, k):
+        v = r.get(k)
+        return v if isinstance(v, (int, float)) and v == v and v > 0 else None
+
+    best = {k: min((val(r, k) for r in recs if val(r, k)), default=None) for k in MODES}
+    return [(r, {k: val(r, k) / best[k] for k in MODES if best[k] and val(r, k)}) for r in recs]
+
+
+def choose(recs):
+    """The record to recommend among the accurate records of one case and platform (see TIE)."""
+    scored = sorted(((max(q.values(), default=float("inf")), i, r) for i, (r, q) in enumerate(mode_ratios(recs))),
+                    key=lambda x: (x[0], x[1]))
+    top = scored[0][0]
+    for score, _, r in scored:
+        if score <= TIE * top and r.get("solver") not in ITERATIVE:
+            return r
+    return scored[0][2]
 
 # Posterior (linear Gaussian observations): m local averages of the prior field. The exact low-rank update applied
 # in FE space ("fe-space") or to the white noise ("noise-space"), its randomised rank-32 version by randomised
@@ -226,6 +259,21 @@ def engines(devices, torch_cpu: bool):
     return out
 
 
+def prior_tasks(d, k, p, t, cfg, devices):
+    tasks = []
+    for power in cfg["powers"]:
+        for name, opts in CPU_SOLVERS.items():
+            if name.startswith("direct") and d == 3 and t > DIRECT_3D_LIMIT:
+                continue
+            if name == "cg-h1amg" and k != "H1":
+                continue
+            tasks.append(Task("prior", d, k, p, t, "ngsolve", "cpu", "float64", "auto", name, power, opts))
+        if "cuda" in devices:
+            for name, opts in GPU_SOLVERS.items():
+                tasks.append(Task("prior", d, k, p, t, "torch", "cuda", "float64", "auto", name, power, opts))
+    return tasks
+
+
 def build_groups(profile: str, suites, devices, max_ndof=None):
     cfg = PROFILES[profile]
     targets = [t for t in cfg["targets"] if max_ndof is None or t <= max_ndof]
@@ -241,19 +289,10 @@ def build_groups(profile: str, suites, devices, max_ndof=None):
     if "prior" in suites:
         for d, k, p in spaces:
             for t in targets:
-                tasks = []
-                for power in cfg["powers"]:
-                    for name, opts in CPU_SOLVERS.items():
-                        if name.startswith("direct") and d == 3 and t > DIRECT_3D_LIMIT:
-                            continue
-                        if name == "cg-h1amg" and k != "H1":
-                            continue
-                        tasks.append(Task("prior", d, k, p, t, "ngsolve", "cpu", "float64", "auto", name, power, opts))
-                    if "cuda" in devices:
-                        for name, opts in GPU_SOLVERS.items():
-                            tasks.append(Task("prior", d, k, p, t, "torch", "cuda", "float64", "auto", name, power,
-                                              opts))
-                groups.append(Group("prior", d, k, p, t, tasks))
+                groups.append(Group("prior", d, k, p, t, prior_tasks(d, k, p, t, cfg, devices)))
+        for d, k, p, t in cfg.get("probes", []):
+            if max_ndof is None or t <= max_ndof:
+                groups.append(Group("prior", d, k, p, t, prior_tasks(d, k, p, t, cfg, devices)))
     if "posterior" in suites:
         pspaces = [(d, k, p) for d in cfg["dims"] for k in ("H1", "L2") for p in cfg["posterior_orders"][k]]
         for d, k, p in pspaces:

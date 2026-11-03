@@ -313,10 +313,10 @@ uv pip install -e /path/to/ngsplot     # optional: local package for the tutoria
 
 ## Calibration (one command)
 ```bash
-python bench/calibrate.py                  # tests, validation, calibration (~30 min on a GPU box)
-python bench/calibrate.py --quick          # a few minutes: harness check
+python bench/calibrate.py                  # tests, validation, calibration, boundary and GPU checks (~30 min)
+python bench/calibrate.py --skip boundary,throughput   # tests, validation and calibration only (~20 min)
+python bench/calibrate.py --quick          # a few minutes: harness check (installs no tuning)
 python bench/calibrate.py --large          # calibrate up to 1e6 dofs (an hour or more)
-python bench/calibrate.py --boundary --throughput   # also boundary sampling and GPU batch throughput
 python bench/calibrate.py --resume results/calibrate/<run>   # continue an interrupted run
 python bench/run_all.py --install          # the calibration step alone
 python bench/run_all.py --profile research # posteriors, distributions, low rank, ...: research data, hours
@@ -324,7 +324,10 @@ python bench/run_all.py --profile research # posteriors, distributions, low rank
 - **Purpose:** choose this machine's white-noise sampler and linear solver, and reject the candidates that cannot win.
   The calibration measures only exact samplers (diagonal, local Gram, quadrature) and the solvers that can win (NGSolve
   sparse Cholesky and UMFPACK, CG with BDDC or h1amg, cuDSS and batched PCG on a GPU), in 2D and 3D at 1e4 and 1e5
-  dofs (1e6 with `--large`), on every available device.
+  dofs plus 3D P1 at 2.5e5 (1e6 with `--large`), on every available device. One recommendation serves single draws
+  and batches (one sample per CPU thread, 256 on a GPU), so candidates are ranked by their worst ratio to the best
+  time in either mode, and near-ties go to exact solvers. On the A100 box (2026-11-03) cuDSS was 16-94x faster than
+  the best CPU solver at 1e5 dofs.
 - **Accuracy first:** every measurement is checked, also at large sizes: white noise must reproduce the mass matrix
   to 1e-10, priors must match a float64 direct reference sample for sample to 1e-6. A candidate is rejected for
   larger sizes once it is inaccurate, fails, exceeds its time budget, or is 20x slower than the best accurate one on

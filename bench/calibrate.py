@@ -1,9 +1,9 @@
 """Calibrate a machine for ngsrng in one command: tests, validation, solver/noise calibration, with logs and a summary.
 
-    python bench/calibrate.py                     # tests, validation, calibration (~30 min on a GPU box)
-    python bench/calibrate.py --quick             # a few minutes: core tests, quick validation, smoke calibration
+    python bench/calibrate.py                     # everything below, ~30 min on the A100 box (estimate)
+    python bench/calibrate.py --quick             # a few minutes: harness check (installs no tuning)
     python bench/calibrate.py --large             # calibration up to 1e6 dofs (large CPU/GPU boxes, an hour or more)
-    python bench/calibrate.py --boundary --throughput    # also the boundary-sampling and GPU-throughput benchmarks
+    python bench/calibrate.py --skip boundary,throughput   # tests, validation and calibration only (~20 min)
     python bench/calibrate.py --resume results/calibrate/<run>   # rerun only the steps that did not finish
 
 Steps, in order:
@@ -12,9 +12,11 @@ Steps, in order:
   tests        the pytest suite, CUDA variants included when a device is usable (junit.xml)
   calibrate    bench/run_all.py --install: measures the white-noise samplers and solvers that can win on this machine,
                rejects the inaccurate, failing and far slower ones, and installs the winners as the active tuning
-               (python -m ngsrng.tuning show)
-  boundary     (--boundary) bench/boundary_scaling.py: restricted and conditioned boundary draws
-  throughput   (--throughput, GPU) bench/gpu_batch.py --quick: device checks and in-place batch throughput
+               (python -m ngsrng.tuning show); ~15 min on the A100 box
+  boundary     bench/boundary_scaling.py --profile calibrate: the cost of restricted and conditioned boundary draws
+               against plain ones, on the CPU and the GPU (~5 min)
+  throughput   (GPU only) bench/gpu_batch.py --quick: device checks, fractional powers (accuracy, 1e6 dofs, float32
+               arithmetic), in-place batch throughput and the cost of float64 arithmetic (~5 min)
 
 Each step runs as a subprocess with a time limit (enforced also while it prints nothing). Its output goes to the
 console and to logs/<step>.log, its status and duration to manifest.json, so an interrupted or failed run is continued
@@ -74,7 +76,8 @@ def steps(cfg, run):
     out = os.path.join(run, "out")
     cal_dir = os.path.join(out, "calibrate")
     profile = "smoke" if cfg["quick"] else "large" if cfg["large"] else "calibrate"
-    calibrate = [PY, "bench/run_all.py", "--profile", profile, "--install"]
+    # a quick run checks the harness at 2e3 dofs: its measurements are no tuning for this machine
+    calibrate = [PY, "bench/run_all.py", "--profile", profile, *([] if cfg["quick"] else ["--install"])]
     calibrate += (["--resume", cal_dir] if os.path.exists(os.path.join(cal_dir, "config.json"))
                   else ["--out", cal_dir])
     tests = ["tests/test_gaussian.py", "tests/test_boundary.py", "tests/test_inplace.py"] if cfg["quick"] \
@@ -87,12 +90,11 @@ def steps(cfg, run):
         ("calibrate", calibrate, (30 if cfg["quick"] else 360 if cfg["large"] else 120) * MIN,
          "out/calibrate/report.md"),
     ]
-    if cfg["boundary"]:
-        plan.append(("boundary", [PY, "bench/boundary_scaling.py", "--profile", "quick" if cfg["quick"] else "standard",
-                                  "--out-dir", os.path.join(out, "boundary")], 60 * MIN, "out/boundary/report.md"))
-    if cfg["throughput"]:
-        plan.append(("throughput", [PY, "bench/gpu_batch.py", "--quick", "--out-dir", os.path.join(out, "throughput")],
-                     60 * MIN, "out/throughput/report.md"))
+    bprofile = "quick" if cfg["quick"] else "standard" if cfg["large"] else "calibrate"
+    plan.append(("boundary", [PY, "bench/boundary_scaling.py", "--profile", bprofile,
+                              "--out-dir", os.path.join(out, "boundary")], 60 * MIN, "out/boundary/report.md"))
+    plan.append(("throughput", [PY, "bench/gpu_batch.py", "--quick", "--out-dir", os.path.join(out, "throughput")],
+                 60 * MIN, "out/throughput/report.md"))
     return plan
 
 
@@ -158,7 +160,8 @@ def summary(run, manifest):
     if env:
         lines.append("\n## Environment\n\n```\n" + json.dumps(env, indent=1) + "\n```")
     for name, pattern in (("tests", ("passed", "failed", "error")), ("validate", ("ALL CHECKS", "FAILED:")),
-                          ("calibrate", ("finished in", "installed tuning")), ("throughput", ("checks:",))):
+                          ("calibrate", ("finished in", "installed tuning")),
+                          ("throughput", ("checks:", "fractional checks:"))):
         path = os.path.join(run, "logs", f"{name}.log")
         if os.path.exists(path):
             hits = [ln for ln in open(path) if any(p in ln for p in pattern)][-3:]
@@ -178,8 +181,6 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--quick", action="store_true", help="core tests, quick validation, smoke calibration")
     ap.add_argument("--large", action="store_true", help="calibrate up to 1e6 dofs")
-    ap.add_argument("--boundary", action="store_true", help="also run bench/boundary_scaling.py")
-    ap.add_argument("--throughput", action="store_true", help="also run bench/gpu_batch.py --quick (GPU)")
     ap.add_argument("--steps", default=None, help="comma-separated subset of the steps")
     ap.add_argument("--skip", default="", help="comma-separated steps to leave out")
     ap.add_argument("--resume", default=None, help="run directory to continue: steps with status ok are skipped")
@@ -190,7 +191,7 @@ def main():
         run = os.path.abspath(args.resume)
         manifest = json.load(open(os.path.join(run, "manifest.json")))
     else:
-        cfg = {k: getattr(args, k) for k in ("quick", "large", "boundary", "throughput")}
+        cfg = {k: getattr(args, k) for k in ("quick", "large")}
         stamp = datetime.now().strftime("%Y%m%d-%H%M")
         tag = f"{socket.gethostname()}_{stamp}{'_quick' if args.quick else '_large' if args.large else ''}"
         run = os.path.join(ROOT, "results", "calibrate", tag)
@@ -216,6 +217,9 @@ def main():
 
     for name, cmd, timeout, report in plan:
         if name not in chosen:
+            continue
+        if name == "throughput" and manifest.get("env") and not manifest["env"].get("cuda_usable"):
+            print("[calibrate] throughput: no CUDA device, skipped", flush=True)
             continue
         if manifest["steps"].get(name, {}).get("status") == "ok":
             print(f"[calibrate] {name}: already ok, skipped", flush=True)
