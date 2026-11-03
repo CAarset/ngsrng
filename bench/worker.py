@@ -145,15 +145,15 @@ def run_noise(task: Task, space: SpaceInfo, rec: dict):
         rec.update(rng_s=rng1, apply_s=app1, batch=batch, per_sample_batch_s=(rngb + appb) / batch)
         del eta1, etab
     rec["per_sample_s"] = rec["rng_s"] + rec["apply_s"]
-    if space.nfree <= EXACT_LIMIT * 2:
-        # Full factor only when cheap: it costs nrand applications (each a degree-sized polynomial for Chebyshev).
-        if smp.nrand <= 2000 and not task.method.startswith("chebyshev"):
-            h = noise_factor(smp, task, space, rec)
-            m = space.mass_free.toarray()
-            err = float(np.abs(h @ h.T - m).max() / np.abs(m).max())
-        else:
-            err = noise_probe_error(smp, task, space, rec)
-        rec["cov_rel_err"] = max(err, rec.get("engine_mismatch", 0.0))
+    # Accuracy at every size: the full factor when cheap (nrand applications), else random probes through the
+    # sampler's exact adjoint. A fast sampler of the wrong law must not be a candidate.
+    if space.nfree <= EXACT_LIMIT * 2 and smp.nrand <= 2000 and not task.method.startswith("chebyshev"):
+        h = noise_factor(smp, task, space, rec)
+        m = space.mass_free.toarray()
+        err = float(np.abs(h @ h.T - m).max() / np.abs(m).max())
+    else:
+        err = noise_probe_error(smp, task, space, rec)
+    rec["cov_rel_err"] = max(err, rec.get("engine_mismatch", 0.0))
 
 
 def noise_probe_error(smp, task, space, rec, nprobe=8):
@@ -233,29 +233,11 @@ class Reference:
         return self.cache[power][1], self.cache[power][2]
 
 
-def apply_only_spec(fes, kind, device, dtype):
-    """The power-2 prior as an apply-only precision c -> K M^-1 K c (sparse K, a mass solver)."""
-    from ngsrng.backend import sparse_to_torch
-    from ngsrng.solvers import CudssDirect, NGSolveDirect
-
-    space = SpaceInfo(fes)
-    dev, wd = torch.device(device), getattr(torch, dtype)
-    k = sparse_to_torch(space.assemble_free(prior_spec(fes, kind, 2).form), dev, wd)
-    if device == "cuda":
-        minv = CudssDirect(space.mass_free, dev, wd).apply
-    else:
-        minv = NGSolveDirect(space, ngsrng.space.mass_form).apply
-    return ngsrng.OperatorPrecision(lambda c: k @ minv(k @ c.to(dev, wd)), tol=1e-6 if dtype == "float32" else 1e-8)
-
-
 def run_prior(task: Task, fes, rec: dict, ref: Reference):
     method = {**task.options, "engine": task.engine}
     tol = 1e-6 if task.dtype == "float32" else 1e-8
     t = time.perf_counter()
-    if task.solver == "apply-only":
-        spec = apply_only_spec(fes, task.kind, task.device, task.dtype)
-    else:
-        spec = prior_spec(fes, task.kind, task.power)
+    spec = prior_spec(fes, task.kind, task.power)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         g = ngsrng.Gaussian(
@@ -268,7 +250,8 @@ def run_prior(task: Task, fes, rec: dict, ref: Reference):
             seed=0,
         )
     rec["setup_s"] = time.perf_counter() - t
-    rec.update(nrand=g.nrand, noise=g.plan.get("noise"), solver_name=g.plan.get("solver"), tol=tol)
+    rec.update(nrand=g.nrand, noise=g.plan.get("noise"), solver_name=g.plan.get("solver"), tol=tol,
+               work_dtype=str(g._work_dtype).replace("torch.", ""))
     sync = sync_for(task.device)
     rec["per_sample_s"], _ = timeit(lambda: g.sample(1), sync, min_time=0.5, max_reps=5)
     batch = 4 if task.engine == "ngsolve" else int(task.options.get("batch", 32))

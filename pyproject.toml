@@ -13,7 +13,6 @@ dependencies = ["ngsolve>=6.2", "numpy", "scipy", "torch", "threadpoolctl"]
 bench = ["pandas", "matplotlib", "tabulate"]
 test = ["pytest"]
 gpu = ["nvmath-python[cu13]"]   # cuDSS sparse direct solver on CUDA
-mkl = ["mkl"]                   # enables NGSolve's PARDISO direct solver
 examples = ["matplotlib", "jupyter", "anywidget"]  # examples/demo.ipynb (and the local ngsplot package)
 
 [tool.setuptools.packages.find]

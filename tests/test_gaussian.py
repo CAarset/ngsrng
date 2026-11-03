@@ -207,6 +207,47 @@ def test_method_keys_and_names_are_validated():
         ngsrng.default_rng(fes, correlation=0.3, method="table")
     g = ngsrng.Gaussian(fes, ngsrng.matern(3.0), method={"engine": "auto", "solver": "auto"})
     assert g.engine == "ngsolve"
+    with pytest.raises(ValueError, match="unknown work_dtype"):
+        ngsrng.Gaussian(fes, ngsrng.matern(3.0), method={"work_dtype": "float16"})
+    # multigrid needs a mesh hierarchy (it crashed the process on a generated mesh); pardiso returned garbage
+    with pytest.raises(ValueError, match="unknown precond 'multigrid'"):
+        ngsrng.Gaussian(fes, ngsrng.matern(3.0), method={"solver": "cg", "precond": "multigrid"})
+    with pytest.raises(ValueError, match="unknown inverse 'pardiso'"):
+        ngsrng.Gaussian(fes, ngsrng.matern(3.0), method={"solver": "direct", "inverse": "pardiso"})
+
+
+@pytest.mark.parametrize("precond", ["bddc", "h1amg", "local"])
+def test_iterative_batches_match_direct(precond):
+    """A threaded batch through CG equals the direct solve: concurrent applications of one BDDC preconditioner
+    corrupted the samples (relative error 0.1), so pipelines with thread-unsafe solvers run samples one at a time."""
+    fes = ngs.H1(_square(0.1), order=2)
+    ref = ngsrng.Gaussian(fes, ngsrng.matern(5.0, 2), method={"solver": "direct"}, dtype="float64")
+    eta = torch.randn(ref.nrand, 8, generator=torch.Generator().manual_seed(1), dtype=torch.float64)
+    c0 = ref.apply(eta).numpy()
+    g = ngsrng.Gaussian(fes, ngsrng.matern(5.0, 2), method={"solver": "cg", "precond": precond}, dtype="float64",
+                        tol=1e-12)
+    assert g._threadsafe == (precond == "h1amg")
+    assert np.abs(g.apply(eta).numpy() - c0).max() < 1e-8 * np.abs(c0).max()
+
+
+def test_float64_arithmetic_by_default():
+    """Every engine computes in float64 and casts the output: float32 solves lost the samples on fine meshes (GPU
+    benchmark). float32 arithmetic is an opt-in of the GPU engine; on the CPU it has no effect and no warning."""
+    fes = ngs.H1(_square(0.4), order=1)
+    g = ngsrng.Gaussian(fes, ngsrng.matern(3.0), method={"engine": "torch"})
+    assert g.dtype == torch.float32 and g._work_dtype == torch.float64
+    assert g._platform == "cpu-torch"
+    assert ngsrng.tuning.platform_of("torch", "cuda", torch.float64) == "cuda-f64"
+    assert ngsrng.tuning.platform_of("torch", "cuda", "float32") == "cuda-f32"
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        g = ngsrng.Gaussian(fes, ngsrng.matern(3.0), method={"work_dtype": "float32"})
+    assert g._work_dtype == torch.float64
+    if cuda_usable():
+        with pytest.warns(UserWarning, match="single precision"):
+            g = ngsrng.Gaussian(fes, ngsrng.matern(3.0), device="cuda", method={"work_dtype": "float32"})
+        assert g._work_dtype == torch.float32 and g._platform == "cuda-f32"
+        assert ngsrng.Gaussian(fes, ngsrng.matern(3.0), device="cuda")._platform == "cuda-f64"
 
 
 @pytest.mark.parametrize("noise,expected", [("lumped", "relative covariance error"), ("chebyshev", "1e-08")])

@@ -24,7 +24,7 @@ from .backend import (
     sparse_to_torch,
 )
 from .inplace import InPlace, as_tensor, chunks, default_work_values, write
-from .solvers import CudssDirect, NGSolveCG, NGSolveDirect, TorchPCG, cudss_available
+from .solvers import INVERSES, PRECONDITIONERS, CudssDirect, NGSolveCG, NGSolveDirect, TorchPCG, cudss_available
 from .space import SpaceInfo, mass_form
 from .specs import AssembledPrecision, OperatorPrecision, PDEPrecision
 
@@ -44,10 +44,13 @@ METHOD_KEYS = {
     "form_noise": FORM_NOISE_METHODS,
     "solver": SOLVERS,
     "engine": ENGINES,
+    # Arithmetic of the torch engine. float32 solves lose accuracy like cond(K) * 6e-8: the GPU benchmark measured
+    # pathwise errors of 1e-4 at 5k dofs and O(1) on fine meshes, so float64 is the default and float32 an opt-in.
+    "work_dtype": ("float64", "float32"),
     "tuning": None,  # False, a recommendations.json path, or a ngsrng.tuning.Tuning
     "noise_tol": None,  # chebyshev noise
-    "inverse": None,  # NGSolve direct solver name (sparsecholesky, umfpack, pardiso)
-    "precond": None,  # NGSolve preconditioner name (bddc, h1amg, multigrid, local)
+    "inverse": INVERSES,  # NGSolve direct solvers (pardiso returned garbage in the benchmark)
+    "precond": PRECONDITIONERS,  # NGSolve preconditioners (multigrid needs a mesh hierarchy)
     "cudss_width": None,
     "threads": None,
     "cpu_blas_threads": None,
@@ -82,16 +85,18 @@ class Gaussian(InPlace):
     mean : GridFunction or CoefficientFunction (interpolated with ``Set``), default 0
     method : optional overrides, e.g. {"noise": "quadrature", "solver": "cg"} (unknown keys or names raise; see
         ``METHOD_KEYS``). "noise" selects the white-noise sampler (even powers; "chebyshev" and "lumped" are
-        approximate), "form_noise" the route for odd powers and assembled precisions ("local-gram": precision-shaped
-        noise, exact; "rational": white noise and a rational approximation of the square root, relative accuracy
-        1e-7, used automatically when the form couples elements; "dense-cholesky": exact, O(n^2) memory, only on
-        request), "solver" one of "direct" | "cg" | "cudss" | "torch-pcg" (with "inverse" / "precond"
-        naming the NGSolve direct solver / preconditioner), "engine" one of "ngsolve" (CPU default) | "torch" (CUDA
-        default; on CPU only useful for testing). Also "tuning" (False disables the benchmark tuning, or a
-        recommendations.json path), "noise_tol" (chebyshev noise), "cudss_width", "threads" (CPU batches) and
-        "cpu_blas_threads".
-    device, dtype : torch device ("cpu", "cuda", "auto") and output dtype (default float32; the CPU engine computes
-        in float64 and casts)
+        approximate: lumped noise has the lumped mass matrix as covariance, off by O(1) for H1 P1), "form_noise"
+        the route for odd powers and assembled precisions ("local-gram": precision-shaped noise, exact; "rational":
+        white noise and a rational approximation of the square root, relative accuracy 1e-7, used automatically
+        when the form couples elements; "dense-cholesky": exact, O(n^2) memory, only on request), "solver" one of
+        "direct" | "cg" | "cudss" | "torch-pcg" (with "inverse" / "precond" naming the NGSolve direct solver /
+        preconditioner), "engine" one of "ngsolve" (CPU default) | "torch" (CUDA
+        default; on CPU only useful for testing), "work_dtype" ("float64", the default, or "float32": the torch
+        engine's arithmetic; float32 solves are fast but inaccurate on fine meshes). Also "tuning" (False disables
+        the benchmark tuning, or a recommendations.json path), "noise_tol" (chebyshev noise), "cudss_width",
+        "threads" (CPU batches) and "cpu_blas_threads".
+    device, dtype : torch device ("cpu", "cuda", "auto") and output dtype (default float32). Every engine computes in
+        float64 and casts at the end, unless method={"work_dtype": "float32"}.
     tol : relative tolerance for iterative solvers
     """
 
@@ -104,6 +109,10 @@ class Gaussian(InPlace):
         self.tuning = None if tun is False else (tn.Tuning.load(tun) if isinstance(tun, str) else tun or tn.active())
         self.plan = {"space": self.space.describe()}
         self.device = self._choose_device(device)
+        if self._work_dtype == torch.float32:
+            warnings.warn("work_dtype='float32': solves in single precision lose accuracy like cond(K) * 6e-8 "
+                          "(pathwise errors from 1e-4 on small meshes to O(1) on fine ones); check against float64",
+                          stacklevel=2)
         self.work_values = default_work_values(self.device)  # chunk size of in-place fills on the torch engine
         engine = self.method.get("engine", "auto")
         self.engine = ("torch" if self.device.type == "cuda" else "ngsolve") if engine == "auto" else engine
@@ -133,7 +142,7 @@ class Gaussian(InPlace):
 
     @property
     def _platform(self):
-        return tn.platform_of(self.engine, self.device.type, self.dtype)
+        return tn.platform_of(self.engine, self.device.type, self._work_dtype)
 
     def _power(self):
         return self.spec.power if isinstance(self.spec, PDEPrecision) else None
@@ -150,7 +159,7 @@ class Gaussian(InPlace):
         dev = resolve_device("auto")
         if dev.type == "cuda" and self.tuning is not None:
             cpu = self._tuned_prior("cpu-ngsolve")
-            gpu = self._tuned_prior(tn.platform_of("torch", "cuda", self.dtype))
+            gpu = self._tuned_prior(tn.platform_of("torch", "cuda", self.method.get("work_dtype", "float64")))
             if cpu and gpu and cpu["per_sample_s"] < gpu["per_sample_s"]:
                 dev = resolve_device("cpu")
             self.plan["device_choice"] = "tuning" if cpu and gpu else "first available"
@@ -190,14 +199,25 @@ class Gaussian(InPlace):
         mass_inv = self._solver(mass_form)
         k, m = s.assemble_free(spec.form), s.mass_free
 
-        def via(solver):
-            return lambda v: (
-                solver.apply(torch.from_numpy(v).to(self._solver_device, self._work_dtype)).double().cpu().numpy()
-            )
+        # The spectral interval spans cond(M^-1 K) ~ h^-2: inverse iteration needs float64 solves (in float32 the
+        # factorisation of a fine 1D mesh broke down and the estimate came out NaN). Single-precision engines get
+        # temporary float64 solvers, released before the shifted ones are built.
+        f64 = self._work_dtype == torch.float64
+        est_k = self.solver if f64 else self._solver(spec.form, dtype=torch.float64)
+        est_m = mass_inv if f64 else self._solver(mass_form, dtype=torch.float64)
 
-        lmin, lmax = spectral_interval(via(self.solver), via(mass_inv), k, m)
+        def via(solver):
+            return lambda v: solver.apply(torch.from_numpy(v).to(self._solver_device, torch.float64)).double().cpu() \
+                .numpy()
+
+        lmin, lmax = spectral_interval(via(est_k), via(est_m), k, m)
+        if not f64:
+            for sv in (est_k, est_m):
+                getattr(sv, "free", lambda: None)()
+            del est_k, est_m
         rational = fractional_power(theta, lmin, lmax, rtol=spec.rtol)
-        shifted = [self._solver(_shifted_form(spec.form, t)) for t in rational.shifts]
+        width = self._shifted_width(rational.degree)
+        shifted = [self._solver(_shifted_form(spec.form, t), width=width) for t in rational.shifts]
         self.first = RationalSolver(rational, shifted, mass_inv)
         self.n_mass_steps = n
         self.plan["structure"] = (
@@ -205,6 +225,20 @@ class Gaussian(InPlace):
             f"shifted solves, rel. error {rational.rel_error:.1e} on [{lmin:.3g}, {lmax:.3g}]) + {n} integer "
             "solve(s) per sample"
         )
+
+    def _shifted_width(self, nshift):
+        """cuDSS right-hand-side width for the ``nshift`` shifted solvers of a fractional power: every solver keeps
+        width x n device buffers, so the width shrinks until all of them fit in a quarter of the free device memory
+        (a 1e6-dof 1D problem with ~40 shifts ran out of 40 GB at width 32 in float64)."""
+        width = int(self.method.get("cudss_width", 32))
+        if self.engine != "torch" or self.device.type != "cuda":
+            return width
+        free, _ = torch.cuda.mem_get_info(self.device)
+        per_column = 2 * self.space.nfree * torch.empty(0, dtype=self._work_dtype).element_size()
+        fit = int(0.25 * free // max(1, nshift * per_column))
+        if fit < width:
+            self.plan["shifted_width"] = f"{max(1, fit)} (device memory)"
+        return max(1, min(width, fit))
 
     def _build_operator(self, spec: OperatorPrecision):
         """Apply-only precision: c = r(M^-1 Q) M^-1 z, r ~ lambda^-1/2, all shifts in one multi-shift PCG run."""
@@ -273,7 +307,10 @@ class Gaussian(InPlace):
 
     @property
     def _work_dtype(self):
-        return self.dtype if self.device.type == "cuda" else torch.float64
+        """Arithmetic of the pipeline: float64, unless the torch engine on a GPU was asked for float32."""
+        if self.device.type == "cuda" and self.method.get("work_dtype") == "float32":
+            return torch.float32
+        return torch.float64
 
     def _mass_noise(self):
         s, choice = self.space, self.method.get("noise", "auto")
@@ -330,11 +367,16 @@ class Gaussian(InPlace):
             self.plan["form_noise_choice"] = f"rational ({err})"
             return None
 
-    def _solver(self, form):
+    def _solver(self, form, dtype=None, width=None):
+        """Solver for the form's matrix on the free dofs; ``dtype`` overrides the work dtype of the torch engine (the
+        CPU engine is float64 anyway) and ``width`` the cuDSS right-hand-side width."""
         s, choice = self.space, self.method.get("solver", "auto")
+        dtype = self._work_dtype if dtype is None else dtype
         rec = self._tuned_prior(self._platform) if choice == "auto" else None
-        if rec and rec["method"].get("engine", self.engine) == self.engine and rec["method"].get("solver") in SOLVERS:
-            m = rec["method"]
+        m = rec["method"] if rec else {}
+        # tables of older versions may name a removed solver (pardiso, multigrid): such entries are ignored
+        if rec and m.get("engine", self.engine) == self.engine and m.get("solver") in SOLVERS \
+                and m.get("precond", "bddc") in PRECONDITIONERS and m.get("inverse", "umfpack") in INVERSES:
             # Sparse direct factorisations in 3D are only trusted near the measured sizes (fill-in grows fast).
             if not (m["solver"] == "direct" and s.dim == 3 and s.nfree > max(DIRECT_LIMIT[3], 2 * rec["_target"])):
                 choice = m["solver"]
@@ -353,20 +395,22 @@ class Gaussian(InPlace):
             default = "umfpack" if s.dim == 1 else "sparsecholesky"
             return NGSolveDirect(s, form, inverse=self.method.get("inverse", default))
         if choice == "cg":
-            pre = self.method.get("precond", "h1amg" if (s.kind == "H1" and s.order == 1) else "bddc")
+            # h1amg for every H1 order: accurate, as fast as BDDC for p = 2, 3, and thread-safe (concurrent BDDC
+            # applications corrupt each other, so BDDC pipelines draw their samples one at a time); L2 needs BDDC
+            pre = self.method.get("precond", "h1amg" if s.kind == "H1" else "bddc")
             return NGSolveCG(s, form, precond=pre, tol=self.tol)
         if choice == "cudss":
             if self.device.type != "cuda":
                 raise ValueError("cudss needs a CUDA device")
             # right-hand sides per cuDSS call (each width keeps its own factorisation); larger widths amortise the
             # call overhead of big batches
-            return CudssDirect(s.assemble_free(form), self.device, self._work_dtype,
-                               width=int(self.method.get("cudss_width", 32)))
+            return CudssDirect(s.assemble_free(form), self.device, dtype,
+                               width=int(width or self.method.get("cudss_width", 32)))
         if choice == "torch-pcg":
             if self.engine != "torch":
                 raise ValueError("torch-pcg needs the torch engine")
-            tol = max(self.tol, 1e-6 if self._work_dtype == torch.float32 else 1e-14)
-            return TorchPCG(s.assemble_free(form), self.device, self._work_dtype, tol=tol)
+            tol = max(self.tol, 1e-6 if dtype == torch.float32 else 1e-14)
+            return TorchPCG(s.assemble_free(form), self.device, dtype, tol=tol)
         raise ValueError(f"unknown solver {choice!r}")
 
     def _build_mean(self, mean):
@@ -413,6 +457,12 @@ class Gaussian(InPlace):
             return max(1, int(self.method["threads"]))
         return available_threads() if self.space.ndof >= 1000 else 1
 
+    @property
+    def _threadsafe(self) -> bool:
+        """Whether samples may run in parallel threads: every solver of the pipeline must allow concurrent solves
+        (BDDC-preconditioned CG does not)."""
+        return all(getattr(sv, "threadsafe", True) for sv in (self.first, self.solver))
+
     def _ngs_rows(self, n, out, *, eta=None, free_only=False, evaluate=None, add_mean=True, transform=None):
         """CPU engine: n samples, row k of ``out`` (n x width, float32 or float64, any strides) for sample k.
 
@@ -448,9 +498,9 @@ class Gaussian(InPlace):
                     out[k] = r[free] if free_only else r
 
         with numpy_blas_threads(self._cpu_blas_threads):
-            if n == 1:
-                with ngs.TaskManager():  # a single sample: NGSolve's task parallelism inside (agrees with batches
-                    work(0, n)           # to rounding: its parallel kernels sum in a different order)
+            if n == 1 or not self._threadsafe:
+                with ngs.TaskManager():  # one sample at a time: NGSolve's task parallelism inside (agrees with
+                    work(0, n)           # threaded batches to rounding: its parallel kernels sum in another order)
             else:
                 parallel_ranges(n, work, self._threads)  # any thread count gives identical results
         return out

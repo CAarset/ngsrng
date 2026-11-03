@@ -26,7 +26,8 @@ def default_path() -> str:
     return os.path.join(cache, "ngsrng", "recommendations.json")
 
 
-def platform_of(engine: str, device: str, dtype: str) -> str:
+def platform_of(engine: str, device: str, dtype) -> str:
+    """Tuning table of a Gaussian; ``dtype`` is its arithmetic (work) dtype, float64 unless opted out on a GPU."""
     if engine == "ngsolve":
         return "cpu-ngsolve"
     if device == "cpu":

@@ -42,6 +42,15 @@ from .space import SpaceInfo, coefficient_vector
 # application per free dof) when nothing cheaper is known.
 EXACT_LIMIT = 4000
 CHUNK = 256
+# Values per dense temporary when Sigma is applied to many columns (256 MB in float64). Applying Sigma = L L^T to
+# CHUNK columns at once made noise-space blocks of nrand x 256 values, several GB for 1e5-1e6 dofs.
+BLOCK_VALUES = 2**25
+
+
+def block_columns(*rows) -> int:
+    """Columns per block when applying Sigma (or L, L^T) to many vectors: at most CHUNK and at most BLOCK_VALUES
+    values in the tallest (rows x columns) temporary, but at least 32, so that threaded solves stay busy."""
+    return int(max(32, min(CHUNK, BLOCK_VALUES // max(1, *rows))))
 
 
 def _np(x) -> np.ndarray:
@@ -128,11 +137,16 @@ def as_covariance(source, fes=None, convention=None) -> CovarianceSource:
     if hasattr(source, "apply") and hasattr(source, "apply_t") and hasattr(source, "space"):
         s = source.space
 
+        step = block_columns(source.nrand, s.nfree)
+
         def factor(e):
-            return np.hstack([_np(source.apply(_t(e[:, i:i + CHUNK]))) for i in range(0, e.shape[1], CHUNK)])
+            return np.hstack([_np(source.apply(_t(e[:, i:i + step]))) for i in range(0, e.shape[1], step)])
 
         def factor_t(y):
-            return np.hstack([_np(source.apply_t(_t(y[:, i:i + CHUNK]))) for i in range(0, y.shape[1], CHUNK)])
+            return np.hstack([_np(source.apply_t(_t(y[:, i:i + step]))) for i in range(0, y.shape[1], step)])
+
+        def sigma(y):  # block by block: never the whole nrand x k noise-space intermediate
+            return np.hstack([factor(factor_t(y[:, i:i + step])) for i in range(0, y.shape[1], step)])
 
         update = None
         if isinstance(source, MatheronPosterior):
@@ -141,7 +155,7 @@ def as_covariance(source, fes=None, convention=None) -> CovarianceSource:
                 return as_covariance(source.prior), source.bmat, d
         elif getattr(source, "_prior", None) is not None and hasattr(source, "_maps"):
             update = _derived_update(source)
-        return CovarianceSource(s, lambda y: factor(factor_t(y)), l=factor, lt=factor_t, nrand=source.nrand,
+        return CovarianceSource(s, sigma, l=factor, lt=factor_t, nrand=source.nrand,
                                 update=update,
                                 mean=source.mean, owner=source, label=type(source).__name__)
     if fes is None:
@@ -178,10 +192,9 @@ def _derived_update(g):
 
 
 def _sigma(g, y):
-    out = []
-    for i in range(0, y.shape[1], CHUNK):
-        out.append(_np(g.apply(g.apply_t(_t(y[:, i:i + CHUNK])).to(torch.float64))))
-    return np.hstack(out)
+    step = block_columns(g.nrand, g.space.nfree)
+    return np.hstack([_np(g.apply(g.apply_t(_t(y[:, i:i + step])).to(torch.float64)))
+                      for i in range(0, y.shape[1], step)])
 
 
 # ------------------------------------------------------------------ local covariance
@@ -389,7 +402,9 @@ def _white_noise(space):
         dm = space.mass_free.diagonal()[:, None]
         minv = lambda y: y / dm  # noqa: E731
     else:
-        minv = spla.splu(space.mass_free.tocsc()).solve
+        from .distributions.bernstein import SymmetricFactor  # sparse Cholesky: SuperLU was 3-100x slower
+
+        minv = SymmetricFactor(space.mass_free).solve
     return noise, minv
 
 

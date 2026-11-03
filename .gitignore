@@ -222,3 +222,4 @@ __marimo__/
 # ngsrng: benchmark runs are generated, machine-specific output (python bench/run_all.py)
 results/runs/
 results/gpu_box/
+results/calibrate/

@@ -75,7 +75,7 @@ import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 
 from .backend import available_memory
-from .covariance import CHUNK, as_covariance
+from .covariance import as_covariance, block_columns
 from .space import SpaceInfo, assemble, to_scipy
 
 try:  # torch rows arrive from the GPU engine; the algebra below is written to run in either backend
@@ -90,14 +90,10 @@ _TOL = 1e-13
 # with P is cheaper than an application of Sigma_h; above it, P (which grows like N^((2d-1)/d) under refinement, unlike
 # a fixed low rank) is never formed
 DENSE_LIFTING_VALUES = 2**24
-
-
-def _convert(arr, x):
-    """numpy ``x`` in the dtype/device of ``arr`` (a numpy array or a torch tensor)."""
-    if _torch is not None and isinstance(arr, _torch.Tensor):
-        x = np.asarray(x)
-        return _torch.as_tensor(x.copy() if not x.flags.writeable else x, dtype=arr.dtype, device=arr.device)
-    return np.asarray(x).astype(arr.dtype, copy=False)
+# Values per dense temporary of the conditioning step. Samples are conditioned in blocks of about this many values,
+# independently of how the caller chunks them: blocks of 2^20 values (the CPU in-place chunk) held 4 samples of a
+# 263k-dof field, too few right-hand sides to keep the threaded solves busy (conditioning cost 7.5 plain draws).
+BLOCK_VALUES = 2**24
 
 
 def _index(arr, ix):
@@ -196,6 +192,9 @@ class BoundarySampler:
         self._free = np.zeros(free.size, dtype=bool)
         self._free[self._pos] = True
         self._off = np.setdiff1d(np.arange(self.fes.ndof), self.dofs)
+        self._int_pos = np.flatnonzero(~self._free)  # free dofs off Gamma: positions among the free dofs ...
+        self._int_dofs = free[self._int_pos]          # ... and dof numbers; the lifting acts only there
+        self._device_ops = {}      # per device: the correction's operators for torch rows
         self._chol = None          # Cholesky factor of sigma_bb (correction of general sources)
         self._residual = None
         self._src = as_covariance(source, self.fes)
@@ -206,6 +205,7 @@ class BoundarySampler:
         # Sigma^-1 assembled and sparse (power 1, assembled precisions): the lifting is the sparse harmonic one
         self._sparse_form = _sparse_precision(source)
         self._q = None
+        self._qblocks = None
         self.info = {"name": self.name, "n_bnd": self.n_bnd, "dofs": self.dofs.copy()}
 
     @property
@@ -220,8 +220,9 @@ class BoundarySampler:
             block = np.empty((self.n_bnd, self.n_bnd))
             small = self.space.nfree * self.n_bnd <= DENSE_LIFTING_VALUES
             cols = np.empty((self.space.nfree, self.n_bnd)) if small else None
-            for j0 in range(0, self.n_bnd, CHUNK):
-                j1 = min(self.n_bnd, j0 + CHUNK)
+            step = block_columns(self.space.nfree, getattr(self._src, "nrand", 0) or 0)
+            for j0 in range(0, self.n_bnd, step):
+                j1 = min(self.n_bnd, j0 + step)
                 e = np.zeros((self.space.nfree, j1 - j0))
                 e[self._pos[j0:j1], np.arange(j1 - j0)] = 1.0
                 c = np.asarray(self._src.sigma(e), dtype=np.float64)
@@ -256,41 +257,99 @@ class BoundarySampler:
         return self._regress()[1]
 
     def _correction(self, d):
-        """Rows ``(P d_k)^T`` (k x ndof, float64) for boundary residuals ``d`` (k x n_bnd), without forming P.
-
-        Sparse precision ``Q`` (power 1, assembled precisions): ``P d = (d on B, -Q_II^-1 Q_IB d on I)``, one sparse
-        solve with the interior block (the discrete harmonic lifting). Otherwise ``P d = Sigma E Sigma_BB^-1 d``: a
-        Cholesky solve with the boundary block and one application of ``Sigma_h``.
-        """
+        """Rows ``(P d_k)^T`` (k x ndof, float64) for boundary residuals ``d`` (k x n_bnd), without forming P: ``d``
+        on the trace DoFs, :meth:`_interior_lift` on the other free DoFs, zero on fixed DoFs."""
         d = np.asarray(d, dtype=np.float64).reshape(-1, self.n_bnd)
-        free = self.space.free
         out = np.zeros((d.shape[0], self.fes.ndof))
-        if self._sparse_form is not None:
-            qii, qib, interior = self._sparse_blocks()
-            out[:, free[interior]] = np.asarray(qii.solve(-(qib @ d.T))).reshape(-1, d.shape[0]).T
-            out[:, self.dofs] = d
-            return out
-        if self._chol is None:
-            self._chol = sla.cho_factor(self.sigma_bb, lower=True)
-        if self._cols is not None:  # small problem: the dense lifting is cheaper than an application of Sigma_h
-            if self._dense is None:
-                self._dense = sla.cho_solve(self._chol, self._cols.T).T  # Sigma E Sigma_BB^-1 (n_free x n_bnd)
-                self._dense[self._pos] = np.eye(self.n_bnd)  # R P = I exactly
-            out[:, free] = d @ self._dense.T
-            return out
-        y = np.zeros((self.space.nfree, d.shape[0]))
-        y[self._pos] = sla.cho_solve(self._chol, d.T)
-        out[:, free] = np.asarray(self._src.sigma(y), dtype=np.float64).T
+        out[:, self._int_dofs] = self._interior_lift(d)
+        out[:, self.dofs] = d
         return out
 
-    def _sparse_blocks(self):
+    def _interior_lift(self, d):
+        """``P d_k`` on the free DoFs off ``Gamma``, as rows (k x n_int, float64), for residuals ``d`` (k x n_bnd).
+
+        Sparse precision ``Q`` (power 1, assembled precisions): ``-Q_II^-1 Q_IB d``, one sparse solve with the interior
+        block (the discrete harmonic lifting). Otherwise ``Sigma E Sigma_BB^-1 d``: a Cholesky solve with the boundary
+        block and one application of ``Sigma_h`` -- or, for a small problem, a product with the stored dense lifting.
+        """
+        if self._sparse_form is not None:
+            qii, qib = self._sparse_blocks()
+            return -np.asarray(qii.solve(qib @ d.T)).reshape(-1, d.shape[0]).T
+        self._factor_bb()
+        if self._cols is not None:  # small problem: the dense lifting is cheaper than an application of Sigma_h
+            return d @ self._dense_lifting()[self._int_pos].T
+        y = np.zeros((self.space.nfree, d.shape[0]))
+        y[self._pos] = sla.cho_solve(self._chol, d.T)
+        return np.asarray(self._src.sigma(y), dtype=np.float64)[self._int_pos].T
+
+    def _interior_lift_torch(self, d):
+        """:meth:`_interior_lift` for a float64 torch tensor ``d``, computed on its device: cuDSS with the interior
+        block on a GPU (sparse precisions), the source's own pipeline (general Gaussians on the same device), else
+        through the host."""
+        if d.device.type == "cpu":
+            return _torch.from_numpy(self._interior_lift(d.numpy()))
+        ops = self._device(d.device)
+        if ops is None:
+            return _torch.from_numpy(self._interior_lift(d.cpu().numpy())).to(d.device)
+        kind, a, b = ops
+        if kind == "sparse":  # a: cuDSS factor of Q_II, b: Q_IB
+            return -a.apply(b @ d.T).T
+        if kind == "dense":  # a: interior rows of the lifting
+            return d @ a.T
+        y = _torch.zeros(self.space.nfree, d.shape[0], device=d.device, dtype=_torch.float64)  # a: chol(Sigma_BB)
+        y[_torch.as_tensor(self._pos, device=d.device)] = _torch.cholesky_solve(d.T, a)
+        sig = b.apply(b.apply_t(y))  # b: the source Gaussian on this device, Sigma = L L^T
+        return sig[_torch.as_tensor(self._int_pos, device=d.device)].T.double()
+
+    def _device(self, dev):
+        key = str(dev)
+        if key not in self._device_ops:
+            self._device_ops[key] = self._build_device_ops(dev)
+        return self._device_ops[key]
+
+    def _build_device_ops(self, dev):
+        from .backend import sparse_to_torch
+
+        f64 = _torch.float64
+        if self._sparse_form is not None:
+            from .solvers import CudssDirect, cudss_available
+
+            if not cudss_available():
+                return None
+            q, ii, bb = self._q_free(), self._int_pos, self._pos
+            return "sparse", CudssDirect(q[ii][:, ii], dev, f64), sparse_to_torch(q[ii][:, bb].tocsr(), dev, f64)
+        self._factor_bb()
+        if self._cols is not None:
+            return "dense", _torch.from_numpy(np.ascontiguousarray(self._dense_lifting()[self._int_pos])).to(dev), None
+        g = self.source
+        if getattr(g, "engine", None) == "torch" and getattr(g, "device", _torch.device("cpu")).type == dev.type \
+                and hasattr(g, "apply_t"):
+            return "sigma", _torch.linalg.cholesky(_torch.from_numpy(self.sigma_bb).to(dev)), g
+        return None
+
+    def _factor_bb(self):
+        if self._chol is None:
+            self._chol = sla.cho_factor(self.sigma_bb, lower=True)
+
+    def _dense_lifting(self):
+        """Sigma E Sigma_BB^-1 on the free DoFs (n_free x n_bnd), stored only for small problems."""
+        if self._dense is None:
+            self._dense = sla.cho_solve(self._chol, self._cols.T).T
+            self._dense[self._pos] = np.eye(self.n_bnd)  # R P = I exactly
+        return self._dense
+
+    def _q_free(self):
         if self._q is None:
+            self._q = self.space.assemble_free(self._sparse_form).tocsr()  # Sigma^-1 up to the scale factor
+        return self._q
+
+    def _sparse_blocks(self):
+        if self._qblocks is None:
             from .distributions.bernstein import SymmetricFactor  # NGSolve sparse Cholesky, threaded right-hand sides
 
-            q = self.space.assemble_free(self._sparse_form).tocsr()  # Sigma^-1 up to the scale factor
-            interior = ~self._free
-            self._q = (SymmetricFactor(q[interior][:, interior]), q[interior][:, self._free].tocsr(), interior)
-        return self._q
+            q, ii = self._q_free(), self._int_pos
+            self._qblocks = SymmetricFactor(q[ii][:, ii]), q[ii][:, self._pos].tocsr()
+        return self._qblocks
 
     # ----------------------------------------------------------------------- diagnostics
 
@@ -377,20 +436,33 @@ class BoundarySampler:
 
     def condition(self, rows, values):
         """Condition the samples ``rows`` (samples by DoFs, in place) on their trace being ``values``: ``rows``
-        becomes an exact draw of the field given ``u_h|Gamma = values`` (one set of values, or one per sample)."""
+        becomes an exact draw of the field given ``u_h|Gamma = values`` (one set of values, or one per sample).
+
+        ``u - P (R u - g)``, with P never formed (:meth:`_interior_lift`), in blocks of about ``BLOCK_VALUES`` values;
+        torch rows are conditioned on their own device.
+        """
         one = rows.ndim == 1
         r = rows.reshape(1, -1) if one else rows
         g = np.asarray(values, dtype=np.float64).reshape(-1, self.n_bnd)
-        if g.shape[0] == 1 and r.shape[0] != 1:
-            g = np.broadcast_to(g, (r.shape[0], self.n_bnd))
-        if g.shape[0] != r.shape[0]:
+        if g.shape[0] not in (1, r.shape[0]):
             raise ValueError(f"bnd_values has {g.shape[0]} rows for {r.shape[0]} samples")
-        dofs = _index(r, self.dofs)
-        trace = r[:, dofs]
-        trace = trace.detach().double().cpu().numpy() if _torch is not None and isinstance(trace, _torch.Tensor) \
-            else np.asarray(trace, dtype=np.float64)
-        r -= _convert(r, self._correction(trace - g))  # u - P (R u - g), P never formed
-        r[:, dofs] = _convert(r, g)  # exact by construction (R P = I); written for bit-level agreement with the data
+        torch_rows = _torch is not None and isinstance(r, _torch.Tensor)
+        if torch_rows:
+            g = _torch.from_numpy(np.ascontiguousarray(g)).to(r.device)
+            dofs, interior = _index(r, self.dofs), _index(r, self._int_dofs)
+        tall = max(self.fes.ndof, 0 if self._sparse_form is not None else getattr(self._src, "nrand", 0) or 0)
+        step = max(1, BLOCK_VALUES // tall)
+        for k0 in range(0, r.shape[0], step):
+            rb = r[k0:k0 + step]
+            gb = g if g.shape[0] == 1 else g[k0:k0 + step]
+            if torch_rows:
+                lift = self._interior_lift_torch(rb[:, dofs].double() - gb)
+                rb[:, interior] -= lift.to(rb.dtype)
+                rb[:, dofs] = gb.to(rb.dtype).expand(rb.shape[0], -1)
+            else:
+                lift = self._interior_lift(np.asarray(rb[:, self.dofs], dtype=np.float64) - gb)
+                rb[:, self._int_dofs] -= lift.astype(rb.dtype, copy=False)
+                rb[:, self.dofs] = gb  # exact by construction (R P = I); written for bit-level agreement with the data
         return rows
 
 

@@ -525,9 +525,8 @@ class Generator:
         n = math.prod(shape)
         flat = target.view(n, -1)
         field.sample_into(flat)
-        if getattr(field, "bnd", None) is not None:  # [bnd] in place, chunk by chunk (bounded temporaries)
-            for k0, k1 in chunks(n, flat.shape[1], self.work_values):
-                self._apply_bnd(field, flat[k0:k1])
+        if getattr(field, "bnd", None) is not None:  # [bnd] in place; the boundary step bounds its own temporaries
+            self._apply_bnd(field, flat)
         return out
 
     def _draw(self, field, size, output, name, out=None):

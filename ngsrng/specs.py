@@ -10,7 +10,6 @@ from typing import Callable
 
 import ngsolve as ngs
 import numpy as np
-import scipy.sparse.linalg as spla
 import torch
 
 
@@ -200,8 +199,9 @@ class OperatorCovariance:
             dm = space.mass_free.diagonal()[:, None]
             minv = lambda y: y / dm  # noqa: E731
         else:
-            lu = spla.splu(space.mass_free.tocsc())
-            minv = lu.solve
+            from .distributions.bernstein import SymmetricFactor  # sparse Cholesky: SuperLU was 3-100x slower
+
+            minv = SymmetricFactor(space.mass_free).solve
         if self.convention == "primal->primal":
             return lambda y: raw(minv(y))
         return lambda y: minv(raw(minv(y)))

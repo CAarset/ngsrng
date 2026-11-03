@@ -2,98 +2,72 @@
 
 A *group* is one (suite, dim, kind, order, target size) and runs in one worker process, which builds the mesh and
 space once. A *task* is one configuration inside a group and produces one result record.
+
+The default profile, ``calibrate``, exists to choose this machine's white-noise sampler and linear solver: it measures
+only candidates that can win, checks every measurement for accuracy, and drops a candidate for larger sizes once it is
+inaccurate, fails, or is far slower than the best one (``RETIRE_RATIO``). Its predecessor measured every method on
+every grid point and needed days on the GPU box; the measured losers are no longer candidates:
+
+- white noise: ``chebyshev`` (60-3400x slower than the exact samplers), ``lumped`` (covariance error 150% for H1 P1;
+  identical to ``diagonal`` where the mass matrix is diagonal; undefined for H1 p >= 2) and ``dense-cholesky``
+  (O(n^2) memory) -- the library still offers them on request;
+- solvers: ``cg-local`` (up to 390x slower than a direct solver), ``cg-multigrid`` (crashed: needs a mesh hierarchy),
+  ``direct-pardiso`` (not available in NGSolve builds without MKL), the apply-only multi-shift route (a feature for
+  precisions known only as an action, not a solver choice), float32 GPU arithmetic (pathwise errors up to O(1)).
 """
 
 from dataclasses import asdict, dataclass, field
 
+# Settings of the research suites (posterior, distributions, lowrank, covariance, continuum); every profile can run
+# them with --suites, but only "research" does so by default.
+_RESEARCH = dict(
+    torch_cpu_max_ndof=1e5,
+    continuum_max_ndof=5e4,
+    continuum_orders={"H1": [1, 2, 3], "L2": [0, 1, 2]},
+    posterior_obs=[10, 100],
+    posterior_orders={"H1": [1, 2], "L2": [0, 1]},
+)
+CALIBRATION_SUITES = ["noise", "prior"]
+RESEARCH_SUITES = ["noise", "prior", "posterior", "distributions", "lowrank", "covariance", "continuum"]
+
 PROFILES = {
-    # tiny: validates the harness end to end in a few minutes
-    "smoke": dict(
-        targets=[1e3],
-        dims=[1, 2, 3],
-        orders={"H1": [1, 3], "L2": [0, 2]},
-        powers=[2, 3, 2.6],
-        method_timeout=180,
-        timeout_floor=60,
-        setup_budget=60,
-        sample_budget=5.0,
-        torch_cpu_max_ndof=1e4,
-        continuum_max_ndof=5e3,
-        continuum_orders={"H1": [1, 2], "L2": [0, 1]},
-        posterior_obs=[10, 40],
-        posterior_orders={"H1": [1], "L2": [1]},
-    ),
-    "quick": dict(
-        targets=[1e3, 1e4, 1e5],
-        dims=[1, 2, 3],
-        orders={"H1": [1, 2, 4], "L2": [0, 1, 2]},
-        powers=[2, 3, 2.6],
-        method_timeout=300,
-        timeout_floor=30,
-        setup_budget=120,
-        sample_budget=10.0,
-        torch_cpu_max_ndof=1e5,
-        continuum_max_ndof=5e4,
-        continuum_orders={"H1": [1, 2, 3], "L2": [0, 1, 2]},
-        posterior_obs=[10, 100],
-        posterior_orders={"H1": [1, 2], "L2": [0, 1]},
-    ),
-    "standard": dict(
-        targets=[1e3, 1e4, 1e5, 1e6],
-        dims=[1, 2, 3],
-        orders={"H1": [1, 2, 4, 8], "L2": [0, 1, 2, 4]},
-        powers=[2, 3, 1.6, 2.6],
-        method_timeout=1200,
-        timeout_floor=60,
-        setup_budget=300,
-        sample_budget=30.0,
-        torch_cpu_max_ndof=1e5,
-        continuum_max_ndof=3e5,
-        continuum_orders={"H1": [1, 2, 3, 4], "L2": [0, 1, 2, 3]},
-        posterior_obs=[10, 100, 1000],
-        posterior_orders={"H1": [1, 2, 4], "L2": [0, 1, 2]},
-    ),
-    "full": dict(
-        targets=[1e3, 1e4, 1e5, 1e6, 1e7],
-        dims=[1, 2, 3],
-        orders={"H1": [1, 2, 3, 4, 6, 8], "L2": [0, 1, 2, 3, 4, 6]},
-        powers=[2, 3, 4, 1.6, 2.6],
-        method_timeout=3600,
-        timeout_floor=120,
-        setup_budget=900,
-        sample_budget=60.0,
-        torch_cpu_max_ndof=1e6,
-        continuum_max_ndof=1e6,
-        continuum_orders={"H1": [1, 2, 3, 4, 6], "L2": [0, 1, 2, 3, 4]},
-        posterior_obs=[10, 100, 1000, 4000],
-        posterior_orders={"H1": [1, 2, 4, 8], "L2": [0, 1, 2, 4]},
-    ),
+    # a few minutes on any machine: the harness end to end
+    "smoke": dict(_RESEARCH, suites=CALIBRATION_SUITES, targets=[2e3], dims=[2, 3], orders={"H1": [1, 2], "L2": [1]},
+                  powers=[2], method_timeout=120, timeout_floor=30, setup_budget=30, sample_budget=2.0,
+                  torch_cpu_max_ndof=0, continuum_max_ndof=5e3, posterior_obs=[10]),
+    # the default: calibrates this machine's automatic choices (2D and 3D, the common orders, 1e4 and 1e5 dofs)
+    "calibrate": dict(_RESEARCH, suites=CALIBRATION_SUITES, targets=[1e4, 1e5], dims=[2, 3],
+                      orders={"H1": [1, 2], "L2": [1]}, powers=[2], method_timeout=300, timeout_floor=30,
+                      setup_budget=60, sample_budget=2.0, torch_cpu_max_ndof=0),
+    # calibrate, extended to 1e6 dofs (large CPU/GPU boxes)
+    "large": dict(_RESEARCH, suites=CALIBRATION_SUITES, targets=[1e4, 1e5, 1e6], dims=[2, 3],
+                  orders={"H1": [1, 2], "L2": [1]}, powers=[2], method_timeout=900, timeout_floor=60,
+                  setup_budget=300, sample_budget=5.0, torch_cpu_max_ndof=0),
+    # research data (all suites, more orders and powers, 1D): hours, not part of calibration
+    "research": dict(_RESEARCH, suites=RESEARCH_SUITES, targets=[1e3, 1e4, 1e5], dims=[1, 2, 3],
+                     orders={"H1": [1, 2, 4], "L2": [0, 1, 2]}, powers=[2, 3, 1.6], method_timeout=600,
+                     timeout_floor=30, setup_budget=120, sample_budget=10.0),
 }
 
-NOISE_METHODS = [
-    "diagonal",
-    "local-gram",
-    "local-gram-explicit",
-    "quadrature",
-    "chebyshev-1e-6",
-    "chebyshev-1e-10",
-    "lumped",
-    "dense-cholesky",
-]
+# Exact white-noise samplers (the only candidates: an approximate sampler is not a faster version of the same law).
+NOISE_METHODS = ["diagonal", "local-gram", "local-gram-explicit", "quadrature"]
 
 # (solver label, Gaussian method overrides); "precond" choices are NGSolve preconditioner names.
 CPU_SOLVERS = {
     "direct-sparsecholesky": {"solver": "direct", "inverse": "sparsecholesky"},
     "direct-umfpack": {"solver": "direct", "inverse": "umfpack"},
-    "direct-pardiso": {"solver": "direct", "inverse": "pardiso"},
     "cg-bddc": {"solver": "cg", "precond": "bddc"},
     "cg-h1amg": {"solver": "cg", "precond": "h1amg"},
-    "cg-multigrid": {"solver": "cg", "precond": "multigrid"},
-    "cg-local": {"solver": "cg", "precond": "local"},
 }
 GPU_SOLVERS = {"cudss": {"solver": "cudss"}, "pcg-jacobi": {"solver": "torch-pcg"}}
-# The same power-2 prior given only as the action c -> K M^-1 K c (OperatorPrecision, multi-shift PCG).
-APPLY_ONLY = {"apply-only": {}}
+ITERATIVE = {"cg-bddc", "cg-h1amg", "pcg-jacobi"}
+
+# Accuracy a measurement must reach to count (all calibrated arithmetic is float64): white noise reproduces M to
+# max|HH^T - M|/max|M| (or its probe estimate), priors match the float64 direct reference sample for sample.
+ACCURACY = {"noise": 1e-10, "prior": 1e-6}
+# A candidate slower than RETIRE_RATIO x the best accurate one of its group is not measured at larger sizes. Iterative
+# solvers in 3D are exempt: their cost grows more slowly than a factorisation's, so they may win at larger sizes.
+RETIRE_RATIO = 20.0
 
 # Posterior (linear Gaussian observations): m local averages of the prior field. The exact low-rank update applied
 # in FE space ("fe-space") or to the white noise ("noise-space"), its randomised rank-32 version by randomised
@@ -156,7 +130,7 @@ COVARIANCE_PROBES = [30, 120]
 COVARIANCE_SOURCES = ["prior", "posterior"]
 COVARIANCE_EXACT_LIMIT = 20000
 
-DENSE_LIMIT = 3000  # dense-cholesky noise only up to this many free dofs
+DENSE_LIMIT = 3000  # dense-cholesky noise only up to this many free dofs (on explicit request)
 DIRECT_3D_LIMIT = 3e5  # sparse direct solvers are not attempted beyond this in 3D (fill-in)
 
 
@@ -242,11 +216,13 @@ class Group:
 
 
 def engines(devices, torch_cpu: bool):
+    """Calibrated platforms: the CPU engine, optionally the torch engine on the CPU, and the GPU engine in float64
+    arithmetic (its default; float64 output, so that the noise suite measures the same arithmetic)."""
     out = [("ngsolve", "cpu", "float64")]
     if torch_cpu:
         out.append(("torch", "cpu", "float64"))
     if "cuda" in devices:
-        out += [("torch", "cuda", "float64"), ("torch", "cuda", "float32")]
+        out.append(("torch", "cuda", "float64"))
     return out
 
 
@@ -258,12 +234,9 @@ def build_groups(profile: str, suites, devices, max_ndof=None):
     if "noise" in suites:
         for d, k, p in spaces:
             for t in targets:
-                tasks = []
-                for eng, dev, dt in engines(devices, torch_cpu=t <= cfg["torch_cpu_max_ndof"]):
-                    for m in NOISE_METHODS:
-                        if m == "dense-cholesky" and t > DENSE_LIMIT:
-                            continue
-                        tasks.append(Task("noise", d, k, p, t, eng, dev, dt, method=m))
+                tasks = [Task("noise", d, k, p, t, eng, dev, dt, method=m)
+                         for eng, dev, dt in engines(devices, torch_cpu=t <= cfg["torch_cpu_max_ndof"])
+                         for m in NOISE_METHODS]
                 groups.append(Group("noise", d, k, p, t, tasks))
     if "prior" in suites:
         for d, k, p in spaces:
@@ -273,17 +246,13 @@ def build_groups(profile: str, suites, devices, max_ndof=None):
                     for name, opts in CPU_SOLVERS.items():
                         if name.startswith("direct") and d == 3 and t > DIRECT_3D_LIMIT:
                             continue
-                        if name in ("cg-h1amg", "cg-multigrid") and k != "H1":
+                        if name == "cg-h1amg" and k != "H1":
                             continue
                         tasks.append(Task("prior", d, k, p, t, "ngsolve", "cpu", "float64", "auto", name, power, opts))
                     if "cuda" in devices:
-                        for dt in ("float64", "float32"):
-                            for name, opts in GPU_SOLVERS.items():
-                                tasks.append(Task("prior", d, k, p, t, "torch", "cuda", dt, "auto", name, power, opts))
-                    if power == 2:
-                        tasks.append(Task("prior", d, k, p, t, "ngsolve", "cpu", "float64", "auto", "apply-only", 2))
-                        if "cuda" in devices:
-                            tasks.append(Task("prior", d, k, p, t, "torch", "cuda", "float64", "auto", "apply-only", 2))
+                        for name, opts in GPU_SOLVERS.items():
+                            tasks.append(Task("prior", d, k, p, t, "torch", "cuda", "float64", "auto", name, power,
+                                              opts))
                 groups.append(Group("prior", d, k, p, t, tasks))
     if "posterior" in suites:
         pspaces = [(d, k, p) for d in cfg["dims"] for k in ("H1", "L2") for p in cfg["posterior_orders"][k]]

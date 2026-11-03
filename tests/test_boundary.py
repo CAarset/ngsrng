@@ -404,7 +404,10 @@ def test_torch_engine_matches(mesh):
 @pytest.mark.parametrize("power", [1, 2])
 def test_correction_paths_agree(mesh, monkeypatch, power):
     """The three ways of applying the lifting P without forming it -- sparse harmonic lifting (power 1), small dense
-    lifting, matrix-free Sigma application -- give the same conditioned samples."""
+    lifting, matrix-free Sigma application -- give the same conditioned samples, also when the samples are conditioned
+    in blocks of two and when they arrive as torch rows."""
+    import torch
+
     import ngsrng.boundary as bmod
 
     fes = h1(mesh, 2)
@@ -421,7 +424,11 @@ def test_correction_paths_agree(mesh, monkeypatch, power):
         elif power != 1:
             continue
         results.append(sam.condition(rows.copy(), data))
-    assert len(results) >= 2
+        monkeypatch.setattr(bmod, "BLOCK_VALUES", 2 * fes.ndof)
+        results.append(sam.condition(rows.copy(), data))
+        results.append(sam.condition(torch.from_numpy(rows.copy()), data).numpy())
+        monkeypatch.setattr(bmod, "BLOCK_VALUES", 2**24)
+    assert len(results) >= 6
     for r in results[1:]:
         np.testing.assert_allclose(r, results[0], rtol=1e-8, atol=1e-10 * np.abs(results[0]).max())
     assert np.all(results[0][:, sam.dofs] == data)

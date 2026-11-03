@@ -61,10 +61,17 @@ class _NGSolveBase(Solver):
         return res[:, 0] if squeeze else res
 
 
+# NGSolve direct solvers whose concurrent solves were checked against sequential results. "pardiso" (an MKL build)
+# returned samples off by up to 1e67 in the GPU-box benchmark and is not offered.
+INVERSES = ("sparsecholesky", "umfpack")
+
+
 class NGSolveDirect(_NGSolveBase):
     """Sparse direct factorisation (NGSolve), computed once and reused for every sample."""
 
     def __init__(self, space: SpaceInfo, form, inverse="sparsecholesky"):
+        if inverse not in INVERSES:
+            raise ValueError(f"unsupported direct solver {inverse!r}; valid: {', '.join(INVERSES)}")
         super().__init__(space, form)
         self.name = f"ngsolve-direct({inverse})"
         u, v = self.fes.TnT()
@@ -82,14 +89,24 @@ class NGSolveDirect(_NGSolveBase):
         out.data = self.inv * rhs
 
 
+# NGSolve preconditioners usable without a mesh hierarchy. "multigrid" needs refinement levels: on a generated mesh it
+# crashed the process (segfault) in every benchmarked case, so it is rejected up front.
+PRECONDITIONERS = ("bddc", "h1amg", "local")
+
+
 class NGSolveCG(_NGSolveBase):
-    """Preconditioned CG with an NGSolve preconditioner (bddc, h1amg, multigrid, local)."""
+    """Preconditioned CG with an NGSolve preconditioner (bddc, h1amg, local)."""
 
     exact = False
-    threadsafe = False  # NGSolve preconditioners are not verified for concurrent application
 
     def __init__(self, space: SpaceInfo, form, precond="bddc", tol=1e-10, maxiter=5000):
+        if precond not in PRECONDITIONERS:
+            raise ValueError(f"unsupported preconditioner {precond!r}; valid: {', '.join(PRECONDITIONERS)} "
+                             "(multigrid needs a mesh hierarchy and crashes on a generated mesh)")
         super().__init__(space, form)
+        # Concurrent applications of one BDDC preconditioner corrupted the samples (relative error 0.1 in a batch of
+        # threaded samples, 1e-10 sequentially); h1amg gave identical results either way; Jacobi is unverified.
+        self.threadsafe = precond == "h1amg"
         self.name = f"ngsolve-cg({precond})"
         self.tol, self.maxiter = tol, maxiter
         u, v = self.fes.TnT()
@@ -134,11 +151,26 @@ def _cudss_mtlayer():
     return None
 
 
+# Right-hand-side staging buffers shared by all cuDSS solvers of one shape: the solves run one after the other on the
+# same stream, so the L shifted solvers of a fractional power need one (n x width) buffer, not L of them.
+_STAGING = {}
+
+
+def _staging(n, width, device, dtype):
+    key = (n, width, str(device), dtype)
+    if key not in _STAGING:
+        # column-major (n x width): cuDSS checks strides exactly, so the buffer is (width x n) transposed
+        _STAGING[key] = torch.zeros(width, n, device=device, dtype=dtype)
+    return _STAGING[key]
+
+
 class CudssDirect(Solver):
     """GPU sparse Cholesky (NVIDIA cuDSS via nvmath-python), factorised once and reused for every sample.
 
-    cuDSS fixes the right-hand-side shape per solver object, so factorisations are kept for widths 1 and ``width``
-    (created on first use); batches are solved in chunks of ``width``, with small remainders one column at a time.
+    cuDSS fixes the right-hand-side shape per solver object. One factorisation of width ``width`` is kept; batches
+    are solved in blocks of ``width`` columns, and a narrower block (a single sample, a remainder) is zero-padded to
+    the full width (one padded call; column by column was up to 25x slower, and a second factorisation for single
+    columns doubled the device memory of every solver).
     """
 
     def __init__(self, a_free: sp.spmatrix, device, dtype, width=32):
@@ -147,35 +179,27 @@ class CudssDirect(Solver):
         import nvmath.sparse.advanced as adv
 
         self.name = "cudss"
-        self.adv, self.width = adv, width
-        self.a = sparse_to_torch(a_free, device, dtype)
+        self.width = int(width)
         self.n, self.device, self.dtype = a_free.shape[0], device, dtype
+        a = sparse_to_torch(a_free, device, dtype)
         logger = logging.getLogger("ngsrng.cudss")
         logger.setLevel(logging.WARNING)
-        self.options = adv.DirectSolverOptions(
+        options = adv.DirectSolverOptions(
             sparse_system_type=adv.DirectSolverMatrixType.SPD, multithreading_lib=_cudss_mtlayer(), logger=logger
         )
-        self._solvers = {}
-        self._get(1)
+        self._rhs = _staging(self.n, self.width, device, dtype)
+        self._solver = adv.DirectSolver(a, self._rhs.T, options=options)
+        self._solver.plan()
+        self._solver.factorize()
 
-    def _get(self, k):
-        if k not in self._solvers:
-            b = torch.zeros(k, self.n, device=self.device, dtype=self.dtype).T
-            s = self.adv.DirectSolver(self.a, b, options=self.options)
-            s.plan()
-            s.factorize()
-            self._solvers[k] = s
-        return self._solvers[k]
-
-    def _solve(self, b):
-        k = b.shape[1]
-        s = self._get(k)
-        # cuDSS checks strides exactly; .contiguous() is a no-op for size-1 dimensions, so copy explicitly into a
-        # column-major (n x k) buffer with strides (1, n).
-        rhs = torch.empty(k, self.n, device=self.device, dtype=self.dtype)
-        rhs.copy_(b.T)
-        s.reset_operands(b=rhs.T)
-        return s.solve()
+    def _solve(self, block):
+        """Solve for an (n x r) block, r <= width, through the shared staging buffer; returns (n x r)."""
+        r = block.shape[1]
+        if r < self.width:
+            self._rhs[r:].zero_()
+        self._rhs[:r].copy_(block.T)
+        self._solver.reset_operands(b=self._rhs.T)
+        return self._solver.solve()[:, :r]
 
     def apply(self, x):
         squeeze = x.ndim == 1
@@ -183,22 +207,20 @@ class CudssDirect(Solver):
         k = x.shape[1]
         out = torch.empty(self.n, k, device=self.device, dtype=self.dtype)
         for start in range(0, k, self.width):
-            block = x[:, start : start + self.width]
-            r = block.shape[1]
-            if r == self.width or r == 1:
-                out[:, start : start + r] = self._solve(block)
-            else:  # a remainder: zero-padded to the full width, one call (column by column was up to 25x slower)
-                padded = torch.zeros(self.n, self.width, device=self.device, dtype=self.dtype)
-                padded[:, :r] = block
-                out[:, start : start + r] = self._solve(padded)[:, :r]
+            out[:, start : start + self.width] = self._solve(x[:, start : start + self.width])
         return out[:, 0] if squeeze else out
 
-    def __del__(self):
-        for s in getattr(self, "_solvers", {}).values():
+    def free(self):
+        """Release the factorisation now (device memory), instead of at garbage collection."""
+        s, self._solver = getattr(self, "_solver", None), None
+        if s is not None:
             try:
                 s.free()
             except Exception:  # noqa: BLE001
                 pass
+
+    def __del__(self):
+        self.free()
 
 
 class TorchPCG(Solver):
@@ -259,6 +281,7 @@ class RationalSolver(Solver):
         self.rational, self.shifted, self.mass_inv = rational, shifted, mass_inv
         self.name = f"rational(theta={rational.theta:g}, {rational.degree} shifts, {shifted[0].name})"
         self.exact = all(sv.exact for sv in shifted)
+        self.threadsafe = all(getattr(sv, "threadsafe", True) for sv in [*shifted, mass_inv])
         self._tmp = None
 
     def apply(self, x):

@@ -1,4 +1,4 @@
-"""GPU batch benchmark: large batches of Gaussian, lognormal and uniform random functions, filled in place.
+"""GPU throughput check: large batches of Gaussian, lognormal and uniform random functions, filled in place.
 
     python bench/gpu_batch.py                  # CUDA, full grid (~20-40 min)
     python bench/gpu_batch.py --quick          # CUDA, small sizes (a few minutes)
@@ -8,8 +8,9 @@
 1. Checks on the device (they gate the timings): the normal CDF in both tails, Gaussian variances against the exact
    pointwise variance (CPU reference), uniform marginals (KS), and ``out=`` against returned arrays.
 2. Throughput of ``rng.<family>(out=buffer)`` with a preallocated buffer on the device, repeated (in-place
-   replacement), for 2D P2 and 3D P1 spaces of several sizes: torch engine with cuDSS at several right-hand-side
-   widths and with batched PCG, float32 and float64; the CPU engine (threaded NGSolve) as reference. With
+   replacement), for 2D P2 and 3D P1 spaces of several sizes: torch engine with cuDSS at right-hand-side widths 32
+   and 128 (float64 arithmetic, float32 output: the defaults); the CPU engine (threaded NGSolve) as reference. The
+   solver choice itself is calibrated by bench/run_all.py, which also rejects batched PCG and float32 arithmetic. With
    ``--work-values`` every configuration is repeated for each chunk size of the in-place fill
    (:mod:`ngsrng.inplace`); the peak device memory of every measurement is recorded.
 
@@ -175,11 +176,11 @@ def main():
 
     sizes = {"2D-P2": [0.03, 0.012] if args.quick else [0.03, 0.012, 0.006],
              "3D-P1": [0.1] if args.quick else [0.1, 0.05]}
-    families = [("normal", None), ("lognormal", None), ("uniform", None), ("uniform", "points")]
+    families = [("normal", None), ("lognormal", None), ("uniform", None)]
     if device.type == "cuda":
-        solvers = ([{"solver": "cudss", "cudss_width": w} for w in (32, 128, 512)] if cudss_available() else [])
-        solvers.append({"solver": "torch-pcg"})
-        dtypes = [torch.float32, torch.float64]
+        solvers = ([{"solver": "cudss", "cudss_width": w} for w in (32, 128)] if cudss_available()
+                   else [{"solver": "torch-pcg"}])
+        dtypes = [torch.float32]
     else:
         solvers, dtypes = [{"engine": "ngsolve"}], [torch.float32]
     batch = 500 if args.quick else args.batch

@@ -76,8 +76,9 @@ scipy and torch.distributions names; unknown names fall back to scipy.stats dist
   quadrature-point values is a GridFunction on an IntegrationRuleSpace: a coefficient for forms integrated with
   `rng.dx()`, not an FE function (evaluating or drawing it elsewhere crashes NGSolve,
   known issue 11).
-- Output arrays are float32 by default, also on the CPU (where everything is computed in float64 and cast at the end).
-  Pass `dtype="float64"` to the generator for double-precision output.
+- Output arrays are float32 by default. Every engine, the GPU included, computes in float64 and casts at the end:
+  float32 solves lost the samples on fine meshes (pathwise errors up to O(1) in the GPU benchmark), so
+  `method={"work_dtype": "float32"}` is an explicit opt-in. Pass `dtype="float64"` for double-precision output.
 - Parameters may vary in space (CoefficientFunctions, GridFunctions or arrays of point values).
 - `construction=` picks between genuinely different fields with the same single-point distribution (e.g.
   `chisquare(df, construction="squares" | "copula")`, `wishart(..., construction="process" | "bartlett")`,
@@ -139,8 +140,8 @@ following:
     "fields"); ngsrng warns and suggests using it as a precision instead.
 11. Values of bounded distributions always stay strictly inside their range, also in single precision (a uniform
     value is never exactly 0 or 1).
-12. The GPU code paths pass their tests on a GPU, but their speed has not been measured yet
-    (`python bench/gpu_batch.py`).
+12. On a GPU (A100), cuDSS samples 25-80x faster than the threaded CPU engine; `python bench/calibrate.py`
+    measures it on your machine and installs the fastest accurate choices.
 13. **Large batches:** on the CPU, samples are computed in parallel threads (one sample per thread; set the number
     with `method={"threads": k}`). Results do not depend on the number of threads. A batch and the same samples drawn
     one at a time agree to rounding (about 1e-14 relative), not bit for bit.
@@ -298,52 +299,47 @@ What to keep in mind:
 |---|---|
 | `ngsrng/` | The package. `gaussian.py` (sampler and automatic selection), `noise.py` (white noise), `solvers.py`, `rational.py` (fractional powers), `observations.py`, `posterior.py`, `lowrank.py`, `randomized.py` (randomised subspace iteration), `covariance.py` (variance maps, traces, covariance functions, sample covariances), `quadrature.py`, `generator.py` (numpy-style API), `correlation.py`, `distributions/` (inversion, copula marginals, quadratic forms, scale mixtures, KL expansions), `tuning.py`, `reference.py` (dense ground truth), `space.py`, `backend.py`, `specs.py` |
 | `tests/` | One test file per module; `python -m pytest` |
-| `bench/` | One-click benchmark: `run_all.py` (orchestrator), `cases.py` (grid), `worker.py`, `report.py` |
+| `bench/` | Calibration: `calibrate.py` (one command), `run_all.py` (orchestrator), `cases.py` (candidates), `worker.py`, `report.py`; optional `boundary_scaling.py`, `gpu_batch.py` |
 | `examples/` | `demo.ipynb`: the user tutorial; `stokes_inverse.ipynb`: advanced walkthrough of a linear Bayesian inverse problem with a Stokes forward model; `hydraulic_tomography_3d.ipynb`: nonlinear 3D problem with heavy-tailed noise, Laplace approximation and MCMC. All executed (interactive `Draw` views and static panels included) |
-| `results/` | `runs/` (generated, git-ignored), `prototype/` (archived early results) |
+| `results/` | `calibrate/` and `runs/` (generated, git-ignored), `gpu_box/` (the 2026-11-02 A100 run), `prototype/` (archived early results) |
 
 ## Installation
 ```bash
 uv pip install -e ".[test,bench]"     # core + tests + benchmark tooling
 uv pip install -e ".[gpu]"            # optional: cuDSS GPU direct solver (CUDA 13)
-uv pip install -e ".[mkl]"            # optional: PARDISO via MKL
 uv pip install -e ".[examples]"       # optional: Jupyter, anywidget (for Draw) and matplotlib, for the tutorial
 uv pip install -e /path/to/ngsplot     # optional: local package for the tutorial's side-by-side panels
 ```
 
-## Benchmarks (one click)
+## Calibration (one command)
 ```bash
-python bench/run_all.py --profile smoke       # ~10 min: validates the harness and every method end to end
-python bench/run_all.py                       # "standard": all methods x engines x devices x precisions,
-                                              #  H1/L2, orders up to 8, 1D/2D/3D, 1e3..1e6 dofs (hours)
-python bench/run_all.py --profile full        # up to 1e7 dofs, more orders, power 4
-python bench/run_all.py --resume results/runs/<run>   # continue an interrupted run
-python bench/run_all.py --install             # also make the measured optimum the dispatcher's tuning
-python bench/gpu_batch.py                     # GPU: batches of 5000 normal/lognormal/uniform fields filled in place
-                                              #  (cuDSS widths, PCG, float32/64) vs the CPU engine; --quick: minutes
+python bench/calibrate.py                  # tests, validation, calibration (~30 min on a GPU box)
+python bench/calibrate.py --quick          # a few minutes: harness check
+python bench/calibrate.py --large          # calibrate up to 1e6 dofs (an hour or more)
+python bench/calibrate.py --boundary --throughput   # also boundary sampling and GPU batch throughput
+python bench/calibrate.py --resume results/calibrate/<run>   # continue an interrupted run
+python bench/run_all.py --install          # the calibration step alone
+python bench/run_all.py --profile research # posteriors, distributions, low rank, ...: research data, hours
 ```
-- **What runs** (suites `noise prior posterior distributions lowrank covariance continuum`; the grid is defined in
-  [bench/cases.py](bench/cases.py)):
-  - every white-noise sampler;
-  - every solver configuration: NGSolve sparse Cholesky / UMFPACK / PARDISO, CG with BDDC / h1amg / multigrid /
-    Jacobi, GPU cuDSS and batched PCG;
-  - integer and fractional Matérn powers;
-  - posteriors (FE-space, noise-space and randomised low-rank updates, re-weighted noise, Matheron);
-  - truncated KL expansions: randomised subspace iteration vs covariance range finder, ranks and iteration counts;
-  - variance maps (exact, low rank plus sampled residual, sampling) and trace estimators (Hutchinson, Hutch++,
-    XNysTrace) for a prior and a posterior;
-  - distribution families, every algorithm variant (inversion methods, constructions);
-  - the CPU engine and the torch engine, CUDA in float64 and float32;
-  - a continuum-accuracy study.
-- **Portability:** available devices and libraries are detected. Missing backends are recorded as `n/a`. Crashes,
-  hangs and out-of-memory cases run in isolated worker processes and are recorded as results, and they retire that
-  configuration for larger sizes. A memory watchdog keeps workers below 80% of available RAM.
-- **Output:** `results/runs/<host>_<date>_<profile>/` holds raw JSON lines per suite, `environment.json`,
-  `report.md` (validation, fastest valid method per circumstance, scaling tables, accuracy, failures), `plots/`
-  and `recommendations.json`.
-- **Tuning:** `python -m ngsrng.tuning install <run dir>` (or `--install`) makes `Gaussian` use the measured fastest
-  noise sampler, solver and, with `device="auto"`, device for the nearest benchmarked case on that machine.
-  `python -m ngsrng.tuning show` lists the active tuning. Without tuning, built-in rules apply.
+- **Purpose:** choose this machine's white-noise sampler and linear solver, and reject the candidates that cannot win.
+  The calibration measures only exact samplers (diagonal, local Gram, quadrature) and the solvers that can win (NGSolve
+  sparse Cholesky and UMFPACK, CG with BDDC or h1amg, cuDSS and batched PCG on a GPU), in 2D and 3D at 1e4 and 1e5
+  dofs (1e6 with `--large`), on every available device.
+- **Accuracy first:** every measurement is checked, also at large sizes: white noise must reproduce the mass matrix
+  to 1e-10, priors must match a float64 direct reference sample for sample to 1e-6. A candidate is rejected for
+  larger sizes once it is inaccurate, fails, exceeds its time budget, or is 20x slower than the best accurate one on
+  its platform (iterative solvers in 3D excepted). The earlier exhaustive benchmark took days and ranked by speed
+  alone; the measured losers -- Chebyshev and lumped noise, Jacobi- and multigrid-preconditioned CG, PARDISO,
+  float32 GPU arithmetic -- are no longer candidates ([bench/cases.py](bench/cases.py)).
+- **Portability:** available devices and libraries are detected. Crashes, hangs and out-of-memory cases run in
+  isolated worker processes and are recorded as results. A memory watchdog keeps workers below 80% of available RAM.
+- **Output:** `results/calibrate/<host>_<date>/` holds `SUMMARY.md`, the step logs and, under `out/calibrate/`, the
+  raw JSON lines, `report.md` (accuracy, fastest accurate method per case, rejected candidates), `plots/`,
+  `recommendations.json` and `rejected.json`.
+- **Tuning:** the calibration installs its recommendations (`python -m ngsrng.tuning install <run dir>` does it by
+  hand): `Gaussian` then uses the measured fastest accurate noise sampler, solver and, with `device="auto"`, device
+  for the nearest calibrated case. `python -m ngsrng.tuning show` lists the active tuning. Without tuning, built-in
+  rules apply.
 
 ## Development
 ```bash

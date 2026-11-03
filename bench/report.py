@@ -422,6 +422,29 @@ def continuum_section(df, plots_dir):
 # ------------------------------------------------------------------ main
 
 
+def rejected_section(run_dir):
+    """The candidates the calibration dropped (not measured at larger sizes), with the reason."""
+    path = os.path.join(run_dir, "rejected.json")
+    if not os.path.exists(path):
+        return ""
+    with open(path) as fh:
+        rejected = json.load(fh)
+    out = ["## Rejected candidates\n",
+           "Dropped for larger sizes: failures and timeouts, misses of the accuracy threshold (noise: covariance error "
+           "1e-10; priors: pathwise error 1e-6 against the float64 direct reference), and candidates 20x slower than "
+           "the best accurate one on their platform (iterative solvers in 3D excepted).\n"]
+    if not rejected:
+        return out[0] + "None.\n"
+    rows = []
+    for lineage, reason in sorted(rejected.items()):
+        suite, dim, kind, order, engine, device, dtype, method, solver, power = lineage.split("|")
+        rows.append({"suite": suite, "space": f"{dim}D {kind} p={order}", "platform": f"{engine}/{device}",
+                     "candidate": solver if suite == "prior" else method,
+                     "power": power if suite == "prior" else "", "reason": reason})
+    out.append(md(pd.DataFrame(rows).set_index(["suite", "platform", "candidate"]).sort_index(), floatfmt="s"))
+    return "\n".join(out)
+
+
 def failures_section(data):
     out = ["## 5. Failures, timeouts and inapplicable combinations\n"]
     frames = [d.assign(suite=s) for s, d in data.items() if isinstance(d, pd.DataFrame) and "status" in d]
@@ -472,6 +495,7 @@ def write(run_dir):
         parts.append(covariance_section(data["covariance"]))
     if "continuum" in data:
         parts.append(continuum_section(data["continuum"], plots_dir))
+    parts.append(rejected_section(run_dir))
     parts.append(failures_section(data))
     plots = sorted(os.listdir(plots_dir))
     parts.append("## 6. Plots\n\n" + "\n".join(f"![{p}](plots/{p})" for p in plots))

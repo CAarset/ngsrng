@@ -1,14 +1,17 @@
-"""One-click benchmark of every sampler, engine, device, precision, space and size; then a report.
+"""Calibrate this machine: measure the candidate white-noise samplers and solvers, reject the bad ones, and write
+the tuning that ngsrng.Gaussian uses for its automatic choices.
 
-    python bench/run_all.py                      # standard profile, all suites, all available devices
+    python bench/run_all.py --install            # "calibrate" (default): 2D/3D, 1e4 and 1e5 dofs, all devices
     python bench/run_all.py --profile smoke      # a few minutes: validates the harness end to end
+    python bench/run_all.py --profile large --install    # calibrate up to 1e6 dofs
+    python bench/run_all.py --profile research   # every suite (posteriors, distributions, ...): hours, not tuning
     python bench/run_all.py --resume results/runs/<run>   # continue an interrupted run
-    python bench/run_all.py --install            # ...and make the measured optimum the dispatcher's tuning
 
 Each (suite, space, size) group runs in its own worker process, so crashes, out-of-memory kills and hangs are
-recorded as results instead of ending the run. A configuration that fails or exceeds its time budget is not tried at
-larger sizes. Results go to results/runs/<host>_<date>_<profile>/ as JSON lines, followed by report.md,
-recommendations.json and plots (see report.py).
+recorded as results instead of ending the run. A candidate is rejected -- not measured at larger sizes -- once it
+fails, exceeds its time budget, misses the accuracy threshold (cases.ACCURACY), or is RETIRE_RATIO times slower than
+the best accurate candidate on its platform. Results go to results/runs/<host>_<date>_<profile>/ as JSON lines,
+followed by report.md, recommendations.json, rejected.json and plots (see report.py).
 """
 
 import argparse
@@ -25,9 +28,24 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
-from cases import PROFILES, build_groups  # noqa: E402
+from cases import ACCURACY, ITERATIVE, PROFILES, RETIRE_RATIO, build_groups  # noqa: E402
 
 FAILED = {"error", "timeout", "crash", "memlimit"}
+
+
+def accurate(rec) -> bool:
+    """Whether an ok record meets the accuracy threshold of its suite (records of other suites always do)."""
+    if rec.get("suite") == "noise":
+        return rec.get("cov_rel_err", 0.0) <= ACCURACY["noise"]
+    if rec.get("suite") == "prior":
+        return all(not (rec.get(k) is not None and rec[k] > ACCURACY["prior"])
+                   for k in ("pathwise_rel_err", "law_rel_fro"))
+    return True
+
+
+def best_time(rec) -> float:
+    times = [rec.get(k) for k in ("per_sample_s", "per_sample_batch_s")]
+    return min(t for t in times if t is not None) if any(t is not None for t in times) else float("inf")
 
 
 def environment() -> dict:
@@ -116,6 +134,7 @@ class Runner:
         self.run_dir, self.cfg, self.mem_limit_gb, self.log = run_dir, PROFILES[profile], mem_limit_gb, log
         self.records = {}
         self.retired = set()
+        self.rejected = {}  # lineage -> reason, written to rejected.json
         for suite in ("noise", "prior", "posterior", "distributions", "lowrank", "covariance", "continuum"):
             path = self.out_path(suite)
             if os.path.exists(path):
@@ -124,6 +143,11 @@ class Runner:
                         rec = json.loads(line)
                         self.records[rec["task_id"]] = rec
                         self.update_retired(rec)
+        groups = {}
+        for rec in self.records.values():
+            groups.setdefault((rec["suite"], rec["dim"], rec["kind"], rec["order"], rec["target"]), []).append(rec)
+        for recs in groups.values():
+            self.retire_slow(recs)
 
     def out_path(self, suite):
         return os.path.join(self.run_dir, f"{suite}.jsonl")
@@ -134,10 +158,33 @@ class Runner:
         too_slow = (
             rec.get("per_sample_s", 0) > self.cfg["sample_budget"] or rec.get("setup_s", 0) > self.cfg["setup_budget"]
         )
-        if rec["status"] in FAILED or too_slow:
+        reason = None
+        if rec["status"] in FAILED:
+            reason = f"{rec['status']} at {int(rec['target'])} dofs"
+        elif too_slow:
+            reason = f"over the time budget at {int(rec['target'])} dofs"
+        elif rec["status"] == "ok" and not accurate(rec):
+            err = rec.get("cov_rel_err", rec.get("pathwise_rel_err"))
+            reason = f"inaccurate at {int(rec['target'])} dofs (error {err:.1e})"
+        if reason:
             self.retired.add(rec["lineage"])
+            self.rejected.setdefault(rec["lineage"], reason)
         if rec["status"] in ("timeout", "crash", "memlimit"):
             self.retired.add(sibling(rec))
+
+    def retire_slow(self, recs):
+        """Reject the candidates of one group that are RETIRE_RATIO x slower than the best accurate one on their
+        platform (iterative solvers in 3D excepted: their cost grows more slowly than a factorisation's)."""
+        ok = [r for r in recs if r.get("status") == "ok" and r["suite"] in ("noise", "prior") and accurate(r)]
+        best = {}
+        for r in ok:
+            key = (r["suite"], r.get("power"), r["engine"], r["device"])
+            best[key] = min(best.get(key, float("inf")), best_time(r))
+        for r in ok:
+            ratio = best_time(r) / best[(r["suite"], r.get("power"), r["engine"], r["device"])]
+            if ratio > RETIRE_RATIO and not (r["dim"] == 3 and r.get("solver") in ITERATIVE):
+                self.retired.add(r["lineage"])
+                self.rejected.setdefault(r["lineage"], f"{ratio:.0f}x slower than the best at {int(r['target'])} dofs")
 
     def is_retired(self, t):
         return lineage(t) in self.retired or sibling(t) in self.retired
@@ -230,6 +277,7 @@ class Runner:
                     self.log(f"    group setup failed twice (exit {code}): {' | '.join(tail[-2:])}")
                     return
             pending = [t for t in pending if task_id(t) not in self.records and not self.is_retired(t)]
+        self.retire_slow([self.records[task_id(t)] for t in group.to_dict()["tasks"] if task_id(t) in self.records])
 
     def reload(self, suite):
         path = self.out_path(suite)
@@ -286,9 +334,9 @@ def sibling(t):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--profile", default="standard", choices=list(PROFILES))
-    ap.add_argument("--suites", nargs="+",
-                    default=["noise", "prior", "posterior", "distributions", "lowrank", "covariance", "continuum"])
+    ap.add_argument("--profile", default="calibrate", choices=list(PROFILES))
+    ap.add_argument("--suites", nargs="+", default=None,
+                    help="default: the profile's (noise and prior, except for the research profile)")
     ap.add_argument("--devices", nargs="+", default=None, help="subset of: cpu cuda (default: all available)")
     ap.add_argument("--max-ndof", type=float, default=None)
     ap.add_argument(
@@ -309,6 +357,7 @@ def main():
     args = ap.parse_args()
 
     env = environment()
+    args.suites = args.suites or PROFILES[args.profile]["suites"]
     devices = args.devices or (["cpu", "cuda"] if env["cuda"] else ["cpu"])
     if "cuda" in devices and not env["cuda"]:
         sys.exit("CUDA requested but not usable")
@@ -323,7 +372,9 @@ def main():
         run_dir = args.resume
         with open(os.path.join(run_dir, "config.json")) as fh:
             saved = json.load(fh)
-        args.profile, devices = saved["profile"], saved["devices"]
+        args.profile, devices, args.suites = saved["profile"], saved["devices"], saved["suites"]
+        groups = build_groups(args.profile, args.suites, devices, saved.get("max_ndof"))
+        ntasks = sum(len(g.tasks) for g in groups)
     else:
         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M")
         run_dir = args.out or os.path.join(ROOT, "results", "runs", f"{env['host']}_{stamp}_{args.profile}")
@@ -369,7 +420,10 @@ def main():
             f"{f', {skipped} retired' if skipped else ''}, {time.time() - tg:.0f}s "
             f"(total {(time.time() - t0) / 60:.1f} min)"
         )
-    log("benchmarks finished; writing report")
+    with open(os.path.join(run_dir, "rejected.json"), "w") as fh:
+        json.dump(runner.rejected, fh, indent=1)
+    log(f"benchmarks finished in {(time.time() - t0) / 60:.1f} min; {len(runner.rejected)} candidates rejected; "
+        "writing report")
     import report
 
     report.write(run_dir)
