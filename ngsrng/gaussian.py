@@ -560,6 +560,12 @@ class Gaussian(InPlace, Rebuildable):
         noise. Samples run in parallel threads; sample k uses the k-th reserved key of the normal stream, so results
         equal a sequential loop of single samples, for any number of threads, and every thread writes its row of
         ``out`` directly (one cast at the end, no intermediate).
+
+        Every sample is computed single-threaded (NGSolve's kernels outside its task manager, BLAS at one thread),
+        a single sample too: then a draw repeats bit for bit, and a single draw equals the matching column of a
+        batch. NGSolve's task parallelism would speed up a lone sample (1.6-2.7x on 6 cores, measured), but its
+        threads add partial results in a varying order (~1e-16 differences from draw to draw). Only solvers that
+        must not run concurrently (BDDC-preconditioned CG) keep it, one sample at a time, and repeat to rounding.
         """
         ticket = self.stream.reserve(n) if eta is None else None
         mean, free = self._mean, self.space.free
@@ -586,11 +592,11 @@ class Gaussian(InPlace, Rebuildable):
                     out[k] = r[free] if free_only else r
 
         with numpy_blas_threads(self._cpu_blas_threads):
-            if n == 1 or not self._threadsafe:
-                with ngs.TaskManager():  # one sample at a time: NGSolve's task parallelism inside (agrees with
-                    work(0, n)           # threaded batches to rounding: its parallel kernels sum in another order)
+            if self._threadsafe:  # one sample per thread, single-threaded kernels: bit for bit, any thread count
+                parallel_ranges(n, work, self._threads)
             else:
-                parallel_ranges(n, work, self._threads)  # any thread count gives identical results
+                with ngs.TaskManager():  # one sample at a time with NGSolve's task parallelism inside (BDDC): repeats
+                    work(0, n)           # to rounding, its threads add in a varying order
         return out
 
     def apply(self, eta: torch.Tensor) -> torch.Tensor:

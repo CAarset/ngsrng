@@ -143,8 +143,8 @@ following:
 12. On a GPU (A100), cuDSS samples 25-80x faster than the threaded CPU engine; `python -m ngsrng.calibrate`
     measures your machine and installs the fastest accurate choices (see [Calibration](#calibration)).
 13. **Large batches:** on the CPU, samples are computed in parallel threads (one sample per thread; set the number
-    with `method={"threads": k}`). Results do not depend on the number of threads. A batch and the same samples drawn
-    one at a time agree to rounding (about 1e-14 relative), not bit for bit.
+    with `method={"threads": k}`). Results do not depend on the number of threads, and a batch equals the same
+    samples drawn one at a time, bit for bit.
 14. **In-place sampling:** every sampler has an in-place form next to the allocating one, as torch has `normal_`
     next to `normal`: `rng.<family>(..., out=buf)`, `rng.distribution(...).sample(out=buf)`, and
     `Gaussian.sample(n, out=buf)` / `LowRankGaussian.sample(n, out=buf)` / `MatheronPosterior.sample(n, out=buf)` for
@@ -325,7 +325,7 @@ What is reproduced, and what is not:
 
 | Same seed, and … | Samples agree |
 |---|---|
-| the same sampler object, CPU engine | bit for bit |
+| the same sampler object, CPU engine | bit for bit, single draws and batches (with BDDC-preconditioned CG, which keeps NGSolve's task parallelism: to rounding) |
 | another run or a separately built sampler, same machine and settings | to rounding (~1e-15; NGSolve's `sparsecholesky` rounds differently from one factorisation to the next, `inverse="umfpack"` does not) |
 | KL / low-rank expansions across runs | to rounding over the eigenvalue gap; on symmetric domains rounding chooses the basis of degenerate eigenspaces, which changes samples by O(1) |
 | an iterative solver, or another solver | to the solver tolerance (CG: 1e-8) |

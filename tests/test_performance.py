@@ -36,11 +36,10 @@ def test_batches_do_not_depend_on_the_thread_count(fes, nu):
             gauss.stream = NormalStream(11)
             out[threads] = gauss.sample(12).numpy()
         assert np.array_equal(out[1], out[3]) and np.array_equal(out[1], out[8])
-        # and a batch equals sequential single samples up to rounding (single samples use NGSolve's task
-        # parallelism, whose kernels sum in a different order)
+        # and a batch equals sequential single samples, bit for bit (single samples are computed like batch columns)
         gauss.stream = NormalStream(11)
         singles = np.column_stack([gauss.sample().vec.FV().NumPy() for _ in range(12)])
-        np.testing.assert_allclose(singles, out[1], rtol=0, atol=1e-11 * np.abs(out[1]).max())
+        np.testing.assert_array_equal(singles, out[1])
 
 
 def test_apply_and_solver_columns_are_exact_in_threads(fes):

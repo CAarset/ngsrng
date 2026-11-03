@@ -246,6 +246,11 @@ def parallel_ranges(n: int, work, threads: int | None = None):
     NGSolve's kernels (sparse products, direct solves) release the GIL and are thread-safe on separate vectors, so
     independent samples or columns run in parallel; results do not depend on the number of threads. Calls from inside a
     worker run sequentially (no nested parallelism, no pool deadlock).
+
+    The work always runs on pool threads, a single range too, never on the caller's: NGSolve runs its kernels
+    single-threaded there even inside the caller's ``with TaskManager():`` block (measured), whereas on the caller's
+    thread they would use the task manager, whose threads add in a varying order: results would then vary at
+    rounding level from call to call.
     """
     if getattr(_IN_WORKER, "active", False):
         work(0, n)
@@ -263,9 +268,6 @@ def parallel_ranges(n: int, work, threads: int | None = None):
     # samples, nested BLAS threads would oversubscribe the cores, and per-call thread counts chosen at run time would
     # make the rounding depend on the schedule
     with blas_threads(1):
-        if threads <= 1:
-            run(0, n)
-            return
         if not _POOL:
             _POOL.append(ThreadPoolExecutor(available_threads(), thread_name_prefix="ngsrng"))
         bounds = np.linspace(0, n, threads + 1).astype(int)

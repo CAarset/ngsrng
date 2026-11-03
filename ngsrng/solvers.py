@@ -51,8 +51,9 @@ class _NGSolveBase(Solver, Rebuildable):
         self._assemble()
 
     def _columns(self, x, solve_one):
-        """Solve column by column; columns are spread over threads (NGSolve releases the GIL), or, for a single
-        column, solved with NGSolve's own task parallelism."""
+        """Solve column by column; columns are spread over threads (NGSolve releases the GIL), each solved
+        single-threaded, a single column too, so that results repeat bit for bit. Solvers that must not run
+        concurrently (BDDC) solve one column at a time with NGSolve's task parallelism (repeats to rounding)."""
         squeeze = x.ndim == 1
         xs = (x[:, None] if squeeze else x).detach().to("cpu", torch.float64).numpy()
         free = self.space.free
@@ -67,11 +68,11 @@ class _NGSolveBase(Solver, Rebuildable):
                 solve_one(rhs, sol)
                 out[k] = sol_np[free]
 
-        if xs.shape[1] == 1 or not self.threadsafe:
+        if self.threadsafe:
+            parallel_ranges(xs.shape[1], work)
+        else:
             with ngs.TaskManager():
                 work(0, xs.shape[1])
-        else:
-            parallel_ranges(xs.shape[1], work)
         res = torch.from_numpy(out.T).to(device=x.device, dtype=x.dtype)
         return res[:, 0] if squeeze else res
 

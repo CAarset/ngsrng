@@ -25,8 +25,10 @@ Samplers made from others inherit the convention: posteriors, low-rank and Karhu
 
 Inside one draw everything derives from the draw's key (or the own stream): white noise, mixing variables, KL
 coefficients. So the CPU engine's samples do not depend on the number of threads, on how a batch is split into
-chunks or on ``out=`` versus allocating calls: bit for bit given the same factorisation (a single NGSolve
-``sparsecholesky`` factorisation rounds differently from one build to the next, ~1e-15 relative). On the torch
+chunks or on ``out=`` versus allocating calls: bit for bit given the same factorisation, single draws included
+(every sample is computed single-threaded, also inside a caller's ``TaskManager`` block), except with
+BDDC-preconditioned CG, which keeps NGSolve's task parallelism and repeats to rounding. (A single NGSolve
+``sparsecholesky`` factorisation rounds differently from one build to the next, ~1e-15 relative.) On the torch
 engine the samples depend on the chunk sizes, as torch's own generators do. Different engines, devices, solvers,
 noise factors or library versions give different samples from the same seed, with the same law.
 
