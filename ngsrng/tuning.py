@@ -398,9 +398,9 @@ def gpu_diagnosis() -> list[str]:
             lines.append("no GPU device found")
         return lines
     if amd and not nvidia and not rocm:
-        lines.append("this torch is an NVIDIA (CUDA) build, but the machine's GPU is AMD: install the ROCm build of "
-                     "torch in this environment (installing a package that depends on torch may have replaced it "
-                     "with the default wheel)")
+        lines.append("this torch is an NVIDIA (CUDA) build, which cannot drive AMD GPUs, and the machine's GPU is "
+                     "AMD: install the ROCm build of torch in this environment (installing a package that depends "
+                     "on torch may have replaced it with the default wheel)")
         return lines
     alone, after = _probe(), _probe("ngsolve")
 
@@ -426,6 +426,7 @@ def _show():
     print(f"machine: {m['cpu']} ({m['threads']} threads); GPUs: {', '.join(m.get('gpus', [])) or 'none'}")
     try:
         if not m.get("gpus"):
+            print("  torch reports no usable GPU here (ngsrng uses any GPU torch reports); why:")
             for line in gpu_diagnosis():
                 print(f"  no GPU: {line}")
     except Exception as err:  # noqa: BLE001 - informational only
