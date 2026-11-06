@@ -190,3 +190,39 @@ def test_posterior_with_given_mean_keeps_the_covariance():
     np.testing.assert_allclose(sampler_covariance(post), sampler_covariance(reference), atol=1e-12)
     with pytest.raises(ValueError):
         obs.posterior(data=np.zeros(6), mean=centre)
+
+
+def test_exact_covariance_of_conditioned_gaussians():
+    """reference.exact_covariance gives the exact covariance of the conditioned law (it used to return the prior's):
+    for both update forms, with noise scaling, for a randomised factorisation (whose sampler only approximates it),
+    downdates, Matheron and low-rank posteriors."""
+    fes = ngs.H1(ngs.Mesh(ngs.unit_square.GenerateMesh(maxh=0.25)), order=2)
+    prior = ngsrng.Gaussian(fes, ngsrng.matern(5.0, 2), dtype="float64", seed=0)
+    s0 = exact_covariance(prior)
+    noise = np.array([0.01, 0.02, 0.03])
+    obs = ngsrng.LinearObservations(prior, points=[(0.3, 0.4), (0.6, 0.5), (0.5, 0.8)], noise=noise)
+    g = obs.gf.toarray()
+
+    def posterior_cov(weights):
+        prec = np.linalg.inv(s0) + g.T @ ((weights / noise)[:, None] * g)
+        return np.linalg.inv(prec)
+
+    def close(a, b):
+        np.testing.assert_allclose(a, b, rtol=0, atol=1e-9 * np.abs(b).max())
+
+    want = posterior_cov(np.ones(3))
+    for post in (obs.posterior(form="fe"), obs.posterior(form="noise")):
+        close(exact_covariance(post), want)
+        close(sampler_covariance(post), want)
+    w = np.array([1.0, 0.0, 2.0])  # observation 1 ignored, observation 2 twice as precise
+    close(exact_covariance(obs.posterior(noise_scaling=w)), posterior_cov(w))
+    rough = ngsrng.LinearObservations(prior, points=[(0.3, 0.4), (0.6, 0.5), (0.5, 0.8)], noise=noise, rank=1,
+                                      oversampling=0)
+    close(exact_covariance(rough.posterior()), want)  # the true posterior, not the rank-1 approximation
+    assert np.abs(sampler_covariance(rough.posterior()) - want).max() > 1e-6 * np.abs(want).max()
+    b = s0 @ g.T  # C0 - B K^-1 B* with these B, K is the posterior again
+    close(exact_covariance(prior.downdate(b, np.diag(noise) + g @ s0 @ g.T)), want)
+    close(exact_covariance(ngsrng.MatheronPosterior(obs)), want)
+    kl = ngsrng.karhunen_loeve(prior, 8)
+    w8 = kl.modes[prior.space.free] * np.sqrt(kl.eigenvalues)
+    close(exact_covariance(kl), w8 @ w8.T)

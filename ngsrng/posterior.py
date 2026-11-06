@@ -335,13 +335,17 @@ class LinearObservations:
         shared = self.__dict__.setdefault("_shared_maps", {"noise": {}, "fe": {}})
         if form == "noise":
             label = f"{self.m} linear observations ({kind}, noise-space update, rank {self.rank})"
-            return self.prior._derive(label, mean, eta_map=NoiseSpaceMap(self.q, a, shared["noise"]), seed=seed)
+            return self.prior._derive(label, mean, eta_map=NoiseSpaceMap(self.q, a, shared["noise"]), seed=seed,
+                                      exact=self._exact_record(scaling))
         if form != "fe":
             raise ValueError(f"unknown form {form!r}")
         update = FESpaceUpdate(self._get_lq(), smat, self.gf, self.prior.space.free, self.prior.space.ndof,
                                shared["fe"])
         label = f"{self.m} linear observations ({kind}, FE-space update, rank {self.rank})"
-        return self.prior._derive(label, mean, post_map=update, seed=seed)
+        return self.prior._derive(label, mean, post_map=update, seed=seed, exact=self._exact_record(scaling))
+
+    def _exact_record(self, scaling):
+        return "observe", self.gf, self.wkind, self.wdata, None if scaling is None else np.asarray(scaling, float)
 
 
 # ------------------------------------------------------------------ (2) known downdate
@@ -381,7 +385,8 @@ def downdate(prior, b, k, mean=None, seed=None, tol=1e-8):
         )
     a = (v * (np.sqrt(np.clip(lam, 0.0, None)) - 1.0)) @ v.T
     mean_vec = prior.mean if mean is None else coefficient_vector(mean, s)
-    return prior._derive(f"low-rank downdate (rank {bmat.shape[1]})", mean_vec, eta_map=NoiseSpaceMap(q, a), seed=seed)
+    return prior._derive(f"low-rank downdate (rank {bmat.shape[1]})", mean_vec, eta_map=NoiseSpaceMap(q, a), seed=seed,
+                         exact=("downdate", bmat[s.free], k))
 
 
 # ------------------------------------------------------------------ (3) pathwise (Matheron) conditioning

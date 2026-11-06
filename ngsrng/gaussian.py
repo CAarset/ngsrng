@@ -136,6 +136,7 @@ class Gaussian(InPlace, Rebuildable):
         self.tol = tol
         self.seed = seed
         self._prior = None  # set on Gaussians derived by conditioning: the prior they came from
+        self._conditioning = []  # the exact updates of the prior covariance behind it (ngsrng.reference)
         self.source = as_source(seed)
         self.stream = NormalStream(self.source) if self.engine == "ngsolve" else None
         self.plan.update(engine=self.engine, device=str(self.device), dtype=str(self.dtype))
@@ -690,9 +691,14 @@ class Gaussian(InPlace, Rebuildable):
         out = torch.from_numpy(np.ascontiguousarray(v / self.scale**2))
         return out[:, 0] if c.ndim == 1 else out
 
-    def _derive(self, label, mean=None, *, eta_map=None, post_map=None, seed=None):
-        """A new Gaussian sharing this one's pipeline, with an extra noise-space or FE-space map and/or a new mean."""
+    def _derive(self, label, mean=None, *, eta_map=None, post_map=None, seed=None, exact=None):
+        """A new Gaussian sharing this one's pipeline, with an extra noise-space or FE-space map and/or a new mean.
+
+        ``exact``: the exact covariance update the maps implement (or approximate, for randomised factorisations),
+        recorded for :func:`ngsrng.reference.exact_covariance`: ``("observe", G_free, whitening kind, whitening data,
+        noise scaling)`` or ``("downdate", B_free, K)``."""
         new = copy.copy(self)
+        new._conditioning = getattr(self, "_conditioning", []) + [exact if exact is not None else ("unknown", label)]
         new.__dict__.pop("_mean_t", None)  # device copy of the parent's mean (see _torch_rows)
         new._maps = self._maps + ([eta_map] if eta_map is not None else [])
         new._post_maps = self._post_maps + ([post_map] if post_map is not None else [])

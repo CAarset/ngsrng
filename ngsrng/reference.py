@@ -8,7 +8,53 @@ from .specs import AssembledPrecision, OperatorPrecision, PDEPrecision
 
 
 def exact_covariance(g) -> np.ndarray:
-    """Exact discrete coefficient covariance Sigma_h on the free dofs of a ``Gaussian``."""
+    """Exact discrete coefficient covariance Sigma_h on the free dofs (dense; small problems).
+
+    ``g``: a ``Gaussian`` -- also a conditioned one (posteriors, downdates: the exact covariance of the conditioned
+    law, also when its sampler uses a randomised low-rank factorisation; compare with :func:`sampler_covariance`) --,
+    a ``LowRankGaussian`` or a ``MatheronPosterior``.
+    """
+    from .lowrank import LowRankGaussian
+    from .posterior import MatheronPosterior
+
+    if isinstance(g, LowRankGaussian):
+        w = g.b[g.space.free] @ g.rinv
+        return _sym(w @ w.T)
+    if isinstance(g, MatheronPosterior):
+        gamma = g.gamma_half @ g.gamma_half.T
+        return _observe(exact_covariance(g.prior), _dense(g.g), gamma=gamma)
+    sigma = _prior_covariance(g)
+    for step in getattr(g, "_conditioning", []):
+        if step[0] == "observe":
+            _, gf, kind, wdata, scaling = step
+            gw = (wdata[:, None] * _dense(gf)) if kind == "diag" else wdata @ _dense(gf)  # Gamma^-1/2 G
+            if scaling is not None:
+                gw = np.sqrt(scaling)[:, None] * gw  # noise precision of observation i times scaling[i]
+            sigma = _observe(sigma, gw)
+        elif step[0] == "downdate":
+            _, b, k = step
+            sigma = _sym(sigma - b @ np.linalg.solve(k, b.T))
+        else:
+            raise TypeError(f"no exact covariance for a Gaussian derived by {step[1]!r}")
+    return sigma
+
+
+def _dense(a):
+    return a.toarray() if hasattr(a, "toarray") else np.asarray(a, dtype=float)
+
+
+def _sym(a):
+    return 0.5 * (a + a.T)
+
+
+def _observe(sigma, g, gamma=None):
+    """Sigma - Sigma G^T (Gamma + G Sigma G^T)^-1 G Sigma (Gamma = I: G already whitened)."""
+    sg = sigma @ g.T
+    kd = g @ sg + (np.eye(g.shape[0]) if gamma is None else gamma)
+    return _sym(sigma - sg @ np.linalg.solve(kd, sg.T))
+
+
+def _prior_covariance(g) -> np.ndarray:
     s, spec = g.space, g.spec
     if isinstance(spec, PDEPrecision):
         k = s.assemble_free(spec.form).toarray()
