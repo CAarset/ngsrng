@@ -30,9 +30,9 @@ the Laplace approximation with its exact variance map and low-rank structure, an
 Laplace proposals, and a Gibbs sampler for the noise scales). It runs in about four minutes.
 
 ```python
+import ngsrng  # before NGSolve: it imports torch first
 from ngsolve import *
 import numpy as np
-import ngsrng
 
 mesh = Mesh(unit_square.GenerateMesh(maxh=0.05))
 X = H1(mesh, order=3, dirichlet="left")

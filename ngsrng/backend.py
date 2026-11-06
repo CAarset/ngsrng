@@ -17,6 +17,51 @@ def resolve_device(device) -> torch.device:
     return torch.device(device)
 
 
+class ImportOrderWarning(UserWarning):
+    """NGSolve was imported before torch: torch's batched CPU matrix products crash."""
+
+
+def check_import_order():
+    """Warn if NGSolve was imported before torch and its OpenBLAS shadows MKL's batched GEMM (known issue 1).
+
+    NGSolve loads its bundled OpenBLAS for the whole process; that OpenBLAS exports ``cblas_dgemm_batch`` and its
+    relatives under MKL's names, and torch, loaded after it, binds its batched CPU products (``torch.matmul`` /
+    ``torch.bmm`` on 3-D tensors, also inside other libraries) to them: a segmentation fault. Nothing can rebind them
+    once torch is loaded. Called by ``import ngsrng``, which imports torch first itself; the warning concerns scripts
+    that import ngsolve before ngsrng (or before torch)."""
+    import sys
+
+    names = list(sys.modules)  # in import order
+    if "ngsolve" not in names or "torch" not in names or names.index("ngsolve") > names.index("torch"):
+        return
+    if not _batched_gemm_shadowed():
+        return
+    warnings.warn("ngsolve was imported before torch: torch's batched CPU matrix products (torch.matmul / torch.bmm "
+                  "on 3-D tensors) will crash with a segmentation fault, because NGSolve's OpenBLAS shadows MKL's "
+                  "batched GEMM. Import torch, or ngsrng, before ngsolve.",
+                  ImportOrderWarning, stacklevel=3)
+
+
+def _batched_gemm_shadowed() -> bool:
+    """torch uses MKL, and a loaded OpenBLAS exports MKL's batched GEMM names (Linux; False where unknown)."""
+    import ctypes
+
+    try:
+        if not torch.backends.mkl.is_available():
+            return False
+        with open("/proc/self/maps") as fh:
+            libs = {line.split()[-1] for line in fh if "libopenblas" in line.split()[-1]}
+    except (OSError, AttributeError):
+        return False
+    for path in libs:
+        try:
+            if hasattr(ctypes.CDLL(path), "cblas_dgemm_batch"):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def cuda_usable() -> bool:
     if not torch.cuda.is_available():
         return False

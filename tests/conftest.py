@@ -1,3 +1,4 @@
+import torch  # noqa: F401, I001  (before NGSolve, which the test modules import: known issue 1)
 import os
 
 # Tests check the built-in selection rules; an installed benchmark tuning must not change them.
