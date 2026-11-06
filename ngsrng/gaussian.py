@@ -89,6 +89,11 @@ def check_method(method) -> dict:
 class Gaussian(InPlace, Rebuildable):
     """N(mean, C) as a random function in ``fes``.
 
+    Linear-algebra interface (public and stable, shared by ``LowRankGaussian`` and ``MatheronPosterior``): the
+    factor C = L L^T on the free dofs as ``apply(eta)`` (L: standard normal noise, nrand x k -> free-dof coefficients,
+    nfree x k, zero mean) and ``apply_t(y)`` (L^T), ``nrand``, ``mean`` (all dofs) and ``space``
+    (:class:`ngsrng.space.SpaceInfo`: ``fes``, ``free``, ``nfree``, ``ndof``, ``mass`` and ``mass_free``).
+
     Parameters
     ----------
     fes : FESpace (H1 or L2). Dirichlet dofs, if any, are fixed to the mean.

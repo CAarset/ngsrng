@@ -405,9 +405,7 @@ class LinearObservations:
         The factorisation does not depend on the scaling, so re-scaled posteriors cost only an l x l
         eigendecomposition (public as ``posterior(noise_scaling=...)``).
         """
-        sc = np.ones(self.m) if scaling is None else np.asarray(scaling, dtype=float)
-        if sc.shape != (self.m,) or (sc < 0).any():
-            raise ValueError("scaling must be a non-negative vector with one entry per observation")
+        sc = self._scaling(scaling)
         # NumPy BLAS threads busy-wait against NGSolve's threads even on these small l x l problems (known issue 9)
         prior = self.prior
         with numpy_blas_threads(getattr(prior, "_cpu_blas_threads", 1) if getattr(prior, "engine", "") != "torch"
@@ -436,6 +434,38 @@ class LinearObservations:
                                shared["fe"])
         label = f"{self.m} linear observations ({kind}, FE-space update, rank {self.rank})"
         return self.prior._derive(label, mean, post_map=update, seed=seed, exact=self._exact_record(scaling))
+
+    def _scaling(self, scaling) -> np.ndarray:
+        sc = np.ones(self.m) if scaling is None else np.asarray(scaling, dtype=float)
+        if sc.shape != (self.m,) or (sc < 0).any():
+            raise ValueError("noise_scaling must be a non-negative vector with one entry per observation")
+        return sc
+
+    def posterior_update(self, noise_scaling=None):
+        """The posterior covariance as a low-rank update of the prior's, from the factorisation: (U, D) with
+
+            Sigma_post = Sigma0 + U D U^T  (free dofs),  U = L Q (``lq()``, nfree x rank),  D = (I + R S R^T)^-1 - I,
+
+        S = diag(noise_scaling) (the noise precision of observation i times its entry; default 1). Exact for an exact
+        factorisation; for a randomised one it is the covariance of ``posterior(form="noise")``. No solves beyond
+        ``lq()`` (once): an r x r inverse per scaling, so many scalings (reweighting, experimental designs) are cheap.
+        Pass it to :meth:`ngsrng.LocalCovariance.plus`, or use :meth:`local_covariance`."""
+        sc = self._scaling(noise_scaling)
+        middle = np.eye(self.rank) + (self.r * sc) @ self.r.T
+        d = np.linalg.inv(0.5 * (middle + middle.T)) - np.eye(self.rank)
+        return self.lq(), 0.5 * (d + d.T)
+
+    def local_covariance(self, noise_scaling=None, prior_method="exact", **prior_options):
+        """The posterior covariance on element-local dof pairs (:class:`ngsrng.LocalCovariance`): its ``variance()``
+        (pointwise variance map), ``trace()`` (L2 trace) and ``std()``, for any noise scaling.
+
+        The prior's part comes from :func:`ngsrng.local_covariance` (``prior_method``, ``prior_options``; computed once
+        and cached on the prior: "exact" costs n_free applications of the prior covariance, "lowrank" is the
+        randomised alternative), the update from :meth:`posterior_update`: no solves per scaling."""
+        from .covariance import local_covariance
+
+        base = local_covariance(self.prior, prior_method, **prior_options)
+        return base.plus([self.posterior_update(noise_scaling)], method=f"{base.method} + factorised update")
 
     def _exact_record(self, scaling):
         return "observe", self.gf, self.wkind, self.wdata, None if scaling is None else np.asarray(scaling, float)

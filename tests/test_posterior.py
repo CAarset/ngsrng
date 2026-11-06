@@ -292,3 +292,21 @@ def test_factorisation_api():
     np.testing.assert_allclose(obs_c.data_variance(), np.diag(gsg), rtol=1e-10)
     est, err = ngsrng.xnystrace(lambda x: s0 @ x, s0.shape[0], 40, np.random.default_rng(0))
     assert abs(est - np.trace(s0)) < 5 * err + 1e-8 * np.trace(s0)
+
+
+def test_reweighted_posterior_variance_and_trace():
+    """Variance maps and traces of the posterior for any noise scaling, from the factorisation (no new solves)."""
+    fes = ngs.H1(ngs.Mesh(ngs.unit_square.GenerateMesh(maxh=0.25)), order=2)
+    prior = ngsrng.Gaussian(fes, ngsrng.matern(5.0, 2), dtype="float64", seed=0)
+    pts = [(0.3, 0.4), (0.6, 0.5), (0.5, 0.8)]
+    obs = LinearObservations(prior, points=pts, noise=0.01)
+    free, mass = prior.space.free, prior.space.mass_free
+    e = ngsrng.observation_operator(fes, points=[(0.31, 0.42), (0.7, 0.7), (0.1, 0.9)])[:, free]
+    for w in (None, np.array([1.0, 0.0, 4.0])):
+        want = exact_covariance(obs.posterior(noise_scaling=w))
+        u, d = obs.posterior_update(w)
+        np.testing.assert_allclose(exact_covariance(prior) + u @ d @ u.T, want, atol=1e-10 * np.abs(want).max())
+        lc = obs.local_covariance(w)
+        assert abs(lc.trace()[0] - float(np.sum(want * mass.toarray()))) < 1e-10 * np.trace(want)
+        np.testing.assert_allclose(lc.values(e), np.diag(e @ want @ e.T), rtol=1e-9)
+    assert obs.local_covariance().variance().space.ndof > 0  # the variance map as a GridFunction

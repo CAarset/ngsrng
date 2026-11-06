@@ -240,6 +240,8 @@ post.sample(100)  # costs about one prior sample each
 obs.R, obs.singular_values, obs.lq()  # R = diag(s) V^T (rank x m), s, L Q (free-dof coefficients, nfree x rank)
 obs.exact, obs.G_free, obs.noise_std  # exact or randomised; G on the free dofs; noise std (None if correlated)
 obs.data_variance()  # Var((G f)_i) = (G C0 G^T)_ii of every noise-free observation, exactly
+U, D = obs.posterior_update(noise_scaling=w)  # Sigma_post = Sigma0 + U D U^T, no solves per scaling w
+lc = obs.local_covariance(noise_scaling=w)   # its variance map lc.variance(), L2 trace lc.trace(), lc.std()
 
 post = prior.downdate(B, K)  # a known posterior C0 - B K^-1 B*, given directly
 
@@ -273,6 +275,8 @@ covariance (the expected squared L2 norm of a sample).
 var = ngsrng.pointwise_variance(prior)          # GridFunction: Draw(var), or the std as ngs.sqrt(var)
 ngsrng.pointwise_variance(post)                 # posterior: the prior's variance plus an exact low-rank update
 ngsrng.covariance_trace(prior)                  # tr C = int k(x, x) dx, with its error and cost
+ngsrng.covariance_trace(prior, weight=W)        # tr(Sigma W) = E||f - m||_W^2, e.g. W = B^T M B: the mean
+                                                # energy of a linear image B f (a PDE solution driven by f)
 k0 = ngsrng.covariance_function(prior, (0.5, 0.5))  # k(x0, .): covariance of the value at x0 with the field
 S = ngsrng.functional_covariance(post, points=pts)  # exact covariance of point values, averages, LinearForms, ...
 ens = ngsrng.sample_covariance(prior, 50)       # ensemble model: the sample covariance of 50 samples (Wishart)
@@ -363,6 +367,15 @@ uv pip install -e ".[amg]"            # optional, other GPUs (AMD/ROCm): AMG-pre
 uv pip install -e ".[examples]"       # optional: Jupyter, anywidget (for Draw) and matplotlib, for the tutorial
 uv pip install -e /path/to/ngsplot     # optional: local package for the tutorial's side-by-side panels
 ```
+AMD GPUs need PyTorch's ROCm build, installed into the environment from PyTorch's ROCm index (pytorch.org) with
+`pip` or `uv pip`. It cannot go into a uv lock file: the ROCm index publishes no wheel metadata, and its torch 2.15
+wheels also depend on AMD's separate `rocm[device-all]` packages (reported downstream, 2026-11-06). The NVIDIA
+extra `ngsrng[gpu]` locks normally.
+
+Code built on ngsrng can rely on the samplers' linear-algebra interface: `apply(eta)` / `apply_t(y)` (the factor
+L of C = L L^T and its transpose, on free-dof coefficients), `nrand`, `mean` and `space` (`fes`, `free`, `nfree`,
+`ndof`, `mesh`, `mass`, `mass_free`), shared by `Gaussian`, `LowRankGaussian` and `MatheronPosterior`; and on
+`LinearObservations`' factorisation (see Posteriors).
 
 ## Calibration
 

@@ -307,3 +307,23 @@ def test_operator_kl_says_when_it_stops_short():
     with pytest.warns(UserWarning, match="stopped at rank 8 \\(max_rank=8\\)"):
         kl = cov.bind(fes, seed=0)
     assert kl.trace_residual > 1e-6
+
+
+def test_weighted_trace():
+    """tr(Sigma W) = E ||f - m||_W^2 for a weight W (a matrix or a function), e.g. the energy of a linear image."""
+    from ngsrng.reference import exact_covariance
+
+    fes = ngs.H1(ngs.Mesh(ngs.unit_square.GenerateMesh(maxh=0.25)), order=2)
+    g = ngsrng.Gaussian(fes, ngsrng.matern(5.0, 2), dtype="float64", seed=0)
+    from ngsrng.space import assemble
+
+    s0 = exact_covariance(g)
+    free = g.space.free
+    w = assemble(fes, lambda u, v: ngs.grad(u) * ngs.grad(v) * ngs.dx)[free][:, free]  # H1 seminorm energy
+    want = float(np.sum(s0 * w.toarray()))
+    for weight in (w, lambda y: w @ y):
+        est = ngsrng.covariance_trace(g, weight=weight, probes=40)
+        assert est.method == "xnystrace" and abs(est.value - want) < 5 * est.stderr + 1e-8 * want
+    assert abs(ngsrng.covariance_trace(g, "hutchinson", weight=w, probes=400).value - want) < 0.2 * want
+    with pytest.raises(ValueError, match="randomised method"):
+        ngsrng.covariance_trace(g, "exact", weight=w)

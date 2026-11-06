@@ -276,7 +276,11 @@ class LocalCovariance:
     method: str = ""
     applications: int = 0
 
-    def plus(self, terms, method, applications) -> "LocalCovariance":
+    def plus(self, terms, method=None, applications=0) -> "LocalCovariance":
+        """The local covariance of Sigma + sum_k U_k D_k U_k^T: ``terms`` are (U, D) pairs, U (nfree x r) and D
+        (r x r, or None for the identity), e.g. a posterior update (:meth:`ngsrng.LinearObservations.posterior_update`).
+        ``method`` and ``applications`` record how the terms were computed (applications of Sigma, L or L^T)."""
+        method = f"{self.method} + {len(terms)} low-rank term(s)" if method is None else method
         return LocalCovariance(self.space, self.pattern, self.terms + list(terms), self.mc, method,
                                self.applications + applications)
 
@@ -516,8 +520,8 @@ def _monte_carlo(src, samples, rng) -> LocalCovariance:
 
 @dataclass
 class TraceEstimate:
-    """tr(C) = tr(Sigma M) = int k(x, x) dx, with a standard error (0 when exact) and the cost in applications of
-    Sigma, L or L^T."""
+    """tr(C) = tr(Sigma M) = int k(x, x) dx (or tr(Sigma W) for a weight W), with a standard error (0 when exact) and
+    the cost in applications of Sigma, L or L^T."""
 
     value: float
     stderr: float
@@ -529,8 +533,15 @@ class TraceEstimate:
 
 
 def covariance_trace(source, method="auto", *, fes=None, convention=None, probes=60, seed=0,
-                     variance_method="auto", **local_options) -> TraceEstimate:
-    """The L2 trace tr(C) = tr(Sigma M) = int k(x, x) dx of a covariance.
+                     variance_method="auto", weight=None, **local_options) -> TraceEstimate:
+    """The L2 trace tr(C) = tr(Sigma M) = int k(x, x) dx of a covariance, or with ``weight`` W the weighted trace
+    tr(Sigma W) = E ||f - m||_W^2.
+
+    ``weight``: a symmetric positive semidefinite map W on free-dof coefficient blocks (NumPy (nfree x k) -> (nfree x
+    k), or a matrix), default the mass matrix M. For a linear image B f of the field, e.g. a PDE solution driven by f,
+    W = B^T M_B B gives the mean energy E ||B (f - m)||^2 of the image in the image space's mass matrix M_B. With a
+    weight, the source needs a factor Sigma = L L^T (Gaussians, low-rank models, posteriors) and the method is one of
+    the randomised estimators ("auto": "xnystrace"), on A = L^T W L.
 
     ``method``:
 
@@ -550,6 +561,14 @@ def covariance_trace(source, method="auto", *, fes=None, convention=None, probes
     """
     _check_method_arg(method)
     src = as_covariance(source, fes, convention)
+    if weight is not None:
+        if method == "auto":
+            method = "xnystrace"
+        if method not in ("hutchinson", "hutch++", "xnystrace"):
+            raise ValueError("a weighted trace needs a randomised method: 'xnystrace', 'hutch++' or 'hutchinson'")
+        if not src.has_factor:
+            raise ValueError("a weighted trace needs a source with a factor Sigma = L L^T (a Gaussian, a low-rank "
+                             "model or a posterior), not an apply-only covariance")
     if method == "auto":
         cheap = src.lowrank is not None or src.update is not None or src.space.nfree <= EXACT_LIMIT
         method = "exact" if cheap else "xnystrace"
@@ -560,21 +579,30 @@ def covariance_trace(source, method="auto", *, fes=None, convention=None, probes
     if method not in ("hutchinson", "hutch++", "xnystrace"):
         raise ValueError("method must be 'auto', 'exact', 'variance', 'hutchinson', 'hutch++' or 'xnystrace'")
     with numpy_blas_threads(src.blas):
-        return _randomized_trace(src, method, probes, seed)
+        return _randomized_trace(src, method, probes, seed, weight)
 
 
-def _randomized_trace(src, method, probes, seed):
+def _randomized_trace(src, method, probes, seed, weight=None):
     rng = np.random.default_rng(seed)
     mass = src.space.mass_free
+    if weight is None:
+        def apply_w(y):
+            return mass @ y
+    elif callable(weight):
+        def apply_w(y):
+            return np.asarray(weight(y), dtype=float)
+    else:
+        def apply_w(y):
+            return np.asarray(weight @ y, dtype=float)
     if src.has_factor:
         n, cost_apply, cost_quad = src.nrand, 2, 1
 
         def apply_a(x):
-            return src.lt(mass @ src.l(x))
+            return src.lt(apply_w(src.l(x)))
 
         def quad(x):
             lx = src.l(x)
-            return np.sum(lx * (mass @ lx), axis=0)
+            return np.sum(lx * apply_w(lx), axis=0)
     else:
         noise, _ = _white_noise(src.space)
         n, cost_apply, cost_quad = noise.nrand, 1, 1

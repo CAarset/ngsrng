@@ -30,7 +30,10 @@ def mass_form(u, v):
 
 @dataclass
 class SpaceInfo:
-    """Wraps an FE space. All sampler vectors live on the free dofs (length ``nfree``)."""
+    """Wraps an FE space. All sampler vectors live on the free dofs (length ``nfree``).
+
+    Public and stable: ``fes``, ``free`` (indices of the free dofs), ``nfree``, ``ndof``, ``mesh``, ``dim``, ``mass``
+    (all dofs) and ``mass_free`` (scipy CSR matrices); the rest serves ngsrng's own algorithms."""
 
     fes: ngs.FESpace
     free: np.ndarray = field(init=False)
