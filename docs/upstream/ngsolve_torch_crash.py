@@ -7,7 +7,7 @@
 import sys
 
 if "--torch-first" in sys.argv:
-    import torch
+    import torch  # noqa: I001  (the order is the point)
     import ngsolve
 else:
     import ngsolve  # loads its bundled OpenBLAS with RTLD_GLOBAL
