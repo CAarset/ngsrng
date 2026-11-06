@@ -1,4 +1,5 @@
-"""Observation operators: any finite set of bounded linear functionals on a FE space, as sparse G (m x ndof)."""
+"""Observation operators: any finite set of bounded linear functionals on a FE space, as G (m x ndof): sparse, or
+dense where the rows are (see DENSE_FRACTION)."""
 
 import ngsolve as ngs
 import numpy as np
@@ -6,6 +7,17 @@ import scipy.linalg as sla
 import scipy.sparse as sp
 
 CHUNK = 256
+# G with more nonzeros than this fraction of its entries is kept dense: products with full rows run in multithreaded
+# BLAS, while scipy multiplies a sparse matrix single-threaded, several times slower, and stores 1.5x the memory
+# (and converting a full G to NGSolve's sparse format took 25 s for 600 x 32k entries).
+DENSE_FRACTION = 0.25
+
+
+def dense_if_full(g):
+    """G as a dense array if it is sparse but mostly nonzero (see DENSE_FRACTION); otherwise unchanged."""
+    if sp.issparse(g) and g.nnz > DENSE_FRACTION * g.shape[0] * g.shape[1]:
+        return g.toarray()
+    return g
 
 
 def observation_operator(fes, matrix=None, functionals=None, points=None, averages=None, adjoint=None, m=None):
@@ -26,7 +38,21 @@ def observation_operator(fes, matrix=None, functionals=None, points=None, averag
 
     Every observation must see the field: a row that is identically zero (e.g. a ``ds`` region name that matches no
     boundary) raises ValueError, as does a point outside the mesh.
+
+    Returns a scipy CSR matrix, or a dense float64 array when ``matrix`` is a dense array and the only source (e.g.
+    observations of a PDE solution, whose rows are full): it is not converted to a sparse matrix of full rows.
     """
+    dense = (matrix is not None and not sp.issparse(matrix) and not hasattr(matrix, "matvec")
+             and adjoint is None and not functionals and averages is None and points is None)
+    if dense:
+        g = np.ascontiguousarray(matrix, dtype=float)
+        if g.ndim != 2 or g.shape[1] != fes.ndof:
+            raise ValueError(f"observation matrix has shape {g.shape}, space has {fes.ndof} dofs")
+        empty = np.flatnonzero(~g.any(axis=1))
+        if empty.size:
+            raise ValueError(f"observation(s) {empty[:10].tolist()} are identically zero; an observation must depend "
+                             "on the field")
+        return g
     # Rows are kept sparse as they come (G is m x ndof: dense intermediates would cost m ndof values); matrix-free maps
     # are applied CHUNK observations at a time
     blocks = []

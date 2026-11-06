@@ -661,16 +661,18 @@ def functional_covariance(source, operator=None, *, fes=None, convention=None, *
     averages, LinearForms, matrices or matrix-free maps (``operator`` and ``observations`` as in
     :func:`ngsrng.observation_operator`). Exact, one application of Sigma per functional. Its diagonal is the exact
     variance at points; for a posterior it is the predictive covariance of noise-free observations."""
-    from .observations import observation_operator
+    from .observations import dense_if_full, observation_operator
 
     src = as_covariance(source, fes, convention)
     s = src.space
-    g = observation_operator(s.fes, operator, **observations)[:, s.free]
-    gt = g.T.tocsc()
+    g = dense_if_full(observation_operator(s.fes, operator, **observations))[:, s.free]
+    gt = g.T.tocsc() if sp.issparse(g) else g.T
     out = np.empty((g.shape[0], g.shape[0]))
     with numpy_blas_threads(src.blas):
         for i in range(0, g.shape[0], CHUNK):  # nfree x CHUNK at a time, not nfree x m
-            out[:, i:i + CHUNK] = np.asarray(g @ src.sigma(gt[:, i:i + CHUNK].toarray()))
+            blk = gt[:, i:i + CHUNK]
+            blk = blk.toarray() if sp.issparse(blk) else np.ascontiguousarray(blk)
+            out[:, i:i + CHUNK] = np.asarray(g @ src.sigma(blk))
     return 0.5 * (out + out.T)
 
 

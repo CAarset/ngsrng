@@ -33,7 +33,7 @@ import torch
 
 from .backend import Scratch, available_memory, numpy_blas_threads
 from .inplace import InPlace
-from .observations import CHUNK, observation_operator, whiten, whitener
+from .observations import CHUNK, dense_if_full, observation_operator, whiten, whitener
 from .randomized import randomized_qr
 from .seeding import inherit
 from .space import coefficient_columns, coefficient_vector
@@ -43,7 +43,7 @@ from .space import coefficient_columns, coefficient_vector
 
 def check_memory(prior, columns, rows_per_column, what, hint):
     """Raise MemoryError before a set-up allocates ``columns`` dense float64 columns of ``rows_per_column`` entries in
-    total (e.g. 3 nrand + 2 nfree per observation for an exact posterior) beyond the available host memory, and, for
+    total (e.g. nrand + 2 nfree per observation for an exact posterior) beyond the available host memory, and, for
     a prior on a CUDA device, its F^T and Q (2 nrand per column) beyond the free device memory."""
     need = 8.0 * columns * rows_per_column
     avail = available_memory()
@@ -100,19 +100,40 @@ class NoiseSpaceMap:
         return x + q @ (a @ (q.T @ x))
 
 
+def _qr(ft: torch.Tensor):
+    """Householder QR of F^T (nrand x m, column-major): torch's (MKL on the CPU, twice as fast as SciPy's OpenBLAS
+    here; F^T and Q are both alive) while two such blocks fit in half the available memory, else SciPy's in place (Q
+    overwrites F^T: one block). Returns NumPy (Q, R)."""
+    if ft.device.type == "cpu":
+        avail = available_memory()
+        if avail is not None and 2 * ft.numel() * ft.element_size() > 0.5 * avail:
+            return sla.qr(ft.numpy(), mode="economic", overwrite_a=True, check_finite=False)
+    q, r = torch.linalg.qr(ft)
+    return q.detach().cpu().double().numpy(), r.detach().cpu().double().numpy()
+
+
+def _rotate_in_place(q: np.ndarray, u: np.ndarray, rows: int = 4096) -> np.ndarray:
+    """Q U (n x k, k <= columns of Q) written into Q's first k columns, ``rows`` rows at a time: no second n x k
+    array. Returns that view."""
+    k = u.shape[1]
+    for i in range(0, q.shape[0], rows):
+        q[i : i + rows, :k] = q[i : i + rows] @ u
+    return q[:, :k]
+
+
 class FESpaceUpdate:
     """c -> c + P S (G c) applied to the output of the prior pipeline (free-dof coefficient vectors).
 
-    P: (nfree x r) dense, S: (r x m) small dense, G: (m x nfree) sparse observation rows. For the noise-space update
-    eta -> eta + Q A Q^T eta, using Q^T eta = s^-1 V^T F eta and F eta = Gamma^-1/2 G (L eta), the same posterior is
-    c -> c + (L Q) A s^-1 V^T Gamma^-1/2 G c. A sample then needs a sparse G product and one pass over L Q (nfree x r)
-    instead of two passes over Q (nrand x r). A s^-1 stays bounded as s -> 0, so this is stable.
+    P: (nfree x r) dense, S: (r x m) small dense, G: (m x nfree) observation rows, sparse or dense. For the
+    noise-space update eta -> eta + Q A Q^T eta, using Q^T eta = s^-1 V^T F eta and F eta = Gamma^-1/2 G (L eta), the
+    same posterior is c -> c + (L Q) A s^-1 V^T Gamma^-1/2 G c. A sample then needs a G product and one pass over L Q
+    (nfree x r) instead of two passes over Q (nrand x r). A s^-1 stays bounded as s -> 0, so this is stable.
     """
 
     def __init__(self, p: np.ndarray, smat: np.ndarray, g: sp.csr_matrix, free: np.ndarray, ndof: int, shared=None):
         self.p = np.ascontiguousarray(p, dtype=np.float64)
         self.s = np.ascontiguousarray(smat, dtype=np.float64)
-        self.g = g.tocsr()
+        self.g = g.tocsr() if sp.issparse(g) else np.ascontiguousarray(g, dtype=np.float64)
         self.free, self.ndof = free, ndof
         self._torch = {}
         self._ngs = None
@@ -130,11 +151,12 @@ class FESpaceUpdate:
             from .backend import sparse_to_torch
 
             if key not in self._shared:
-                self._shared[key] = (
-                    torch.from_numpy(self.p).to(device, dtype),
-                    sparse_to_torch(self.g, device, dtype),
-                    sparse_to_torch(self.g.T.tocsr(), device, dtype),
-                )
+                if sp.issparse(self.g):
+                    g, gt = sparse_to_torch(self.g, device, dtype), sparse_to_torch(self.g.T.tocsr(), device, dtype)
+                else:
+                    g = torch.from_numpy(self.g).to(device, dtype)
+                    gt = g.T
+                self._shared[key] = (torch.from_numpy(self.p).to(device, dtype), g, gt)
             p, g, gt = self._shared[key]
             self._torch[key] = (p, torch.from_numpy(self.s).to(device, dtype), g, gt)
         return self._torch[key]
@@ -153,7 +175,8 @@ class FESpaceUpdate:
             from .backend import ngs_sparse
 
             if "ngs" not in self._shared:
-                gfull = ngs_sparse(self.g, cols=self.free, ncols=self.ndof)
+                # dense rows: NumPy (one GEMV per sample) instead of an NGSolve sparse matrix of full rows
+                gfull = ngs_sparse(self.g, cols=self.free, ncols=self.ndof) if sp.issparse(self.g) else None
                 pmv = ngs.MultiVector(vec, self.rank)
                 for k in range(self.rank):
                     col = pmv[k].FV().NumPy()
@@ -161,11 +184,15 @@ class FESpaceUpdate:
                     col[self.free] = self.p[:, k]
                 self._shared["ngs"] = (gfull, pmv)
             gfull, pmv = self._shared["ngs"]
-            self._ngs = (gfull, pmv, Scratch(gfull.CreateColVector))  # work vector per thread
+            self._ngs = (gfull, pmv, Scratch(gfull.CreateColVector) if gfull is not None else None)  # per thread
         gfull, pmv, scratch = self._ngs
-        y = scratch.get()
-        y.data = gfull * vec
-        coeff = self.s @ y.FV().NumPy()
+        if gfull is None:
+            obs = self.g @ vec.FV().NumPy()[self.free]
+        else:
+            y = scratch.get()
+            y.data = gfull * vec
+            obs = y.FV().NumPy()
+        coeff = self.s @ obs
         vec.data += pmv * ngs.Vector(list(coeff))
 
 
@@ -209,27 +236,35 @@ class LinearObservations:
     ):
         self.prior = prior
         s = prior.space
-        self.G = observation_operator(s.fes, operator, functionals, points, averages, adjoint, m)
+        # G (m x ndof): sparse, or dense when its rows are full (a dense matrix, e.g. observations of a PDE solution)
+        self.G = dense_if_full(observation_operator(s.fes, operator, functionals, points, averages, adjoint, m))
         self.m = self.G.shape[0]
         self.wkind, self.wdata = whitener(noise, self.m)
         self.noise = noise
-        self.gf = self.G[:, s.free]  # observation of the free part
-        # Gamma^-1/2 G_free (m x nfree): sparse for diagonal noise, dense only when correlated noise mixes the rows
-        gh = sp.diags(self.wdata) @ self.gf if self.wkind == "diag" else self.wdata @ self.gf
+        # observation of the free part (no copy when every dof is free)
+        self.gf = self.G if len(s.free) == s.ndof else self.G[:, s.free]
+        # Gamma^-1/2 G_free (m x nfree), set-up only: sparse stays sparse for diagonal noise
+        if self.wkind == "diag":
+            gh = sp.diags(self.wdata) @ self.gf if sp.issparse(self.gf) else self.wdata[:, None] * self.gf
+        else:
+            gh = self.wdata @ self.gf
         self._lq = None
         if not factorize:  # observation operator only (e.g. for MatheronPosterior)
             return
-        # dense blocks of the set-up (columns: observations, or the sketch width): F^T, its Q factor and Q U
-        # (nrand each), L Q and its NGSolve/torch copy for the FE-space form (nfree each)
+        # dense blocks of the set-up (columns: observations, or the sketch width): F^T and its Q factor (nrand; Q
+        # overwrites F^T when memory is short, see _qr; Q U overwrites Q; the randomised sketch keeps three such
+        # blocks), L Q and its NGSolve/torch copy for the FE-space form (nfree each)
         width = self.m if rank is None else min(self.m, int(rank) + int(oversampling))
-        check_memory(prior, width, 3 * prior.nrand + 2 * s.nfree,
+        check_memory(prior, width, (1 if rank is None else 3) * prior.nrand + 2 * s.nfree,
                      "the exact posterior" if rank is None else f"the rank-{rank} posterior",
                      "Use rank=k (randomised low rank: (2q+2)(k+oversampling) applications of L, error set by the "
                      "decay of the data-informed spectrum), or fewer observations." if rank is None else
                      "Use a smaller rank.")
         if rank is None:
-            ft = self._lt(gh.T)  # F^T = L^T G^T Gamma^-T/2 (nrand x m)
-            q, r = torch.linalg.qr(ft)
+            ft = self._lt(gh.T)  # F^T = L^T G^T Gamma^-T/2 (nrand x m), column-major
+            del gh
+            q, r = _qr(ft)
+            del ft
             self.exact = True
         else:
             blas = getattr(prior, "_cpu_blas_threads", 1) if getattr(prior, "engine", "") != "torch" else None
@@ -242,13 +277,13 @@ class LinearObservations:
                 )
             q, r = torch.from_numpy(q), torch.from_numpy(r)
             self.exact = False
-        q = q.detach().cpu().double().numpy()
-        r = r.detach().cpu().double().numpy()
+        if isinstance(q, torch.Tensor):
+            q, r = q.detach().cpu().double().numpy(), r.detach().cpu().double().numpy()
         # Rotate to the SVD basis of R (F^T = Q R = (Q U) s V^T) and drop exactly degenerate directions: then
         # q = Q U has orthonormal columns, r = s V^T, and the FE-space form needs s^-1 only where s > 0.
         u, sv, vt = np.linalg.svd(r, full_matrices=False)
         keep = sv > (np.finfo(float).eps * max(r.shape) * (sv.max() if sv.size else 0.0))
-        self.q, self.sv, self.vt = q @ u[:, keep], sv[keep], vt[keep]
+        self.q, self.sv, self.vt = _rotate_in_place(q, u[:, keep]), sv[keep], vt[keep]
         self.r = self.sv[:, None] * self.vt
 
     def _get_lq(self):
@@ -270,8 +305,8 @@ class LinearObservations:
             blk = x[:, i : i + CHUNK]
             blk = blk.toarray() if sp.issparse(blk) else np.ascontiguousarray(blk)
             col = self.prior.apply_t(torch.from_numpy(blk))
-            if out is None:
-                out = torch.empty((col.shape[0], x.shape[1]), dtype=torch.float64, device=col.device)
+            if out is None:  # column-major: each chunk is a contiguous write, and LAPACK's QR can work in place
+                out = torch.empty((x.shape[1], col.shape[0]), dtype=torch.float64, device=col.device).T
             out[:, i : i + col.shape[1]] = col
         return out
 
@@ -405,7 +440,7 @@ class MatheronPosterior(InPlace):
         prior, s = obs.prior, obs.prior.space
         check_memory(prior, obs.m, prior.nrand + 2 * s.nfree, "Matheron conditioning",
                      "Use LinearObservations(..., rank=k).posterior() for many observations.")
-        g = obs.gf  # sparse (m x nfree)
+        g = obs.gf  # (m x nfree), sparse or dense
         gamma = np.diag(1.0 / obs.wdata**2) if obs.wkind == "diag" else np.asarray(obs.noise, dtype=float)
         lt = obs._lt(g.T)
         self.bmat = obs._l(lt.cpu().numpy())  # Sigma0 G^T (nfree x m_a)

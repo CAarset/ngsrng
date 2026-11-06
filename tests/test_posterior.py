@@ -226,3 +226,40 @@ def test_exact_covariance_of_conditioned_gaussians():
     kl = ngsrng.karhunen_loeve(prior, 8)
     w8 = kl.modes[prior.space.free] * np.sqrt(kl.eigenvalues)
     close(exact_covariance(kl), w8 @ w8.T)
+
+
+@pytest.mark.parametrize("engine", ["ngsolve", "torch"])
+def test_dense_observation_matrix_stays_dense(engine, monkeypatch):
+    """A dense observation matrix (e.g. observations of a PDE solution) stays dense: it gives the posterior of the same
+    matrix stored sparse, through both update forms and engines, and functional_covariance agrees; the in-place QR
+    (used when memory is short) gives the same factorisation."""
+    import scipy.sparse as sp
+
+    fes = ngs.H1(ngs.Mesh(ngs.unit_square.GenerateMesh(maxh=0.25)), order=2, dirichlet="left")
+    prior = ngsrng.Gaussian(fes, ngsrng.matern(5.0, 2), dtype="float64", seed=0, method={"engine": engine})
+    g = np.random.default_rng(0).standard_normal((7, fes.ndof))
+    assert isinstance(ngsrng.observation_operator(fes, g), np.ndarray)
+    with pytest.raises(ValueError, match="identically zero"):
+        ngsrng.observation_operator(fes, np.vstack([g, np.zeros(fes.ndof)]))
+    dense = LinearObservations(prior, g, noise=0.1)
+    sparse = LinearObservations(prior, sp.csr_matrix(g) * 1.0, noise=0.1)
+    assert isinstance(dense.gf, np.ndarray)  # (a full sparse matrix is densified too)
+    want = exact_covariance(dense.posterior())
+    np.testing.assert_allclose(exact_covariance(sparse.posterior()), want, atol=1e-12 * np.abs(want).max())
+    for form in ("fe", "noise"):
+        got = sampler_covariance(dense.posterior(form=form))
+        np.testing.assert_allclose(got, want, rtol=0, atol=1e-9 * np.abs(want).max())
+    if engine == "ngsolve":  # the NGSolve per-sample path of the FE-space update
+        post = dense.posterior(data=np.zeros(7))
+        x = post.sample(4000).numpy()
+        free = prior.space.free
+        emp = np.cov(x[free])
+        assert np.abs(emp - want).max() < 0.15 * np.abs(want).max()
+    fc = ngsrng.functional_covariance(prior, g[:3])
+    np.testing.assert_allclose(fc, g[:3, prior.space.free] @ exact_covariance(prior) @ g[:3, prior.space.free].T,
+                               rtol=1e-8)
+    monkeypatch.setattr("ngsrng.posterior.available_memory", lambda: 1.0)  # forces the in-place QR ...
+    monkeypatch.setattr("ngsrng.posterior.check_memory", lambda *args, **kwargs: None)  # ... past the memory check
+    in_place = LinearObservations(prior, g, noise=0.1)
+    np.testing.assert_allclose(in_place.sv, dense.sv, rtol=1e-10)
+    np.testing.assert_allclose(exact_covariance(in_place.posterior()), want, atol=1e-12 * np.abs(want).max())
