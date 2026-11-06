@@ -17,6 +17,7 @@ from .covariance import (
     local_covariance,
     pointwise_variance,
     sample_covariance,
+    xnystrace,
 )
 from .gaussian import Gaussian
 from .generator import FieldDistribution, Generator, default_rng
@@ -39,6 +40,7 @@ __all__ = [
     "covariance_trace",
     "covariance_function",
     "functional_covariance",
+    "xnystrace",
     "sample_covariance",
     "LocalCovariance",
     "TraceEstimate",

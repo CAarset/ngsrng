@@ -214,6 +214,15 @@ class LinearObservations:
         approximate, but only (2q + 2)(k + oversampling) applications of L or L^T. ``low_rank_method="power"`` uses
         plain power iteration instead (for comparison).
     factorize : False builds only the observation operator (for :class:`MatheronPosterior`).
+
+    The factorisation (public, also for code built on it, e.g. optimal experimental design): with the whitened,
+    prior-preconditioned forward map F = Gamma^-1/2 G L (L: the prior's factor, C0 = L L^T on the free dofs),
+    F^T = Q R with orthonormal Q (nrand x rank). ``R`` (rank x m) = diag(s) V^T in the SVD basis of R,
+    ``singular_values`` s (descending), ``lq()`` = L Q (free-dof coefficients, nfree x rank), ``exact`` (False for
+    the randomised factorisation, where F^T ~ Q R), ``G`` and ``G_free`` the observation operator on all / the free
+    dofs (sparse, or dense for full rows), ``noise_std`` and ``correlated_noise`` the noise model. Every posterior
+    follows from them: Sigma_post = C0 - (L Q) (I - (I + R S R^T)^-1) (L Q)^T for noise precisions scaled by S
+    (``posterior(noise_scaling=...)``).
     """
 
     def __init__(
@@ -291,6 +300,55 @@ class LinearObservations:
         if self._lq is None:
             self._lq = self._l(self.q)
         return self._lq
+
+    def lq(self) -> np.ndarray:
+        """L Q (nfree x rank): the factorisation's noise-space basis Q mapped to free-dof coefficients (computed once,
+        rank applications of L). See the class docstring."""
+        return self._get_lq()
+
+    @property
+    def R(self) -> np.ndarray:  # noqa: N802 - the matrix of F^T = Q R
+        """R (rank x m) of F^T = Q R, in the SVD basis: diag(singular_values) V^T."""
+        return self.r
+
+    @property
+    def singular_values(self) -> np.ndarray:
+        """Singular values of F = Gamma^-1/2 G L (descending; the data-informed spectrum)."""
+        return self.sv
+
+    @property
+    def G_free(self):  # noqa: N802 - the matrix G
+        """The observation operator on the free dofs (m x nfree; sparse, or dense for full rows)."""
+        return self.gf
+
+    @property
+    def correlated_noise(self) -> bool:
+        """Whether the noise covariance is a full matrix (otherwise a variance per observation)."""
+        return self.wkind != "diag"
+
+    @property
+    def noise_std(self):
+        """Noise standard deviation of every observation (m,), or None for correlated noise."""
+        return None if self.correlated_noise else 1.0 / self.wdata
+
+    def data_variance(self, chunk: int = CHUNK) -> np.ndarray:
+        """Prior variance of every noise-free observation, Var((G f)_i) = (G C0 G^T)_ii, exactly (m,).
+
+        From the factorisation when it is exact (F F^T = R^T R = Gamma^-1/2 G C0 G^T Gamma^-T/2: free), otherwise
+        one application of L^T per observation, ``chunk`` at a time. Add the noise variance for the variance of the
+        data."""
+        if getattr(self, "exact", False):
+            if not self.correlated_noise:
+                return np.sum(self.r**2, axis=0) / self.wdata**2
+            chol = np.linalg.inv(self.wdata)  # Gamma = C C^T, wdata = C^-1
+            return np.sum((self.r @ chol.T) ** 2, axis=0)
+        gt = self.gf.T.tocsc() if sp.issparse(self.gf) else self.gf.T
+        out = np.empty(self.m)
+        for i in range(0, self.m, chunk):
+            blk = gt[:, i : i + chunk]
+            blk = blk.toarray() if sp.issparse(blk) else np.ascontiguousarray(blk)
+            out[i : i + chunk] = (self.prior.apply_t(torch.from_numpy(blk)).double() ** 2).sum(0).cpu().numpy()
+        return out
 
     @property
     def rank(self) -> int:

@@ -233,7 +233,13 @@ obs = LinearObservations(prior, averages=(centers, 0.05), functionals=[flux_form
 post = obs.posterior(data=y)  # exact; a Gaussian with the prior's pipeline + a low-rank update
 post.sample(100)  # costs about one prior sample each
 # set-up keeps dense nrand x m and nfree x m factors (m observations): it raises MemoryError up front when they do not
-# fit, and LinearObservations(..., rank=k) is the randomised low-rank alternative
+# fit, and LinearObservations(..., rank=k) is the randomised low-rank alternative. A dense observation matrix (e.g.
+# observations of a PDE solution) stays dense: its products run in multithreaded BLAS
+
+# the factorisation F^T = Q R of F = Gamma^-1/2 G L, for code built on it (e.g. experimental design):
+obs.R, obs.singular_values, obs.lq()  # R = diag(s) V^T (rank x m), s, L Q (free-dof coefficients, nfree x rank)
+obs.exact, obs.G_free, obs.noise_std  # exact or randomised; G on the free dofs; noise std (None if correlated)
+obs.data_variance()  # Var((G f)_i) = (G C0 G^T)_ii of every noise-free observation, exactly
 
 post = prior.downdate(B, K)  # a known posterior C0 - B K^-1 B*, given directly
 
@@ -251,7 +257,10 @@ spectra cannot break it (`method="covariance"`, a range finder on the covariance
 randomised posterior update (`LinearObservations(..., rank=k)`) uses the same algorithm on the prior-preconditioned
 adjoint of the observation map. All of it is in `ngsrng/randomized.py`.
 
-`prior.condition(...)` is a shortcut for `LinearObservations(prior, ...).posterior(...)`.
+`prior.condition(...)` is a shortcut for `LinearObservations(prior, ...).posterior(...)`. `ngsrng.reference` has dense
+ground truth for tests on small meshes: `exact_covariance(g)` (priors, and the exact covariance of posteriors,
+downdates, Matheron and low-rank samplers) and `sampler_covariance(g)` (the covariance the sampler realises).
+`ngsrng.xnystrace(apply, n, probes, rng)` estimates the trace of any positive semidefinite operator (XNysTrace).
 
 ### Covariances: variance maps, traces, sample covariances
 Every Gaussian (prior, posterior, low-rank model) and every covariance given as an operator can be inspected without

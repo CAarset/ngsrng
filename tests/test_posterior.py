@@ -263,3 +263,32 @@ def test_dense_observation_matrix_stays_dense(engine, monkeypatch):
     in_place = LinearObservations(prior, g, noise=0.1)
     np.testing.assert_allclose(in_place.sv, dense.sv, rtol=1e-10)
     np.testing.assert_allclose(exact_covariance(in_place.posterior()), want, atol=1e-12 * np.abs(want).max())
+
+
+def test_factorisation_api():
+    """The public face of the factorisation F^T = Q R (used by code built on it, e.g. experimental design)."""
+    fes = ngs.H1(ngs.Mesh(ngs.unit_square.GenerateMesh(maxh=0.25)), order=2, dirichlet="left")
+    prior = ngsrng.Gaussian(fes, ngsrng.matern(5.0, 2), dtype="float64", seed=0)
+    pts = [(0.3, 0.4), (0.6, 0.5), (0.5, 0.8), (0.8, 0.2)]
+    noise = np.array([0.01, 0.02, 0.03, 0.04])
+    obs = LinearObservations(prior, points=pts, noise=noise)
+    s0 = exact_covariance(prior)
+    g = obs.G_free.toarray()
+    gsg = g @ s0 @ g.T
+    assert obs.exact and not obs.correlated_noise and obs.R.shape == (obs.rank, obs.m)
+    np.testing.assert_allclose(obs.noise_std, np.sqrt(noise))
+    np.testing.assert_allclose(obs.data_variance(), np.diag(gsg), rtol=1e-10)
+    np.testing.assert_allclose(obs.R.T @ obs.R, gsg / np.sqrt(np.outer(noise, noise)), rtol=1e-8, atol=1e-12)
+    np.testing.assert_allclose(obs.singular_values, np.linalg.norm(obs.R, axis=1), rtol=1e-12)
+    lq = obs.lq()  # Sigma_post = C0 - LQ (I - (I + R R^T)^-1) LQ^T
+    mid = np.eye(obs.rank) - np.linalg.inv(np.eye(obs.rank) + obs.R @ obs.R.T)
+    np.testing.assert_allclose(s0 - lq @ mid @ lq.T, exact_covariance(obs.posterior()), atol=1e-10 * np.abs(s0).max())
+    rough = LinearObservations(prior, points=pts, noise=noise, rank=2, oversampling=0)
+    assert not rough.exact
+    np.testing.assert_allclose(rough.data_variance(), np.diag(gsg), rtol=1e-10)  # exact also then
+    corr = 0.01 * (np.eye(4) + 0.3 * np.ones((4, 4)))
+    obs_c = LinearObservations(prior, points=pts, noise=corr)
+    assert obs_c.correlated_noise and obs_c.noise_std is None
+    np.testing.assert_allclose(obs_c.data_variance(), np.diag(gsg), rtol=1e-10)
+    est, err = ngsrng.xnystrace(lambda x: s0 @ x, s0.shape[0], 40, np.random.default_rng(0))
+    assert abs(est - np.trace(s0)) < 5 * err + 1e-8 * np.trace(s0)

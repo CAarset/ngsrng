@@ -605,6 +605,9 @@ def _randomized_trace(src, method, probes, seed):
 def xnystrace(apply_a, n, m, rng):
     """XNysTrace (Epperly, Tropp & Webber 2024) for a PSD operator on R^n with m probes: (estimate, standard error).
 
+    ``apply_a``: NumPy (n x k) -> (n x k), any symmetric positive semidefinite operator (matrix-free); ``rng``: a
+    ``numpy.random.Generator`` for the Gaussian probes. Public: :func:`covariance_trace` uses it for covariances.
+
     With Y = A Omega, G = Omega^T Y = C^T C and Z = Y C^-1 (the Nystrom approximation is Z Z^T), the leave-one-out
     estimate for probe i is tr(Z Z^T) - (||Z v_i||^2 - 1) / ||v_i||^2, v_i = C^-T e_i: the trace of the Nystrom
     approximation without probe i plus the Hutchinson correction omega_i^T (A - A_(i)) omega_i = 1 / X_ii
