@@ -328,8 +328,9 @@ class LinearObservations:
                 coeff = np.linalg.solve(middle, self.r @ (sc * whiten(self.wkind, self.wdata, resid)))
                 mean[prior.space.free] += self._get_lq() @ coeff
             if form == "fe":
-                whitening = np.diag(self.wdata) if self.wkind == "diag" else self.wdata
-                smat = (a / self.sv[None, :]) @ self.vt @ whitening
+                smat = (a / self.sv[None, :]) @ self.vt
+                # times Gamma^-1/2: a column scaling for uncorrelated noise (no m x m diagonal matrix)
+                smat = smat * self.wdata[None, :] if self.wkind == "diag" else smat @ self.wdata
         kind = "exact" if self.exact else "randomised"
         shared = self.__dict__.setdefault("_shared_maps", {"noise": {}, "fe": {}})
         if form == "noise":

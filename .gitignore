@@ -223,3 +223,18 @@ __marimo__/
 results/runs/
 results/gpu_box/
 results/calibrate/
+
+# Empty placeholder files that the Claude Code sandbox mounts into the working tree (bind-mount targets); never
+# content of this repository
+/.bash_profile
+/.bashrc
+/.gitconfig
+/.gitmodules
+/.idea
+/.mcp.json
+/.profile
+/.ripgreprc
+/.vscode
+/.zprofile
+/.zshrc
+/.claude/
