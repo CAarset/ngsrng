@@ -213,3 +213,29 @@ def test_single_draws_repeat_bit_for_bit(fes):
         else:  # a pointwise transform after the Gaussian: once seen to differ by 1 ulp in 3 of 2450 values (three
             # runs on 2026-11-03, not reproduced in ~45 since; cause not found), hence to rounding
             np.testing.assert_allclose(*draws, rtol=1e-15, atol=0)
+
+
+def test_spawned_children_share_the_set_up(fes):
+    """Children of spawn() share the parent's deterministic set-up (pipelines, pointwise standard deviations, boundary
+    samplers): no new factorisation or estimate per child, only new randomness; they pickle with it."""
+    import pickle
+
+    rng = ngsrng.default_rng(fes, seed=1, correlation=0.3, dtype="float64")
+    g = np.zeros(len(ngsrng.boundary_dofs(fes, "left")))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        rng.uniform(bnd="left")
+        rng.normal(bnd="left", bnd_values=g)
+        a, b = rng.spawn(2)
+        assert a.gaussian().first is rng.gaussian().first and a.gaussian().source is not rng.gaussian().source
+        (_, std, pts), = [v for v in a._points.values()]
+        assert pts.std is next(iter(rng._points.values()))[2].std  # shared, not re-estimated
+        assert next(iter(a._boundary.values()))[1] is next(iter(rng._boundary.values()))[1]
+        ua, ub = a.uniform(bnd="left", size=3), b.uniform(bnd="left", size=3)
+        assert not close(ua, ub)
+        again = ngsrng.default_rng(fes, seed=1, correlation=0.3, dtype="float64")
+        again.uniform(bnd="left")
+        again.normal(bnd="left", bnd_values=g)
+        assert close(again.spawn(2)[0].uniform(bnd="left", size=3), ua)
+        c = pickle.loads(pickle.dumps(a))
+        assert close(c.normal(bnd="left", bnd_values=g, size=2), a.normal(bnd="left", bnd_values=g, size=2))

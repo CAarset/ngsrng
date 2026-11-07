@@ -324,6 +324,11 @@ Every sampler takes `seed=` (details in [ngsrng/seeding.py](ngsrng/seeding.py)),
 - **Samplers pickle** (worker processes started by `spawn` or `forkserver`, checkpoints): the random state travels
   with them, and the NGSolve objects (matrices, factorisations) are rebuilt in the receiving process. See
   known issue 16 for worker processes.
+- **Worker processes: set up once, spawn per worker.** A generator's first draw from a field pays its set-up: the
+  factorisation, and for pointwise families (uniform, lognormal, ...) the pointwise standard deviations, about 6 s
+  at 5k dofs, also for boundary data (`bnd=`). Draw once from every field in the parent, then give each worker
+  process a child, `children = rng.spawn(n_workers)`: children share the set-up and have independent, reproducible
+  streams, and they pickle with it (a spawned worker's first draw: 0.2 s instead of 6 s).
 - **A `torch.Generator` or `numpy.random.Generator`** passed as `seed` is read at every draw in the same way.
 - **An int or `SeedSequence` gives an own stream**, as `numpy.random.default_rng(seed)` does. Global seeds neither
   affect it nor are advanced by it.

@@ -23,6 +23,7 @@ Algorithms are chosen automatically for every family (and never change its law);
 ``distribution(name, ...).info`` report the choice.
 """
 
+import copy
 import math
 import numbers
 import warnings
@@ -316,6 +317,7 @@ class Generator:
         self.standardize_by = standardize_by
         self.work_values = default_work_values(self.device) if work_values is None else int(work_values)
         self._gaussians, self._points, self._fields, self._bernstein = {}, {}, {}, {}
+        self._boundary = {}  # (id(Gaussian), boundary name) -> (Gaussian, BoundarySampler)
 
     # ------------------------------------------------------------------ plumbing
 
@@ -327,6 +329,7 @@ class Generator:
                         for k, v in self._points.items()}
         self._bernstein = {id(v[0]): v for v in self._bernstein.values()}
         self._fields = {_field_key(k[0], *v[0]): v for k, v in self._fields.items()}
+        self._boundary = {(id(v[0]), k[1]): v for k, v in self.__dict__.get("_boundary", {}).items()}
 
     @property
     def seed_sequence(self):
@@ -340,12 +343,52 @@ class Generator:
     def spawn(self, n):
         """n child generators with the same settings (numpy's ``Generator.spawn``): independent streams for an
         explicitly seeded generator; for draw-time randomness (seed None or a generator) children read the same
-        generator, and their draws are independent because every draw takes a new key."""
-        return [Generator(self.fes, self._seed(), correlation=self.correlation, device=self.device, dtype=self.dtype,
-                          method=self.method, tol=self.tol, representation=self.representation, std=self.std,
-                          order=self.order, output=self.output, standardize_by=self.standardize_by,
-                          work_values=self.work_values)
-                for _ in range(n)]
+        generator, and their draws are independent because every draw takes a new key.
+
+        Children share the parent's deterministic set-up built so far -- Gaussian pipelines (factorisations, noise
+        samplers), pointwise standard deviations, Bernstein forms, boundary samplers -- and only get new randomness.
+        So the set-up is paid once: draw once from every field in the parent, then spawn one child per worker
+        process (children pickle; see the README, "Worker processes")."""
+        children = []
+        for _ in range(n):
+            child = Generator(self.fes, self._seed(), correlation=self.correlation, device=self.device,
+                              dtype=self.dtype, method=self.method, tol=self.tol, representation=self.representation,
+                              std=self.std, order=self.order, output=self.output, standardize_by=self.standardize_by,
+                              work_values=self.work_values)
+            child._adopt(self)
+            children.append(child)
+        return children
+
+    def _adopt(self, parent):
+        """Take over ``parent``'s deterministic set-up: its Gaussians with new randomness (sharing their pipelines),
+        their point evaluations and standard deviations, Bernstein forms and boundary samplers. Fields themselves
+        are rebuilt on first use (cheap given these), with this generator's randomness."""
+        own = {}  # id(parent's Gaussian) -> this generator's
+        for key, (spec, g) in parent._gaussians.items():
+            if key[0] == "kl":
+                continue
+            if isinstance(g, Gaussian) and g._prior is None:
+                own[id(g)] = g._reseeded(self._seed())
+            elif isinstance(g, LowRankGaussian):  # e.g. an operator covariance's KL: share the modes
+                own[id(g)] = copy.copy(g)
+                own[id(g)].source = as_source(self._seed())
+            else:
+                continue
+            self._gaussians[key] = (spec, own[id(g)])
+        for key, (g, kl) in parent._gaussians.items():
+            if key[0] == "kl" and id(g) in own:
+                self._gaussians[("kl", id(own[id(g)]), key[2])] = (own[id(g)], kl)  # modes: deterministic
+        for key, (g, std, pts) in parent._points.items():
+            if id(g) in own:
+                child = copy.copy(pts)
+                child.gauss = own[id(g)]
+                if pts.reference is g:
+                    child.reference = own[id(g)]
+                self._points[(id(own[id(g)]), *key[1:])] = (own[id(g)], std, child)
+        self._bernstein.update(parent._bernstein)
+        for (gid, name), (g, sampler) in parent._boundary.items():
+            if gid in own:
+                self._boundary[(id(own[gid]), name)] = (own[gid], sampler)
 
     def gaussian(self, correlation=None, precision=None, covariance=None):
         """The (cached) Gaussian random function behind a correlation specification."""
@@ -429,7 +472,7 @@ class Generator:
             field = self._build(name, args, dict(kwargs), corr, dict(opts))
             field.out_dtype = torch.empty(0, dtype=self.dtype).numpy().dtype  # bounded families clamp in it
             if opts.get("bnd") is not None:  # [bnd] boundary (trace) sampling: ngsrng/boundary.py
-                attach_boundary(field, opts["bnd"], opts.get("bnd_values"))
+                attach_boundary(field, opts["bnd"], opts.get("bnd_values"), cache=self._boundary)
             field.work_values = self.work_values  # chunk size of in-place fills (out=)
             self._fields[key] = ((args, kwargs, corr, opts), field)
         return self._fields[key][1]

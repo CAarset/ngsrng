@@ -716,6 +716,17 @@ class Gaussian(InPlace, Rebuildable):
             new.stream = NormalStream(new.source)
         return new
 
+    def _reseeded(self, seed):
+        """A Gaussian sharing this one's pipeline (factorisations, noise sampler: deterministic set-up) with other
+        randomness (``seed``, see :mod:`ngsrng.seeding`)."""
+        new = copy.copy(self)
+        new.__dict__.pop("_mean_t", None)
+        new.source = as_source(seed)
+        new.plan = {**self.plan, "randomness": new.source.describe()}
+        if self.engine != "torch":
+            new.stream = NormalStream(new.source)
+        return new
+
     @property
     def generator(self):
         """Torch engine: the torch.Generator of the current draw (the own stream's, which persists, for an explicit

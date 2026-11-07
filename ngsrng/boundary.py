@@ -493,7 +493,7 @@ def _latent(field):
                               "whose DoFs are the sample's finite element coefficients")
 
 
-def attach_boundary(field, name, values=None):
+def attach_boundary(field, name, values=None, cache=None):
     """Attach the ``bnd=`` specification of a freshly built field (called by :class:`ngsrng.Generator`).
 
     Sets ``field.bnd`` (what :meth:`ngsrng.Generator._apply_bnd` needs) and adds the boundary block to
@@ -510,7 +510,12 @@ def attach_boundary(field, name, values=None):
                          "quadrature points, which have no DoF trace. Use representation='bernstein' (or "
                          "'projection'), which returns coefficients.")
     gauss, affine = _latent(field)
-    sampler = BoundarySampler(gauss, name)
+    # ``cache``: {(id(gauss), name): (gauss, sampler)} -- a sampler's set-up (trace DoFs, and for conditioning the
+    # n_B applications of Sigma behind Sigma_BB) depends on the law only, so fields of one Gaussian share it
+    hit = None if cache is None else cache.get((id(gauss), str(name)))
+    sampler = hit[1] if hit is not None else BoundarySampler(gauss, name)
+    if cache is not None:
+        cache[(id(gauss), str(name))] = (gauss, sampler)
     if values is not None:
         if not affine:
             raise NotImplementedError(
