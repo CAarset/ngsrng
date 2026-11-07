@@ -490,8 +490,8 @@ class Gaussian(InPlace, Rebuildable):
             if self.device.type != "cuda":
                 raise ValueError("cudss needs a CUDA device")
             if tn.gpu_backend() != "cuda" or not cudss_available():
-                raise RuntimeError("cuDSS is not available: it needs an NVIDIA GPU and nvmath-python "
-                                   "(pip install ngsrng[gpu]); on other GPUs, solver='amg-pcg' (pip install pyamg)")
+                raise RuntimeError("cuDSS is not available: it needs an NVIDIA GPU and nvmath-python (the cuda "
+                                   "extra); on AMD GPUs, solver='amg-pcg' (the rocm extra, or pip install pyamg)")
             # right-hand sides per cuDSS call; larger widths amortise the call overhead of big batches
             return CudssDirect(s.assemble_free(form), self.device, dtype,
                                width=int(width or self.method.get("cudss_width", 32)))
@@ -502,7 +502,8 @@ class Gaussian(InPlace, Rebuildable):
             # a mass matrix is spectrally equivalent to its diagonal: Jacobi PCG converges in a few iterations
             if name == "amg-pcg" and form is not mass_form:
                 if not pyamg_available():
-                    raise RuntimeError("pyamg is not available: amg-pcg needs it (pip install pyamg)")
+                    raise RuntimeError("pyamg is not available: amg-pcg needs it (the rocm extra, or pip install "
+                                       "pyamg)")
                 return TorchAMGPCG(s.assemble_free(form), self.device, dtype, tol=tol)
             return TorchPCG(s.assemble_free(form), self.device, dtype, tol=tol)
         raise ValueError(f"unknown solver {name!r}")

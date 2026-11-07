@@ -13,8 +13,9 @@ pandas, tabulate and matplotlib if they are installed).
     python -m ngsrng.calibrate --resume DIR  # continue an interrupted calibration
     python -m ngsrng.tuning show             # what is installed, and what applies on this machine
 
-On a GPU without cuDSS (AMD, or NVIDIA without ``pip install ngsrng[gpu]``), install pyamg first
-(``pip install ngsrng[amg]``): AMG-preconditioned CG is then the GPU candidate.
+Install the accelerator extra that fits the machine first (``python -m ngsrng.tuning show`` names it): ``cuda`` for
+cuDSS on NVIDIA GPUs, ``rocm`` for AMG-preconditioned CG (pyamg) on AMD GPUs, the GPU candidate where cuDSS is
+missing.
 """
 
 import argparse

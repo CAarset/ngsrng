@@ -10,10 +10,29 @@ requires-python = ">=3.11"
 dependencies = ["ngsolve>=6.2", "numpy", "scipy", "torch", "threadpoolctl"]
 
 [project.optional-dependencies]
+# Accelerator, exactly one per environment: cpu | cuda | rocm (uv sync --extra rocm; python -m ngsrng.tuning show says
+# which fits the machine). torch stays unqualified in the dependencies; each extra takes PyTorch's build for its device
+# through the uv block below (plain `uv sync` installs PyPI's torch, the CUDA build on Linux) and adds ngsrng's GPU
+# solver: cuDSS on NVIDIA GPUs, AMG-preconditioned CG on AMD GPUs.
+cpu = ["torch>=2.6"]
+cuda = ["torch>=2.6", "nvmath-python[cu13]"]
+# PyTorch's ROCm wheels depend on AMD's ROCm SDK packages, published on PyTorch's ROCm index rather than on PyPI; uv
+# takes a package from a named index only if it is a direct dependency, so they are listed here, one device package
+# per GPU architecture: keep the gfx list in step with the index (here and in [tool.uv.sources]).
+rocm = [
+    "torch>=2.6", "pyamg",
+    "triton-rocm", "rocm[device-all,libraries]", "rocm-sdk-core", "rocm-sdk-libraries", "rocm-sdk-device-gfx908",
+    "rocm-sdk-device-gfx90a", "rocm-sdk-device-gfx942", "rocm-sdk-device-gfx950", "rocm-sdk-device-gfx1010",
+    "rocm-sdk-device-gfx1011", "rocm-sdk-device-gfx1012", "rocm-sdk-device-gfx1030", "rocm-sdk-device-gfx1031",
+    "rocm-sdk-device-gfx1032", "rocm-sdk-device-gfx1033", "rocm-sdk-device-gfx1034", "rocm-sdk-device-gfx1035",
+    "rocm-sdk-device-gfx1036", "rocm-sdk-device-gfx1100", "rocm-sdk-device-gfx1101", "rocm-sdk-device-gfx1102",
+    "rocm-sdk-device-gfx1103", "rocm-sdk-device-gfx1150", "rocm-sdk-device-gfx1151", "rocm-sdk-device-gfx1152",
+    "rocm-sdk-device-gfx1153", "rocm-sdk-device-gfx1200", "rocm-sdk-device-gfx1201", "rocm-sdk-device-gfx1250"
+]
+gpu = ["nvmath-python[cu13]"]   # deprecated name of the cuda extra's solver, kept until consumers switch to cuda
+amg = ["pyamg"]                 # deprecated name of the rocm extra's solver, kept until consumers switch to rocm
 bench = ["pandas", "matplotlib", "tabulate"]
 test = ["pytest"]
-gpu = ["nvmath-python[cu13]"]   # cuDSS sparse direct solver on NVIDIA GPUs
-amg = ["pyamg"]                 # AMG-preconditioned CG: the GPU solver without cuDSS (AMD GPUs, ROCm)
 examples = ["matplotlib", "jupyter", "anywidget"]  # examples/demo.ipynb (and the local ngsplot package)
 
 [project.scripts]
@@ -24,6 +43,54 @@ include = ["ngsrng*"]
 
 [tool.setuptools.package-data]
 ngsrng = ["data/*.json"]  # the shipped calibration (ngsrng/tuning.py)
+
+# The reference uv configuration for locked environments with an accelerator extra (cpu | cuda | rocm); projects that
+# depend on ngsrng copy it into their own pyproject. The per-extra torch indexes can go once wheel variants (which
+# select the accelerator build at install time) reach mainline uv.
+[tool.uv]
+conflicts = [[{ extra = "cpu" }, { extra = "cuda" }, { extra = "rocm" }]]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", extra = "cpu" }, { index = "pytorch-rocm", extra = "rocm" }]
+triton-rocm = { index = "pytorch-rocm", extra = "rocm" }
+rocm = { index = "pytorch-rocm", extra = "rocm" }
+rocm-sdk-core = { index = "pytorch-rocm", extra = "rocm" }
+rocm-sdk-libraries = { index = "pytorch-rocm", extra = "rocm" }
+rocm-sdk-device-gfx908 = { index = "pytorch-rocm", extra = "rocm" }
+rocm-sdk-device-gfx90a = { index = "pytorch-rocm", extra = "rocm" }
+rocm-sdk-device-gfx942 = { index = "pytorch-rocm", extra = "rocm" }
+rocm-sdk-device-gfx950 = { index = "pytorch-rocm", extra = "rocm" }
+rocm-sdk-device-gfx1010 = { index = "pytorch-rocm", extra = "rocm" }
+rocm-sdk-device-gfx1011 = { index = "pytorch-rocm", extra = "rocm" }
+rocm-sdk-device-gfx1012 = { index = "pytorch-rocm", extra = "rocm" }
+rocm-sdk-device-gfx1030 = { index = "pytorch-rocm", extra = "rocm" }
+rocm-sdk-device-gfx1031 = { index = "pytorch-rocm", extra = "rocm" }
+rocm-sdk-device-gfx1032 = { index = "pytorch-rocm", extra = "rocm" }
+rocm-sdk-device-gfx1033 = { index = "pytorch-rocm", extra = "rocm" }
+rocm-sdk-device-gfx1034 = { index = "pytorch-rocm", extra = "rocm" }
+rocm-sdk-device-gfx1035 = { index = "pytorch-rocm", extra = "rocm" }
+rocm-sdk-device-gfx1036 = { index = "pytorch-rocm", extra = "rocm" }
+rocm-sdk-device-gfx1100 = { index = "pytorch-rocm", extra = "rocm" }
+rocm-sdk-device-gfx1101 = { index = "pytorch-rocm", extra = "rocm" }
+rocm-sdk-device-gfx1102 = { index = "pytorch-rocm", extra = "rocm" }
+rocm-sdk-device-gfx1103 = { index = "pytorch-rocm", extra = "rocm" }
+rocm-sdk-device-gfx1150 = { index = "pytorch-rocm", extra = "rocm" }
+rocm-sdk-device-gfx1151 = { index = "pytorch-rocm", extra = "rocm" }
+rocm-sdk-device-gfx1152 = { index = "pytorch-rocm", extra = "rocm" }
+rocm-sdk-device-gfx1153 = { index = "pytorch-rocm", extra = "rocm" }
+rocm-sdk-device-gfx1200 = { index = "pytorch-rocm", extra = "rocm" }
+rocm-sdk-device-gfx1201 = { index = "pytorch-rocm", extra = "rocm" }
+rocm-sdk-device-gfx1250 = { index = "pytorch-rocm", extra = "rocm" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-rocm"
+url = "https://download.pytorch.org/whl/rocm7.14"
+explicit = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

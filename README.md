@@ -366,16 +366,26 @@ Gaussian's `plan` records its algorithms and its `"randomness"`.
 
 ## Installation
 ```bash
-uv pip install -e ".[test,bench]"     # core + tests + benchmark tooling
-uv pip install -e ".[gpu]"            # optional, NVIDIA GPUs: cuDSS sparse direct solver (CUDA 13)
-uv pip install -e ".[amg]"            # optional, other GPUs (AMD/ROCm): AMG-preconditioned CG on the device
+uv sync --extra cpu                   # exactly one accelerator extra: cpu | cuda | rocm
+uv sync --extra rocm --extra test --extra bench   # ... plus tests and benchmark tooling
 uv pip install -e ".[examples]"       # optional: Jupyter, anywidget (for Draw) and matplotlib, for the tutorial
 uv pip install -e /path/to/ngsplot     # optional: local package for the tutorial's side-by-side panels
 ```
-AMD GPUs need PyTorch's ROCm build, installed into the environment from PyTorch's ROCm index (pytorch.org) with
-`pip` or `uv pip`. It cannot go into a uv lock file: the ROCm index publishes no wheel metadata, and its torch 2.15
-wheels also depend on AMD's separate `rocm[device-all]` packages (reported downstream, 2026-11-06). The NVIDIA
-extra `ngsrng[gpu]` locks normally.
+**Accelerator extras**, exactly one per environment (`python -m ngsrng.tuning show` says which fits the machine and
+flags mismatches, such as the CUDA build of torch on an AMD GPU):
+- `cpu`: PyTorch's CPU build;
+- `cuda` (NVIDIA GPUs): PyTorch's CUDA build and nvmath-python, for cuDSS, the GPU sparse direct solver;
+- `rocm` (AMD GPUs): PyTorch's ROCm 7.14 build with AMD's ROCm SDK packages, and pyamg, for AMG-preconditioned CG on
+  the GPU.
+
+torch stays unqualified in ngsrng's dependencies; the `[tool.uv]` block in `pyproject.toml` takes each extra's build
+from PyTorch's indexes (plain `uv sync` would install PyPI's torch, the CUDA build on Linux). It is the reference for
+projects that depend on ngsrng: copy it into their pyproject. It locks (uv 0.13.7, 2026-11-07:
+torch 2.15.0+cpu, PyPI's 2.15.0, 2.15.0+rocm7.14). ROCm's device packages come one per GPU architecture
+(`rocm-sdk-device-gfx*`): keep that list in step with PyTorch's ROCm index. The per-extra indexes can go once wheel
+variants (which select the accelerator build at install time) reach mainline uv. With pip instead of uv, install
+torch for the device from PyTorch's index first (pytorch.org), then ngsrng with the extra. The extras `gpu` and
+`amg` are the old names of the GPU solvers (`cuda`, `rocm`), kept for now.
 
 Code built on ngsrng can rely on the samplers' linear-algebra interface: `apply(eta)` / `apply_t(y)` (the factor
 L of C = L L^T and its transpose, on free-dof coefficients), `nrand`, `mean` and `space` (`fes`, `free`, `nfree`,
@@ -448,7 +458,7 @@ The precise behaviour:
 **GPUs without cuDSS (AMD/ROCm).** cuDSS, NVIDIA's sparse direct solver, has no AMD counterpart with a Python
 interface. On such GPUs (and on NVIDIA GPUs without `nvmath-python`), ngsrng uses AMG-preconditioned CG on the
 device:
-- the multigrid hierarchy is built once on the CPU by pyamg (`pip install ngsrng[amg]`);
+- the multigrid hierarchy is built once on the CPU by pyamg (the `rocm` extra);
 - every iteration is sparse-dense products on all samples of a batch at once;
 - it converged in 16-27 iterations in our tests (2D and 3D, P1, P2 and DG, to the default solver tolerance of
   1e-8), with an iteration count that does not grow with the mesh size.

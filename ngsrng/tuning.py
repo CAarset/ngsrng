@@ -421,9 +421,51 @@ def gpu_diagnosis() -> list[str]:
     return lines
 
 
+def accelerator_extra() -> tuple[str, list[str]]:
+    """The accelerator extra that fits this machine -- ``cpu``, ``cuda`` (NVIDIA GPU) or ``rocm`` (AMD GPU) -- and
+    what the installed packages lack for it (a torch build for another device, a missing GPU solver).
+
+    The GPU vendor comes from torch when it uses a GPU, otherwise from the device nodes (/dev/kfd: AMD,
+    /dev/nvidiactl: NVIDIA)."""
+    import torch
+
+    from .backend import cuda_usable
+    from .solvers import cudss_available, pyamg_available
+
+    build = "rocm" if getattr(torch.version, "hip", None) else "cuda" if torch.version.cuda else "cpu"
+    if cuda_usable():
+        fits = build
+    elif os.path.exists("/dev/nvidiactl") or os.path.exists("/dev/nvidia0"):
+        fits = "cuda"
+    elif os.path.exists("/dev/kfd"):
+        fits = "rocm"
+    else:
+        fits = "cpu"
+    vendor = {"cuda": "NVIDIA", "rocm": "AMD"}
+    issues = []
+    if fits != "cpu" and build != fits:
+        issues.append(f"torch is the {build.upper() if build != 'cpu' else 'CPU-only'} build, but the GPU is "
+                      f"{vendor[fits]}: install the {fits.upper() if fits == 'rocm' else 'CUDA'} build of torch")
+    if fits == "cuda" and not cudss_available():
+        issues.append("nvmath-python[cu13] is missing: no cuDSS, the NVIDIA GPU's sparse direct solver")
+    if fits == "rocm" and not pyamg_available():
+        issues.append("pyamg is missing: no AMG-preconditioned CG, the AMD GPU's solver")
+    if fits == "cpu" and build != "cpu":
+        issues.append(f"no GPU found, but torch is the {build.upper()} build (the CPU build is far smaller)")
+    return fits, issues
+
+
 def _show():
     m = machine()
     print(f"machine: {m['cpu']} ({m['threads']} threads); GPUs: {', '.join(m.get('gpus', [])) or 'none'}")
+    try:
+        fits, issues = accelerator_extra()
+        print(f"accelerator extra for this machine: ngsrng[{fits}] (uv sync --extra {fits}; see the README)"
+              + ("" if issues else ": installed as it should be"))
+        for issue in issues:
+            print(f"  mismatch: {issue}")
+    except Exception as err:  # noqa: BLE001 - informational only
+        print(f"accelerator extra: unknown ({type(err).__name__}: {err})")
     try:
         if not m.get("gpus"):
             print("  torch reports no usable GPU here (ngsrng uses any GPU torch reports); why:")

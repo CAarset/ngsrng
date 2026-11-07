@@ -267,3 +267,28 @@ def test_gpu_probe_runs():
     """The fresh-process probe itself (on this machine, whatever it finds)."""
     out = tuning._probe("ngsolve")
     assert set(out) == {"available", "count", "error"}
+
+
+def test_accelerator_extra(monkeypatch):
+    """tuning show names the extra that fits the machine and what the installed packages lack for it."""
+    _fake_gpu_machine(monkeypatch, cuda="13.2")  # AMD GPU, CUDA torch
+    monkeypatch.setattr("ngsrng.solvers.pyamg_available", lambda: True)
+    fits, issues = tuning.accelerator_extra()
+    assert fits == "rocm" and any("CUDA build, but the GPU is AMD" in i for i in issues)
+    _fake_gpu_machine(monkeypatch, hip="7.14")
+    monkeypatch.setattr("ngsrng.solvers.pyamg_available", lambda: False)
+    fits, issues = tuning.accelerator_extra()
+    assert fits == "rocm" and issues == ["pyamg is missing: no AMG-preconditioned CG, the AMD GPU's solver"]
+    _fake_gpu_machine(monkeypatch, amd=False)  # NVIDIA GPU, CPU-only torch
+    monkeypatch.setattr("ngsrng.solvers.cudss_available", lambda: True)
+    fits, issues = tuning.accelerator_extra()
+    assert fits == "cuda" and any("CPU-only build, but the GPU is NVIDIA" in i for i in issues)
+    import os
+
+    real = os.path.exists
+    monkeypatch.setattr(os.path, "exists", lambda p: False if str(p).startswith("/dev/") else real(p))  # no GPU
+    import torch
+
+    monkeypatch.setattr(torch.version, "cuda", "13.2")  # ... but the CUDA build of torch
+    fits, issues = tuning.accelerator_extra()
+    assert fits == "cpu" and any("no GPU found, but torch is the CUDA build" in i for i in issues)
