@@ -391,7 +391,7 @@ torch"). Checked with uv 0.13.7 (2026-11-08): ngsrng's environment and a depende
 2.15.0+cpu, PyPI's 2.15.0, 2.15.0+rocm7.14), also when the dependent's cpu extra takes torch without `ngsrng[cpu]`.
 The per-extra torch indexes can go once wheel variants (which select the accelerator build at install time) reach
 mainline uv. With pip instead of uv, install torch for the device from PyTorch's index first (pytorch.org), then
-ngsrng with the extra. The extras `gpu` and `amg` are the old names of the GPU solvers (`cuda`, `rocm`), kept for now.
+ngsrng with the extra.
 
 Code built on ngsrng can rely on the samplers' linear-algebra interface: `apply(eta)` / `apply_t(y)` (the factor
 L of C = L L^T and its transpose, on free-dof coefficients), `nrand`, `mean` and `space` (`fes`, `free`, `nfree`,

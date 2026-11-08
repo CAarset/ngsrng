@@ -29,8 +29,6 @@ rocm = [
     "rocm-sdk-device-gfx1103", "rocm-sdk-device-gfx1150", "rocm-sdk-device-gfx1151", "rocm-sdk-device-gfx1152",
     "rocm-sdk-device-gfx1153", "rocm-sdk-device-gfx1200", "rocm-sdk-device-gfx1201", "rocm-sdk-device-gfx1250"
 ]
-gpu = ["nvmath-python[cu13]"]   # deprecated name of the cuda extra's solver, kept until consumers switch to cuda
-amg = ["pyamg"]                 # deprecated name of the rocm extra's solver, kept until consumers switch to rocm
 bench = ["pandas", "matplotlib", "tabulate"]
 test = ["pytest"]
 examples = ["matplotlib", "jupyter", "anywidget"]  # examples/demo.ipynb (and the local ngsplot package)
