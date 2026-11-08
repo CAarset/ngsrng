@@ -238,3 +238,9 @@ results/calibrate/
 /.zprofile
 /.zshrc
 /.claude/
+
+# env/ is the development environment's project (env/pyproject.toml), not a virtualenv: tracked; its lock and uv
+# cache are not (env/.venv is covered by .venv above)
+!/env/
+/env/uv.lock
+/env/.uv-cache/

@@ -1,0 +1,41 @@
+# ngsrng's development environment, and the template for projects that depend on ngsrng.
+#
+#     uv sync --project env --extra cpu        # exactly one accelerator: cpu | cuda | rocm
+#     uv run --project env pytest              # (from the repository root)
+#
+# A separate, non-package project: uv reads a dependency's [tool.uv.sources], so the choice of PyTorch build cannot
+# live in ngsrng's own pyproject.toml without clashing with every dependent's choice. Dependents copy the torch
+# sources, the two indexes and the conflicts below (ngsrng supplies the rest of the rocm extra: AMD's packages).
+# The per-extra torch indexes can go once wheel variants (which select the accelerator build at install time) reach
+# mainline uv.
+
+[project]
+name = "ngsrng-dev"
+version = "0"
+requires-python = ">=3.11"
+dependencies = ["ngsrng[test]"]
+
+[project.optional-dependencies]
+cpu = ["torch>=2.6", "ngsrng[cpu]"]
+cuda = ["torch>=2.6", "ngsrng[cuda]"]  # PyPI's torch: the CUDA build on Linux
+rocm = ["torch>=2.6", "ngsrng[rocm]"]
+bench = ["ngsrng[bench]"]
+examples = ["ngsrng[examples]"]
+
+[tool.uv]
+package = false
+conflicts = [[{ extra = "cpu" }, { extra = "cuda" }, { extra = "rocm" }]]
+
+[tool.uv.sources]
+ngsrng = { path = "..", editable = true }
+torch = [{ index = "pytorch-cpu", extra = "cpu" }, { index = "pytorch-rocm", extra = "rocm" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-rocm"
+url = "https://download.pytorch.org/whl/rocm7.14"
+explicit = true

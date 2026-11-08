@@ -10,10 +10,10 @@ requires-python = ">=3.11"
 dependencies = ["ngsolve>=6.2", "numpy", "scipy", "torch", "threadpoolctl"]
 
 [project.optional-dependencies]
-# Accelerator, exactly one per environment: cpu | cuda | rocm (uv sync --extra rocm; python -m ngsrng.tuning show says
-# which fits the machine). torch stays unqualified in the dependencies; each extra takes PyTorch's build for its device
-# through the uv block below (plain `uv sync` installs PyPI's torch, the CUDA build on Linux) and adds ngsrng's GPU
-# solver: cuDSS on NVIDIA GPUs, AMG-preconditioned CG on AMD GPUs.
+# Accelerator, exactly one per environment: cpu | cuda | rocm (python -m ngsrng.tuning show says which fits the
+# machine). torch stays unqualified in the dependencies: the environment's project picks PyTorch's build for the device
+# (env/pyproject.toml for ngsrng's own; dependents copy its torch sources, see the README). Each extra adds ngsrng's
+# GPU solver: cuDSS on NVIDIA GPUs, AMG-preconditioned CG on AMD GPUs.
 cpu = ["torch>=2.6"]
 cuda = ["torch>=2.6", "nvmath-python[cu13]"]
 # PyTorch's ROCm wheels depend on AMD's ROCm SDK packages, published on PyTorch's ROCm index rather than on PyPI; uv
@@ -44,14 +44,14 @@ include = ["ngsrng*"]
 [tool.setuptools.package-data]
 ngsrng = ["data/*.json"]  # the shipped calibration (ngsrng/tuning.py)
 
-# The reference uv configuration for locked environments with an accelerator extra (cpu | cuda | rocm); projects that
-# depend on ngsrng copy it into their own pyproject. The per-extra torch indexes can go once wheel variants (which
-# select the accelerator build at install time) reach mainline uv.
+# uv applies a dependency's [tool.uv.sources]: this block is read by every uv project that depends on ngsrng. So it
+# holds only what the rocm extra needs from PyTorch's ROCm index (AMD's packages, scoped to that extra), never torch
+# itself: torch sources here would clash with a dependent's own ("conflicting indexes for package torch"). The torch
+# build per extra is chosen by the environment's project: env/pyproject.toml here, the template for dependents.
 [tool.uv]
 conflicts = [[{ extra = "cpu" }, { extra = "cuda" }, { extra = "rocm" }]]
 
 [tool.uv.sources]
-torch = [{ index = "pytorch-cpu", extra = "cpu" }, { index = "pytorch-rocm", extra = "rocm" }]
 triton-rocm = { index = "pytorch-rocm", extra = "rocm" }
 rocm = { index = "pytorch-rocm", extra = "rocm" }
 rocm-sdk-core = { index = "pytorch-rocm", extra = "rocm" }
@@ -81,11 +81,6 @@ rocm-sdk-device-gfx1153 = { index = "pytorch-rocm", extra = "rocm" }
 rocm-sdk-device-gfx1200 = { index = "pytorch-rocm", extra = "rocm" }
 rocm-sdk-device-gfx1201 = { index = "pytorch-rocm", extra = "rocm" }
 rocm-sdk-device-gfx1250 = { index = "pytorch-rocm", extra = "rocm" }
-
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-explicit = true
 
 [[tool.uv.index]]
 name = "pytorch-rocm"

@@ -460,7 +460,7 @@ def _show():
     print(f"machine: {m['cpu']} ({m['threads']} threads); GPUs: {', '.join(m.get('gpus', [])) or 'none'}")
     try:
         fits, issues = accelerator_extra()
-        print(f"accelerator extra for this machine: ngsrng[{fits}] (uv sync --extra {fits}; see the README)"
+        print(f"accelerator extra for this machine: ngsrng[{fits}] (the README's Installation)"
               + ("" if issues else ": installed as it should be"))
         for issue in issues:
             print(f"  mismatch: {issue}")

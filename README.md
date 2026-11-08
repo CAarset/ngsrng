@@ -366,11 +366,14 @@ Gaussian's `plan` records its algorithms and its `"randomness"`.
 
 ## Installation
 ```bash
-uv sync --extra cpu                   # exactly one accelerator extra: cpu | cuda | rocm
-uv sync --extra rocm --extra test --extra bench   # ... plus tests and benchmark tooling
-uv pip install -e ".[examples]"       # optional: Jupyter, anywidget (for Draw) and matplotlib, for the tutorial
+uv sync --project env --extra cpu     # exactly one accelerator extra: cpu | cuda | rocm
+uv sync --project env --extra rocm --extra bench   # ... plus benchmark tooling (examples: Jupyter for the tutorial)
+uv run --project env pytest           # from the repository root
 uv pip install -e /path/to/ngsplot     # optional: local package for the tutorial's side-by-side panels
 ```
+ngsrng's development environment is the small project in [env/](env/pyproject.toml): ngsrng itself (editable, with
+the tests) plus PyTorch's build for the chosen accelerator.
+
 **Accelerator extras**, exactly one per environment (`python -m ngsrng.tuning show` says which fits the machine and
 flags mismatches, such as the CUDA build of torch on an AMD GPU):
 - `cpu`: PyTorch's CPU build;
@@ -378,14 +381,17 @@ flags mismatches, such as the CUDA build of torch on an AMD GPU):
 - `rocm` (AMD GPUs): PyTorch's ROCm 7.14 build with AMD's ROCm SDK packages, and pyamg, for AMG-preconditioned CG on
   the GPU.
 
-torch stays unqualified in ngsrng's dependencies; the `[tool.uv]` block in `pyproject.toml` takes each extra's build
-from PyTorch's indexes (plain `uv sync` would install PyPI's torch, the CUDA build on Linux). It is the reference for
-projects that depend on ngsrng: copy it into their pyproject. It locks (uv 0.13.7, 2026-11-07:
-torch 2.15.0+cpu, PyPI's 2.15.0, 2.15.0+rocm7.14). ROCm's device packages come one per GPU architecture
-(`rocm-sdk-device-gfx*`): keep that list in step with PyTorch's ROCm index. The per-extra indexes can go once wheel
-variants (which select the accelerator build at install time) reach mainline uv. With pip instead of uv, install
-torch for the device from PyTorch's index first (pytorch.org), then ngsrng with the extra. The extras `gpu` and
-`amg` are the old names of the GPU solvers (`cuda`, `rocm`), kept for now.
+**Projects that depend on ngsrng** (with uv) declare the same three extras, each requiring `torch>=2.6` and
+`ngsrng[<extra>]`, and copy from [env/pyproject.toml](env/pyproject.toml) the torch sources, the two PyTorch indexes
+and the conflicts declaration. Nothing else: ngsrng's own `pyproject.toml` supplies the rest of the
+rocm extra (AMD's ROCm SDK packages, one per GPU architecture, from PyTorch's ROCm index), and the list of GPU
+architectures is maintained there only. It holds no torch sources on purpose: uv applies a dependency's
+`[tool.uv.sources]`, and torch sources in ngsrng's would clash with the dependent's ("conflicting indexes for package
+torch"). Checked with uv 0.13.7 (2026-11-08): ngsrng's environment and a dependent with these extras lock (torch
+2.15.0+cpu, PyPI's 2.15.0, 2.15.0+rocm7.14), also when the dependent's cpu extra takes torch without `ngsrng[cpu]`.
+The per-extra torch indexes can go once wheel variants (which select the accelerator build at install time) reach
+mainline uv. With pip instead of uv, install torch for the device from PyTorch's index first (pytorch.org), then
+ngsrng with the extra. The extras `gpu` and `amg` are the old names of the GPU solvers (`cuda`, `rocm`), kept for now.
 
 Code built on ngsrng can rely on the samplers' linear-algebra interface: `apply(eta)` / `apply_t(y)` (the factor
 L of C = L L^T and its transpose, on free-dof coefficients), `nrand`, `mean` and `space` (`fes`, `free`, `nfree`,
