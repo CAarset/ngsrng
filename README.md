@@ -264,6 +264,29 @@ ground truth for tests on small meshes: `exact_covariance(g)` (priors, and the e
 downdates, Matheron and low-rank samplers) and `sampler_covariance(g)` (the covariance the sampler realises).
 `ngsrng.xnystrace(apply, n, probes, rng)` estimates the trace of any positive semidefinite operator (XNysTrace).
 
+### Observations: the data y = G f + e
+The data of an inverse problem live in R^m: an observation map G: X -> R^m (point values, local averages,
+LinearForms, matrices, matrix-free maps through their adjoint) applied to the random function, plus noise.
+`ngsrng.ObservedGaussian` samples y = G f + e exactly, for any of these maps and any field (prior, posterior,
+low-rank, Matheron, apply-only covariance), with white, coloured (a covariance matrix) or field-generated noise:
+
+```python
+obs_law = ngsrng.ObservedGaussian(prior, points=xy, scale=sigma)      # G f at m points: obs_law.sample(n) is (m, n)
+y = rng.observed(0.0, sigma, points=xy, out=buf)                      # the same from a generator: (n, m), in place
+noise = ngsrng.ObservedGaussian(disturbance, averages=(xy, 0.02))     # e from another random field (coloured)
+data = ngsrng.ObservedGaussian(prior, averages=(xy, 0.02), noise=noise)
+obs.predictive()       # prior predictive N(G m0, G C0 G^T + Gamma) of LinearObservations obs (its evidence)
+obs.predictive(post)   # posterior predictive
+```
+Two exact algorithms, chosen automatically and recorded in `plan`: **factor** -- K = G Sigma G^T (+ Gamma) once
+(m applications of the field's factor L^T on its device, then one product), its eigendecomposition and
+F = V diag(sqrt(w)) over the eigenvalues above `rtol` (1e-12) times the largest, then one dense product per batch
+(the default up to 10^4 observations; spawned generators share the factor) -- and **pathwise** (a field draw and G per
+sample, G on the device). For a P5 Matern prior observed on a 65 x 65 grid (11,951 dofs, m = 4225, rank 1406), the
+factor takes 44 s to set up on a 6-core laptop (16 s of it the eigendecomposition) and 0.22 ms per draw (float32,
+batch 20); pathwise draws take 3.7 ms. `rng.normal(loc, scale, points=xy)` is the pathwise route for point values: an
+exact draw of G f, not a pointwise standardisation (that is `representation=`).
+
 ### Covariances: variance maps, traces, sample covariances
 Every Gaussian (prior, posterior, low-rank model) and every covariance given as an operator can be inspected without
 drawing samples. The variance at a point x is the diagonal k(x, x) of the covariance kernel, and on each element it

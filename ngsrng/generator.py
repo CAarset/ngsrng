@@ -33,7 +33,7 @@ import numpy as np
 import scipy.stats as st
 import torch
 
-from .backend import Rebuildable, ngs_sparse, resolve_device, resolve_dtype
+from .backend import Rebuildable, ngs_sparse, resolve_device, resolve_dtype, sparse_to_torch
 from .boundary import attach_boundary  # [bnd] boundary (trace) sampling: ngsrng/boundary.py
 from .correlation import MaternCorrelation, matern
 from .distributions.bernstein import BernsteinForm, default_ok
@@ -54,6 +54,7 @@ from .gaussian import Gaussian, check_method
 from .inplace import InPlace, as_tensor, chunks, default_work_values
 from .lowrank import LowRankGaussian, karhunen_loeve
 from .observations import observation_operator
+from .observed import RTOL, ObservedGaussian
 from .posterior import MatheronPosterior
 from .seeding import Source, as_source, draw
 from .space import SpaceInfo, mass_form
@@ -63,7 +64,7 @@ DISCRETE = {"poisson", "binomial", "bernoulli", "negative_binomial", "geometric"
             "hypergeometric"}
 SPECIAL = {"normal", "standard_normal", "white_noise", "chisquare", "standard_t", "dirichlet", "wishart",
            "inverse_wishart", "matrix_lognormal", "normal_inverse_gaussian", "variance_gamma", "indicator",
-           "transformed", "marginal", "standard_exponential", "standard_gamma", "karhunen_loeve"}
+           "transformed", "marginal", "standard_exponential", "standard_gamma", "karhunen_loeve", "observed"}
 
 ALIASES = {
     "gaussian": "normal", "norm": "normal", "standard_gaussian": "standard_normal", "randn": "standard_normal",
@@ -108,7 +109,7 @@ def _nparams(name) -> int:
     return {"normal": 2, "standard_normal": 0, "white_noise": 0, "chisquare": 1, "standard_t": 1, "dirichlet": 1,
             "wishart": 2, "inverse_wishart": 2, "matrix_lognormal": 2, "normal_inverse_gaussian": 1,
             "variance_gamma": 1, "indicator": 1, "transformed": 1, "marginal": 1, "standard_exponential": 0,
-            "standard_gamma": 1, "karhunen_loeve": 1}.get(name, 0)
+            "standard_gamma": 1, "karhunen_loeve": 1, "observed": 2}.get(name, 0)
 
 
 def _field_key(name, args, kwargs, corr, opts):
@@ -183,8 +184,13 @@ class _NormalField(InPlace, Rebuildable):  # pickles; the NGSolve evaluation mat
         if getattr(self.gauss, "engine", None) == "ngsolve":  # float64 coefficients evaluated in the worker threads
             vals = self.gauss._ngs_rows(ns, np.empty((ns, self.evaluation.shape[0])), evaluate=self._ngs_evaluation(),
                                         add_mean=self.trivial, transform=None if self.trivial else self._affine).T
-        else:
-            vals = self.evaluation @ self._full(ns).double().cpu().numpy()
+        else:  # on the Gaussian's device (torch engine): G as a torch sparse matrix there
+            full = self._full(ns)
+            key = (str(full.device), full.dtype)
+            cache = self.__dict__.setdefault("_eval_torch", {})
+            if key not in cache:
+                cache[key] = sparse_to_torch(self.evaluation, full.device, full.dtype)
+            vals = cache[key] @ full
         return vals[:, 0] if n is None else vals
 
     def sample_into(self, rows):
@@ -318,6 +324,7 @@ class Generator:
         self.work_values = default_work_values(self.device) if work_values is None else int(work_values)
         self._gaussians, self._points, self._fields, self._bernstein = {}, {}, {}, {}
         self._boundary = {}  # (id(Gaussian), boundary name) -> (Gaussian, BoundarySampler)
+        self._factors = {}  # (id(Gaussian), observation key) -> (Gaussian, factor of an ObservedGaussian)
 
     # ------------------------------------------------------------------ plumbing
 
@@ -330,6 +337,7 @@ class Generator:
         self._bernstein = {id(v[0]): v for v in self._bernstein.values()}
         self._fields = {_field_key(k[0], *v[0]): v for k, v in self._fields.items()}
         self._boundary = {(id(v[0]), k[1]): v for k, v in self.__dict__.get("_boundary", {}).items()}
+        self._factors = {(id(v[0]), *k[1:]): v for k, v in self.__dict__.get("_factors", {}).items()}
 
     @property
     def seed_sequence(self):
@@ -389,6 +397,9 @@ class Generator:
         for (gid, name), (g, sampler) in parent._boundary.items():
             if gid in own:
                 self._boundary[(id(own[gid]), name)] = (own[gid], sampler)
+        for key, (g, factor) in parent._factors.items():
+            if key[0] in own:
+                self._factors[(id(own[key[0]]), *key[1:])] = (own[key[0]], factor)
 
     def gaussian(self, correlation=None, precision=None, covariance=None):
         """The (cached) Gaussian random function behind a correlation specification."""
@@ -514,6 +525,19 @@ class Generator:
                 loc = 0.0 if p["loc"] is None else p["loc"]
                 return named_marginal(pts(), "normal", loc, p["scale"], representation=rep)
             return _NormalField(self.gaussian(**corr), p["loc"], p["scale"], points=points)
+        if name == "observed":
+            p = params({"loc": None, "scale": 1.0, "operator": None, "functionals": None, "averages": None,
+                        "adjoint": None, "m": None, "noise": None, "rtol": RTOL})
+            gauss = self.gaussian(**corr)
+            obs_args = {k: p[k] for k in ("operator", "functionals", "averages", "adjoint", "m")}
+            key = (id(gauss), _freeze(obs_args), _freeze(points), _freeze(p["noise"]), p["scale"], p["rtol"], method)
+            cached = self._factors.get(key)
+            field = ObservedGaussian(gauss, **obs_args, points=points, noise=p["noise"], loc=p["loc"],
+                                     scale=p["scale"], method=method, rtol=p["rtol"], seed=self._seed(),
+                                     dtype=self.dtype, factor=None if cached is None else cached[1])
+            if field.method == "factor":
+                self._factors[key] = (gauss, field.factor_data())
+            return field
         if name == "white_noise":
             params({})
             return _NormalField(self.gaussian(precision=self._mass_precision()), None, 1.0)
@@ -762,6 +786,20 @@ class Generator:
     def variance_gamma(self, nu=1.0, size=None, **kwargs):
         """Type-G field driven by variance-gamma (Laplace-type) noise."""
         return self.sample("variance_gamma", nu, size=size, **kwargs)
+
+    def observed(self, loc=None, scale=1.0, size=None, **kwargs):
+        """Finite observations y = G f (+ e) of the Gaussian random function f ~ N(loc, scale^2 C): values (*size, m).
+
+        The observation map G is any finite set of bounded linear functionals (``points=``, ``averages=``,
+        ``functionals=``, ``operator=`` a matrix or LinearOperator, ``adjoint=`` with ``m=``; see
+        :func:`ngsrng.observation_operator`); ``noise=`` adds e ~ N(0, Gamma): variance(s), a covariance matrix, or an
+        independent :class:`ngsrng.ObservedGaussian` (coloured noise from another random field). Exact:
+        ``method="factor"`` (an m x m factor, set up once per generator and shared with spawned children; dense
+        draws, the fast route for many draws), ``"pathwise"`` (a field draw and G per sample) or ``"auto"``; see
+        :mod:`ngsrng.observed`. ``out=`` fills a preallocated (n, m) buffer, also on the GPU. Unlike
+        ``normal(points=...)``, also for observations other than point values and with noise.
+        """
+        return self.sample("observed", loc, scale, size=size, **kwargs)
 
     def karhunen_loeve(self, coefficients="normal", rank=None, size=None, **kwargs):
         """f = m + sum_k sqrt(lambda_k) xi_k phi_k: the Karhunen-Loeve expansion of the Gaussian with iid

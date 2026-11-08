@@ -22,6 +22,7 @@ from .covariance import (
 from .gaussian import Gaussian
 from .generator import FieldDistribution, Generator, default_rng
 from .lowrank import LowRankGaussian, karhunen_loeve, operator_kl
+from .observed import ObservedGaussian
 from .observations import observation_operator
 from .posterior import LinearObservations, MatheronPosterior, downdate
 from .space import SpaceInfo
@@ -46,6 +47,7 @@ __all__ = [
     "TraceEstimate",
     "LinearObservations",
     "MatheronPosterior",
+    "ObservedGaussian",
     "downdate",
     "observation_operator",
     "SpaceInfo",

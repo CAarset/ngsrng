@@ -29,9 +29,9 @@ ARGS = {
     "standard_normal": (), "white_noise": (), "dirichlet": ([1.0, 2.0, 3.0],), "wishart": (3, np.eye(2)),
     "inverse_wishart": (4, np.eye(2)), "matrix_lognormal": (2,), "normal_inverse_gaussian": (), "variance_gamma": (),
     "indicator": (0.5,), "transformed": (np.tanh,), "marginal": (st.genextreme(0.2),), "standard_exponential": (),
-    "standard_gamma": (2.0,), "karhunen_loeve": ("uniform",),
+    "standard_gamma": (2.0,), "karhunen_loeve": ("uniform",), "observed": (0.0, 2.0),
 }
-KWARGS = {"karhunen_loeve": {"rank": 12}}
+KWARGS = {"karhunen_loeve": {"rank": 12}, "observed": {"points": [[0.2, 0.3], [0.7, 0.6], [0.5, 0.5]], "noise": 0.1}}
 # other constructions and representations of the same families
 VARIANTS = [
     ("normal", (1.0, 0.5), {}), ("normal", (1.0, 0.5), {"points": [[0.2, 0.3], [0.7, 0.6]]}),

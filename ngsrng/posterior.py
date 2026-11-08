@@ -354,6 +354,16 @@ class LinearObservations:
     def rank(self) -> int:
         return self.q.shape[1]
 
+    def predictive(self, source=None, noise=True, **options):
+        """The law of the data y = G f + e as an :class:`ngsrng.ObservedGaussian`: f from ``source`` (default the
+        prior: the prior predictive, whose density at the data is the evidence; a posterior gives the posterior
+        predictive), e from this noise model (``noise=False``: G f alone). ``options``: method, rtol, seed, device,
+        dtype (see :class:`ngsrng.ObservedGaussian`)."""
+        from .observed import ObservedGaussian
+
+        return ObservedGaussian(self.prior if source is None else source, self.G,
+                                noise=self.noise if noise else None, **options)
+
     def _lt(self, x) -> torch.Tensor:
         """L^T x (float64), CHUNK columns at a time into one preallocated result; x dense or sparse (densified one
         chunk at a time)."""
