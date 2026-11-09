@@ -1,15 +1,16 @@
-"""Per-domain tuning of the Robin coefficient of Matern priors: ``matern_correlation(..., robin="tune")``.
+"""Estimating the Robin coefficient of Matern priors for a space: ``matern_correlation(..., boundary="robin",
+beta=None)``.
 
-The Robin condition du/dn + beta u = 0 with beta = c kappa keeps the pointwise variance of a Matern field near its
-interior value up to the boundary, where the natural (Neumann) condition doubles it (more in corners). The best
-constant c depends on the smoothness: 1/1.42 is the classical value for nu = 1 in 2D, while for nu = 5 it pulls the
-variance down to 0.1 in corners and c ~ 1/4 does better. It also depends on the domain (corners, curvature, thin
-parts, the length relative to the domain). :func:`tune_robin` chooses c for a given FE space: it minimises the
-root-mean-square of log(variance) over the boundary layer (the points within one correlation length of the
-boundary, area-weighted), with the variances of the discretised sampler computed exactly (sigma^2(x) = |L^T g_x|^2).
+The Robin condition du/dn + beta u = 0 keeps the pointwise variance of a Matern field near its interior value up to
+the boundary, where the natural (Neumann) condition doubles it (more in corners), if beta suits the field and the
+domain. In units of kappa = sqrt(8 nu) / length, beta = c kappa: the classical c = 1/1.42 suits nu = 1 in 2D, while
+for nu = 5 it pulls the variance down to 0.1 in corners and c ~ 0.28 does better. :func:`tune_robin` chooses beta for
+a given FE space: it minimises the root-mean-square of log(variance) over the boundary layer (the points within one
+correlation length of the boundary, area-weighted), with the variances of the discretised sampler computed exactly
+(sigma^2(x) = |L^T g_x|^2).
 
-A constant c cannot remove every boundary effect: for large nu the variance still dips in corners and overshoots
-slightly further in. The result records the remaining deviation, and that of the classical factor for comparison.
+A constant beta cannot remove every boundary effect: for large nu the variance still dips in corners and overshoots
+slightly further in. The result records the remaining deviation, and that of the classical c = 1/1.42 for comparison.
 """
 
 import math
@@ -33,54 +34,53 @@ _CACHE_SIZE = 32
 
 @dataclass(frozen=True)
 class RobinTuning:
-    """Result of :func:`tune_robin`: the Robin coefficient is beta = ``factor`` * kappa.
+    """Result of :func:`tune_robin`: the Robin coefficient ``beta`` (= ``factor`` * kappa).
 
-    ``rms`` is the area-weighted root-mean-square of log(variance) over the boundary layer with this factor (0 for a
+    ``rms`` is the area-weighted root-mean-square of log(variance) over the boundary layer with this beta (0 for a
     variance of exactly 1 throughout; 0.1 is about a 10% typical deviation), ``variance_range`` the smallest and
-    largest variance at the probe points. ``default_rms`` and ``default_range`` are the same for the classical factor
-    1/1.42.
+    largest variance at the probe points. ``classical_rms`` and ``classical_range`` are the same for the classical
+    beta = kappa / 1.42.
     """
 
-    factor: float
+    beta: float
     kappa: float
     rms: float
     variance_range: tuple
-    default_rms: float
-    default_range: tuple
+    classical_rms: float
+    classical_range: tuple
     probes: int
     evaluations: int
     seconds: float
 
     @property
-    def beta(self) -> float:
-        return self.factor * self.kappa
+    def factor(self) -> float:
+        return self.beta / self.kappa
 
     def __str__(self):
         lo, hi = self.variance_range
-        dlo, dhi = self.default_range
-        return (f"Robin factor {self.factor:.4g} (beta = {self.beta:.4g}): boundary-layer variance in [{lo:.3f}, "
-                f"{hi:.3f}], rms log-deviation {self.rms:.3f} (1/1.42: [{dlo:.3f}, {dhi:.3f}], "
-                f"{self.default_rms:.3f}); {self.probes} probes, {self.evaluations} set-ups, {self.seconds:.1f} s")
+        clo, chi = self.classical_range
+        return (f"Robin beta = {self.beta:.4g} ({self.factor:.4g} kappa): boundary-layer variance in [{lo:.3f}, "
+                f"{hi:.3f}], rms log-deviation {self.rms:.3f} (kappa / 1.42: [{clo:.3f}, {chi:.3f}], "
+                f"{self.classical_rms:.3f}); {self.probes} probes, {self.evaluations} set-ups, {self.seconds:.1f} s")
 
 
 def tune_robin(fes, length: float, nu: float = 1.0, *, rtol: float = 1e-7, probes: int = PROBES,
                bounds: tuple = BOUNDS, xtol: float = XTOL) -> RobinTuning:
-    """The constant c (beta = c kappa) for which ``matern_correlation(length, nu, boundary="robin", robin=c)`` on
-    ``fes`` has its pointwise variance closest to one near the boundary.
+    """The Robin coefficient beta for which ``matern_correlation(length, nu, boundary="robin", beta=beta)`` on ``fes``
+    has its pointwise variance closest to constant (one, its interior value) near the boundary.
 
     Criterion: the area-weighted mean of log(variance)^2 over the mesh vertices within ``length`` of the boundary
     (a deterministic subsample of ``probes`` of them on fine meshes: half on the boundary itself, where the deviation
     is largest, half inside the layer), over boundaries without a Dirichlet condition (points within ``length`` of a
     Dirichlet boundary are left out: their variance is pinned down whatever c is). Variances are exact for the
     discretised sampler, so the result accounts for the mesh, the element order and the rational approximation of
-    fractional powers.
+    fractional powers. The search runs over c = beta / kappa in ``bounds`` (log scale, to ``xtol``).
 
     Cost: about 15 set-ups of the Gaussian and ``probes`` applications of L^T each (seconds for 1e4 dofs in 2D). The
-    best c does not depend on the mesh once the mesh resolves ``length``: tune on a coarser mesh of the same geometry
-    and pass ``robin=result.factor`` to save time. Results are cached per space and parameters, and
-    ``matern_correlation(..., robin="tune")`` uses this function.
+    best beta does not depend on the mesh once the mesh resolves ``length``: tune on a coarser mesh of the same
+    geometry and pass ``beta=result.beta`` to save time. Results are cached per space and parameters, and
+    ``matern_correlation(..., boundary="robin", beta=None)`` uses this function.
     """
-    from .correlation import MaternCorrelation
 
     if length <= 0 or nu <= 0:
         raise ValueError("length and nu must be positive")
@@ -105,12 +105,12 @@ def tune_robin(fes, length: float, nu: float = 1.0, *, rtol: float = 1e-7, probe
                           method="bounded", options={"xatol": float(xtol)})
     factor = float(math.exp(res.x))
     if min(res.x - math.log(lo), math.log(hi) - res.x) < 2 * xtol:
-        warnings.warn(f"the tuned Robin factor {factor:.3g} lies at the end of the search interval {bounds}",
-                      RuntimeWarning, stacklevel=2)
-    v, vd = variances(factor), variances(ROBIN_FACTOR)
-    out = RobinTuning(factor=factor, kappa=MaternCorrelation(length, nu).kappa(), rms=rms(v),
-                      variance_range=(float(v.min()), float(v.max())), default_rms=rms(vd),
-                      default_range=(float(vd.min()), float(vd.max())), probes=len(points),
+        warnings.warn(f"the estimated Robin coefficient ({factor:.3g} kappa) lies at the end of the search interval "
+                      f"{bounds} (in units of kappa)", RuntimeWarning, stacklevel=2)
+    v, vc = variances(factor), variances(ROBIN_FACTOR)
+    out = RobinTuning(beta=factor * variances.kappa, kappa=variances.kappa, rms=rms(v),
+                      variance_range=(float(v.min()), float(v.max())), classical_rms=rms(vc),
+                      classical_range=(float(vc.min()), float(vc.max())), probes=len(points),
                       evaluations=variances.evaluations, seconds=time.perf_counter() - start)
     _CACHE[key] = out
     while len(_CACHE) > _CACHE_SIZE:
@@ -119,13 +119,15 @@ def tune_robin(fes, length: float, nu: float = 1.0, *, rtol: float = 1e-7, probe
 
 
 class _Variances:
-    """c -> exact pointwise variances at the probes of the Matern Gaussian with Robin factor c (memoised)."""
+    """c -> exact pointwise variances at the probes of the Matern Gaussian with beta = c kappa (memoised)."""
 
     def __init__(self, fes, points, length, nu, rtol):
+        from .correlation import MaternCorrelation
         from .observations import observation_operator
         from .space import SpaceInfo
 
         self.fes, self.length, self.nu, self.rtol = fes, length, nu, rtol
+        self.kappa = MaternCorrelation(length, nu).kappa()
         self.gt = observation_operator(fes, points=points)[:, SpaceInfo(fes).free].T.tocsc()
         self.known = {}
         self.evaluations = 0
@@ -139,7 +141,7 @@ class _Variances:
 
         if c in self.known:
             return self.known[c]
-        spec = MaternCorrelation(self.length, self.nu, self.rtol, "robin", c).bind(self.fes)
+        spec = MaternCorrelation(self.length, self.nu, self.rtol, "robin", c * self.kappa).bind(self.fes)
         gauss = Gaussian(self.fes, spec, dtype="float64", seed=0)
         m = self.gt.shape[1]
         out = np.empty(m)

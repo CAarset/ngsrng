@@ -197,14 +197,16 @@ error when requested.
 
 Precisions:
 - `matern(kappa, power)` (H1) or `matern_dg(fes, kappa, power)` (L2 with `dgjumps=True`): $\mathcal C = \mathcal A^{-\text{power}}$.
-  `robin=beta` (or `"auto"`: $\beta=\kappa/1.42$) adds a Robin boundary condition. With the default natural
-  condition the variance is about twice as large at edges and four times as large in corners;
-  `matern_correlation(..., boundary="robin")` keeps it within a few percent of the interior value except near corners
-  (up to about 12% lower there), as measured in the Stokes walkthrough, for $\nu=1$ in 2D. The classical factor
-  $1/1.42$ is too strong for smoother fields ($\nu=5$: variance 0.1 in corners); `robin="tune"` chooses the factor
-  for each space (`ngsrng.tune_robin(fes, length, nu)`: the factor $c$ in $\beta=c\kappa$ minimising the area mean of
-  $(\log\sigma^2)^2$ over the points within one correlation length of the boundary, with exact variances; seconds per
-  domain, cached; `corr.robin_tuning(fes)` reports the remaining deviation).
+  `robin=beta` adds the Robin boundary condition $\partial_n u+\beta u=0$. With the default natural condition the
+  variance is about twice as large at edges and four times as large in corners. A suitable $\beta$ keeps it close
+  to the interior value up to the boundary, but the best value depends on $\nu$ and on the domain, so it has no
+  default: `matern_correlation(length, nu, boundary="robin", beta=...)` takes a number, or `beta=None` to estimate
+  the $\beta$ whose pointwise variance stays closest to constant (`ngsrng.tune_robin(fes, length, nu)`: minimises
+  the area mean of $(\log\sigma^2)^2$ over the points within one correlation length of the boundary, with exact
+  variances; seconds per space, cached; `corr.robin_tuning(fes)` reports $\beta$ and the remaining deviation).
+  Leaving `beta` out with `boundary="robin"` is an error that says so. In units of $\kappa=\sqrt{8\nu}/\ell$ the
+  estimates are $\beta\approx0.68\kappa$, $0.45\kappa$, $0.28\kappa$ for $\nu=1,2,5$ in 2D (the classical
+  $\kappa/1.42$ suits $\nu=1$ only: for $\nu=5$ it pulls the variance down to 0.1 in corners).
   `power` is any positive real (Matérn smoothness $\nu=\text{power}-d/2$). Integer powers are exact, except odd powers of forms with facet terms (`matern_dg`), which take the
   rational route below with a relative accuracy of `rtol` (no global factorisation is ever formed). Real powers use
   a rational approximation with relative accuracy `rtol` (default 1e-7) on the discrete spectrum, i.e. 7–25 shifted

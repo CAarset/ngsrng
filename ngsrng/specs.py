@@ -71,10 +71,10 @@ class OperatorPrecision:
             raise ValueError("convention must be 'primal->dual' or 'dual->dual'")
 
 
-# Robin coefficient beta = ROBIN_FACTOR * kappa for A = kappa^2 - Laplace (C = A^-2 in 2D): the empirical constant of
-# Roininen, Huttunen & Lasanen (2014), used by Daon & Stadler (2018) and, as beta = sqrt(gamma delta) / 1.42 for
-# A = delta - div(gamma grad), by hIPPYlib (Villa & O'Leary-Roseberry 2024). It mitigates the boundary variance
-# inflation of the natural (Neumann) condition.
+# The classical Robin coefficient beta = ROBIN_FACTOR * kappa for A = kappa^2 - Laplace (C = A^-2 in 2D): the empirical
+# constant of Roininen, Huttunen & Lasanen (2014), used by Daon & Stadler (2018) and, as beta = sqrt(gamma delta) / 1.42
+# for A = delta - div(gamma grad), by hIPPYlib (Villa & O'Leary-Roseberry 2024). Not a default (the best coefficient
+# depends on nu and the domain: ngsrng.tune_robin); tune_robin reports it for comparison.
 ROBIN_FACTOR = 1 / 1.42
 
 
@@ -82,8 +82,8 @@ def matern(kappa: float, power: float = 2, scale: float = 1.0, coef=None, robin=
     """Whittle-Matern-type prior: A = kappa^2 - div(coef grad). H1-conforming spaces only (L2 needs a DG form).
 
     Boundary condition: natural (Neumann) by default, Dirichlet through the space; ``robin=beta`` adds the Robin
-    condition (coef grad u) . n + beta u = 0, i.e. the term beta * u * v * ds (``robin="auto"``: beta = kappa / 1.42,
-    see ROBIN_FACTOR).
+    condition (coef grad u) . n + beta u = 0, i.e. the term beta * u * v * ds (to estimate beta for a space, use
+    ``matern_correlation(length, nu, boundary="robin", beta=None)`` or :func:`ngsrng.tune_robin`).
     """
     return PDEPrecision(MaternForm(kappa, coef, _robin(robin, kappa)), power, scale)
 
@@ -106,7 +106,11 @@ class MaternForm:
 def _robin(robin, kappa):
     if robin is None:
         return None
-    beta = ROBIN_FACTOR * kappa if isinstance(robin, str) and robin == "auto" else float(robin)
+    if isinstance(robin, str):
+        raise ValueError("robin= is the Robin coefficient beta itself (robin='auto', beta = kappa / 1.42, was removed: "
+                         "that constant suits nu = 1 in 2D only). To estimate beta for the space, use "
+                         "matern_correlation(length, nu, boundary='robin', beta=None) or ngsrng.tune_robin")
+    beta = float(robin)
     if beta < 0:
         raise ValueError("the Robin coefficient must be nonnegative")
     return beta

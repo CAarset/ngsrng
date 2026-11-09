@@ -416,7 +416,7 @@ class Generator:
             spec = matern(float(spec))
         elif isinstance(spec, dict):
             spec = matern(**spec)
-        key = (("matern", spec.length, spec.nu, spec.rtol, spec.boundary, spec.robin)
+        key = (("matern", spec.length, spec.nu, spec.rtol, spec.boundary, spec.beta)
                if isinstance(spec, MaternCorrelation) else ("id", id(spec)))
         if key not in self._gaussians:
             if isinstance(spec, OperatorCovariance):

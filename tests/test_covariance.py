@@ -276,14 +276,15 @@ def test_robin_boundary_flattens_the_variance(kind):
         [(0.5, 0.5), (0.01, 0.5), (0.5, 0.01), (0.01, 0.01), (0.99, 0.99)]
     v = {}
     for boundary in ("neumann", "robin"):
-        corr = ngsrng.matern_correlation(0.3, nu=1.0, boundary=boundary)
+        beta = {"beta": ngsrng.matern_correlation(0.3).kappa() / 1.42} if boundary == "robin" else {}
+        corr = ngsrng.matern_correlation(0.3, nu=1.0, boundary=boundary, **beta)
         g = ngsrng.default_rng(fes, seed=0, correlation=corr, dtype="float64").gaussian()
         v[boundary] = np.diag(ngsrng.functional_covariance(g, points=pts))
     assert v["neumann"][1:].min() > 1.7 * v["neumann"][0]  # reflection: about 2x at edges, more in corners
     assert np.abs(v["robin"][1:] / v["robin"][0] - 1).max() < 0.2  # Robin, beta = kappa / 1.42: nearly flat
     with pytest.raises(ValueError):
         ngsrng.matern_correlation(0.3, boundary="dirichlet")
-    spec = ngsrng.matern(5.0, robin="auto")
+    spec = ngsrng.matern(5.0, robin=5.0 / 1.42)
     a = ngsrng.SpaceInfo(fes if kind == "H1" else ngs.H1(mesh, order=1)).assemble_free(spec.form)
     b = ngsrng.SpaceInfo(fes if kind == "H1" else ngs.H1(mesh, order=1)).assemble_free(ngsrng.matern(5.0).form)
     one = np.ones(a.shape[0])
