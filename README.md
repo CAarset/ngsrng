@@ -200,7 +200,11 @@ Precisions:
   `robin=beta` (or `"auto"`: $\beta=\kappa/1.42$) adds a Robin boundary condition. With the default natural
   condition the variance is about twice as large at edges and four times as large in corners;
   `matern_correlation(..., boundary="robin")` keeps it within a few percent of the interior value except near corners
-  (up to about 12% lower there), as measured in the Stokes walkthrough.
+  (up to about 12% lower there), as measured in the Stokes walkthrough, for $\nu=1$ in 2D. The classical factor
+  $1/1.42$ is too strong for smoother fields ($\nu=5$: variance 0.1 in corners); `robin="tune"` chooses the factor
+  for each space (`ngsrng.tune_robin(fes, length, nu)`: the factor $c$ in $\beta=c\kappa$ minimising the area mean of
+  $(\log\sigma^2)^2$ over the points within one correlation length of the boundary, with exact variances; seconds per
+  domain, cached; `corr.robin_tuning(fes)` reports the remaining deviation).
   `power` is any positive real (Matérn smoothness $\nu=\text{power}-d/2$). Integer powers are exact, except odd powers of forms with facet terms (`matern_dg`), which take the
   rational route below with a relative accuracy of `rtol` (no global factorisation is ever formed). Real powers use
   a rational approximation with relative accuracy `rtol` (default 1e-7) on the discrete spectrum, i.e. 7–25 shifted
@@ -381,7 +385,7 @@ Gaussian's `plan` records its algorithms and its `"randomness"`.
 ## Repository layout
 | Path | Contents |
 |---|---|
-| `ngsrng/` | The package. `gaussian.py` (sampler and automatic selection), `noise.py` (white noise), `solvers.py`, `rational.py` (fractional powers), `observations.py`, `posterior.py`, `lowrank.py`, `randomized.py` (randomised subspace iteration), `covariance.py` (variance maps, traces, covariance functions, sample covariances), `quadrature.py`, `generator.py` (numpy-style API), `correlation.py`, `distributions/` (inversion, copula marginals, quadratic forms, scale mixtures, KL expansions), `seeding.py` (seeds and generators), `tuning.py` (calibrated choices), `calibrate.py` and `calibration/` (the calibration), `data/default_tuning.json` (the shipped calibration), `reference.py` (dense ground truth), `space.py`, `backend.py`, `specs.py` |
+| `ngsrng/` | The package. `gaussian.py` (sampler and automatic selection), `noise.py` (white noise), `solvers.py`, `rational.py` (fractional powers), `observations.py`, `posterior.py`, `lowrank.py`, `randomized.py` (randomised subspace iteration), `covariance.py` (variance maps, traces, covariance functions, sample covariances), `quadrature.py`, `generator.py` (numpy-style API), `correlation.py`, `robin.py` (Robin factor per domain), `observed.py` (observed Gaussians), `distributions/` (inversion, copula marginals, quadratic forms, scale mixtures, KL expansions), `seeding.py` (seeds and generators), `tuning.py` (calibrated choices), `calibrate.py` and `calibration/` (the calibration), `data/default_tuning.json` (the shipped calibration), `reference.py` (dense ground truth), `space.py`, `backend.py`, `specs.py` |
 | `tests/` | One test file per module; `python -m pytest` |
 | `bench/` | Developer checks: `calibrate.py` (tests, validation, calibration, boundary and GPU benchmarks in one run), `boundary_scaling.py`, `gpu_batch.py` |
 | `examples/` | `demo.ipynb`: the user tutorial; `stokes_inverse.ipynb`: advanced walkthrough of a linear Bayesian inverse problem with a Stokes forward model; `hydraulic_tomography_3d.ipynb`: nonlinear 3D problem with heavy-tailed noise, Laplace approximation and MCMC. All executed (interactive `Draw` views and static panels included) |

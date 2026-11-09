@@ -325,6 +325,10 @@ class LocalGramNoise(NoiseSampler):
     Elements touching Dirichlet dofs instead factor their reduced Gram matrix E_ef^T A_e E_ef directly on their
     free dofs, so no random numbers are spent on Dirichlet dofs.
 
+    Surface terms of the form (``ds`` integrals, e.g. the Robin term of a Matern operator), which the volume-element
+    (broken) assembly drops, get their own boundary-element roots in the same way (H1 spaces). A form whose matrix is
+    not reproduced by these local parts raises RuntimeError (the caller then uses white noise and a rational solve).
+
     Interior elements whose local matrix equals s_e D_e R_k D_e (D_e diagonal +-1, s_e > 0) for one of a few
     reference matrices R_k (orientation classes; the mass matrix on affine meshes) share that class's Cholesky
     factor: one GEMM per class and O(#elements) storage. Remaining elements store individual roots.
@@ -371,6 +375,9 @@ class LocalGramNoise(NoiseSampler):
             bnd = np.flatnonzero(~interior)
             if len(bnd):
                 boundary.extend(_reduced_grams(blocks[bnd], rows[bnd], elem[bnd], e, freepos))
+        surface = [] if form is mass_form else _surface_terms(space, form, a_b, e, freepos)
+        boundary.extend(surface)
+        self.n_surface_elements = len(surface)
 
         self.ref_parts = ref_parts
         self.n_classes = len(ref_parts)
@@ -516,6 +523,7 @@ class LocalGramNoise(NoiseSampler):
             "reference_elements": self.n_ref_elements,
             "batched_elements": self.n_batched_elements,
             "boundary_elements": self.n_boundary_elements,
+            "surface_elements": getattr(self, "n_surface_elements", 0),
         }
 
 
@@ -533,6 +541,76 @@ def _reduced_grams(blocks, rows, elems, e: sp.csr_matrix, freepos):
         np.add.at(ef, (sub.row[keep], local), sub.data[keep])
         out.append((ef.T @ blk @ ef, cols, el))
     return out
+
+
+def _surface_terms(space: SpaceInfo, form, a_b, e, freepos):
+    """Boundary-element Gram matrices (on the free dofs) of the form's surface terms, which the broken assembly drops.
+
+    Checks that the element-wise parts reproduce the form's matrix: A_ff = E_f^T A_broken E_f (+ the surface part).
+    The surface part is assembled on the broken trace space Discontinuous(H1 on the boundary, BND=True), one block
+    per boundary element, so region restrictions such as ds("top") apply exactly as in NGSolve's assembly. Returns
+    [] for forms without surface terms; raises RuntimeError for anything else the local parts miss (facet terms,
+    spaces other than H1) and for indefinite surface terms (a negative Robin coefficient).
+    """
+    a_ff = space.assemble_free(form)
+    e_f = e[:, space.free]
+    missing = (a_ff - e_f.T @ a_b @ e_f).tocsr()
+    scale = max(abs(a_ff).max(), 1e-300)
+    if missing.nnz == 0 or abs(missing).max() <= 1e-10 * scale:
+        return []
+    fes, mesh = space.fes, space.mesh
+    if fes.type != "h1ho":
+        raise RuntimeError(f"form has terms that are not element-local on a {fes.type} space (e.g. surface terms)")
+    with _quiet_stderr():  # NGSolve warns that BND is undocumented (it is documented, and works)
+        trace = ngs.Discontinuous(ngs.H1(mesh, order=fes.globalorder, definedon=mesh.Boundaries(".*")), BND=True)
+    b = assemble(trace, form).tocsr()
+    rows, cols, items = [], [], []
+    for el in mesh.Elements(ngs.BND):
+        ei = ngs.ElementId(el)
+        r, c = list(trace.GetDofNrs(ei)), list(fes.GetDofNrs(ei))
+        if len(r) != len(c):
+            raise RuntimeError("the boundary trace space does not match the space's boundary elements")
+        rows += r
+        cols += c
+        items.append((np.array(r), mesh[el.vertices[0]].elements[0].nr))
+    e_s = sp.csr_matrix((np.ones(len(rows)), (rows, cols)), shape=(trace.ndof, fes.ndof))
+    es_f = e_s[:, space.free]
+    if abs(missing - es_f.T @ b @ es_f).max() > 1e-10 * scale:
+        raise RuntimeError("form has terms that are neither element-local nor on boundary elements (e.g. facet terms)")
+    blocks = [b[r][:, r].toarray() for r, _ in items]
+    grams = _reduced_grams(blocks, [r for r, _ in items], [el for _, el in items], e_s, freepos)
+    grams = [g for g in grams if np.abs(g[0]).max() > 0]
+    for g, _, _ in grams:
+        lam = np.linalg.eigvalsh(g)
+        if lam[0] < -1e-10 * max(lam[-1], 0.0):
+            raise RuntimeError("the form's surface terms are not positive semidefinite (negative Robin coefficient?)")
+    return grams
+
+
+class _quiet_stderr:
+    """Silences file descriptor 2 (C++ std::cerr) for the duration; a no-op where it cannot be redirected."""
+
+    def __enter__(self):
+        import os
+        import sys
+
+        try:
+            sys.stderr.flush()
+            self.saved = os.dup(2)
+            null = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(null, 2)
+            os.close(null)
+        except (OSError, AttributeError, ValueError):
+            self.saved = None
+        return self
+
+    def __exit__(self, *exc):
+        import os
+
+        if self.saved is not None:
+            os.dup2(self.saved, 2)
+            os.close(self.saved)
+        return False
 
 
 def _group_by_size(items):

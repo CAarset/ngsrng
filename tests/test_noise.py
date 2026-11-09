@@ -88,6 +88,31 @@ def test_stiffness_noise_is_exact():
     assert np.abs(h @ h.T - q).max() / np.abs(q).max() < 1e-12
 
 
+@pytest.mark.parametrize("make", ["1D-H1-p3-dir", "2D-H1-p1-dir", "2D-H1-p4-dir", "3D-H1-p3-dir", "2D-H1-p3-mapped"])
+def test_stiffness_noise_includes_surface_terms(make, capfd):
+    """Robin-type ds terms (which the volume-element assembly drops), also restricted to regions, are part of the
+    noise covariance; NGSolve's warning about the broken trace space is not shown."""
+    space = SpaceInfo(SPACES[make]())
+    regions = "right" if space.dim == 1 else "top|right"
+
+    def form(u, v):
+        return ((ngs.grad(u) * ngs.grad(v) + 9 * u * v) * ngs.dx + (1 + ngs.x) * u * v * ngs.ds
+                + 2 * u * v * ngs.ds(regions))
+
+    q = space.assemble_free(form).toarray()
+    sampler = nz.LocalGramNoise(space, form=form).setup(*CPU64)
+    h = sampler.factor().toarray()
+    assert sampler.n_surface_elements > 0
+    assert np.abs(h @ h.T - q).max() / np.abs(q).max() < 1e-12
+    assert "undocumented" not in capfd.readouterr().err
+
+
+def test_indefinite_surface_terms_are_rejected():
+    space = SpaceInfo(SPACES["2D-H1-p1-dir"]())
+    with pytest.raises(RuntimeError, match="positive semidefinite"):
+        nz.LocalGramNoise(space, form=lambda u, v: (ngs.grad(u) * ngs.grad(v) + u * v) * ngs.dx - u * v * ngs.ds)
+
+
 def test_dg_form_is_rejected_by_local_gram():
     mesh = ngs.Mesh(ngs.unit_square.GenerateMesh(maxh=0.3))
     fes = ngs.L2(mesh, order=1, dgjumps=True)

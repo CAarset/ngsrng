@@ -25,6 +25,7 @@ from .lowrank import LowRankGaussian, karhunen_loeve, operator_kl
 from .observed import ObservedGaussian
 from .observations import observation_operator
 from .posterior import LinearObservations, MatheronPosterior, downdate
+from .robin import RobinTuning, tune_robin
 from .space import SpaceInfo
 from .specs import AssembledPrecision, OperatorCovariance, OperatorPrecision, PDEPrecision, matern, matern_dg
 
@@ -38,6 +39,8 @@ __all__ = [
     "operator_kl",
     "local_covariance",
     "pointwise_variance",
+    "tune_robin",
+    "RobinTuning",
     "covariance_trace",
     "covariance_function",
     "functional_covariance",

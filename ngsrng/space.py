@@ -17,8 +17,20 @@ def to_scipy(mat) -> sp.csr_matrix:
 def assemble(fes, form) -> sp.csr_matrix:
     """Assemble ``form(u, v)`` (a SumOfIntegrals, measures included) on ``fes`` into a scipy matrix."""
     u, v = fes.TnT()
+    terms = form(u, v)
+    if fes.type.startswith("Discontinuous"):
+        # one integral at a time: NGSolve 6.2.2608 segfaults assembling two or more ds integrals together on a
+        # Discontinuous space; coef * symbol rebuilds an integral with its region and options
+        parts = [_assemble(fes, p.coef * p.symbol) for p in terms]
+        if len(parts) > 1:
+            return sum(parts[1:], parts[0]).tocsr()
+        return parts[0]
+    return _assemble(fes, terms)
+
+
+def _assemble(fes, terms) -> sp.csr_matrix:
     a = ngs.BilinearForm(fes)
-    a += form(u, v)
+    a += terms
     with ngs.TaskManager():
         a.Assemble()
     return to_scipy(a.mat)
