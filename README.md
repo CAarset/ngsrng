@@ -202,11 +202,14 @@ Precisions:
   to the interior value up to the boundary, but the best value depends on $\nu$ and on the domain, so it has no
   default: `matern_correlation(length, nu, boundary="robin", beta=...)` takes a number, or `beta=None` to estimate
   the $\beta$ whose pointwise variance stays closest to constant (`ngsrng.tune_robin(fes, length, nu)`: minimises
-  the area mean of $(\log\sigma^2)^2$ over the points within one correlation length of the boundary, with exact
-  variances; seconds per space, cached; `corr.robin_tuning(fes)` reports $\beta$ and the remaining deviation).
-  Leaving `beta` out with `boundary="robin"` is an error that says so. In units of $\kappa=\sqrt{8\nu}/\ell$ the
-  estimates are $\beta\approx0.68\kappa$, $0.45\kappa$, $0.28\kappa$ for $\nu=1,2,5$ in 2D (the classical
-  $\kappa/1.42$ suits $\nu=1$ only: for $\nu=5$ it pulls the variance down to 0.1 in corners).
+  the mean squared deviation of $\log\sigma^2$ from its interior level over the points within one correlation
+  length of the boundary, with exact variances and a quadrature of that layer that does not depend on the mesh's
+  vertices; seconds to minutes per space on the CPU, on the GPU if torch sees one; cached; `corr.robin_tuning(fes)`
+  reports $\beta$ and the remaining deviation). Leaving `beta` out with `boundary="robin"` is an error that says
+  so. In units of $\kappa=\sqrt{8\nu}/\ell$ the estimates are $\beta\approx0.71\kappa$, $0.49\kappa$,
+  $0.30\kappa$ for $\nu=1,2,5$ on the unit square ($\ell=0.3$; a disk gives 2% more, a domain with five holes 6%
+  less), unchanged under mesh refinement to within 1% (the classical $\kappa/1.42$ suits $\nu=1$ only: for
+  $\nu=5$ it pulls the variance down to 0.1 in corners).
   `power` is any positive real (Matérn smoothness $\nu=\text{power}-d/2$). Integer powers are exact, except odd powers of forms with facet terms (`matern_dg`), which take the
   rational route below with a relative accuracy of `rtol` (no global factorisation is ever formed). Real powers use
   a rational approximation with relative accuracy `rtol` (default 1e-7) on the discrete spectrum, i.e. 7–25 shifted

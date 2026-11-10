@@ -11,7 +11,7 @@ within about one correlation length of the boundary (about 2x at edges, more in 
 unit variance standardise pointwise. ``boundary="robin"`` uses the Robin condition du/dn + beta u = 0, which keeps the
 variance close to one up to the boundary for a suitable beta. The coefficient has no default: the best value depends
 on nu and on the domain (the classical beta = kappa / 1.42 of Roininen, Huttunen & Lasanen 2014, used by Daon &
-Stadler 2018 and Villa & O'Leary-Roseberry 2024, suits nu = 1 in 2D; nu = 5 needs about kappa / 3.6). Pass it, or
+Stadler 2018 and Villa & O'Leary-Roseberry 2024, suits nu = 1 in 2D; nu = 5 needs about 0.3 kappa). Pass it, or
 ``beta=None`` to estimate the beta whose pointwise variance stays closest to constant (:func:`ngsrng.tune_robin`).
 ``ngsrng.pointwise_variance`` shows the result exactly. With this normalisation, ``normal(loc, scale,
 correlation=matern(...))`` has pointwise standard deviation ~scale, as in numpy.
