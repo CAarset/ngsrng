@@ -420,11 +420,11 @@ class Generator:
             spec = matern(float(spec))
         elif isinstance(spec, dict):
             spec = matern(**spec)
-        key = (("matern", spec.length, spec.nu, spec.rtol, spec.boundary, spec.beta)
+        key = (("matern", spec.length, spec.nu, spec.rtol, spec.boundary, spec.beta, repr(sorted(spec.options.items())))
                if isinstance(spec, MaternCorrelation) else ("id", id(spec)))
         if key not in self._gaussians:
-            if isinstance(spec, OperatorCovariance):
-                gauss = spec.bind(self.fes, seed=self._seed())
+            if isinstance(spec, OperatorCovariance) or (isinstance(spec, MaternCorrelation) and spec.stationary):
+                gauss = spec.bind(self.fes, seed=self._seed())  # a sampler of its own (StationaryMatern: CPU, float64)
             else:
                 bound = spec.bind(self.fes) if hasattr(spec, "bind") else spec
                 if not isinstance(bound, (PDEPrecision, AssembledPrecision, OperatorPrecision)):

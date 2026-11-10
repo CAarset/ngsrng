@@ -15,10 +15,13 @@ For every case (domain, mesh size, element order, nu; correlation length 0.3) an
 - set-up seconds (construction and first draw) and milliseconds per sample (in-place batch of 16);
 - method details: torus cells, dofs and padding; FFT grid and embedding; dense rank; Robin coefficient.
 
-Priors: "neumann" and "robin" (``matern_correlation``, ``beta=None``: the estimated coefficient), "torus"
-(construction="torus", tol=1e-3), "restrict-fft", "restrict-dense" (small cases only) and "torus+dirichlet" (the
-boundary update on a space with dirichlet="left"; its statistics leave out the vertices within one length of the
-Dirichlet edge, whose variance is meant to drop to zero). Each prior runs in its own process with a time limit.
+Priors, all from ``ngsrng.matern_correlation(0.3, nu, boundary=...)``: "neumann", "robin" (``beta=None``: the
+estimated coefficient), and the two StationaryMatern constructions, compared with each other for speed and accuracy:
+"torus" (boundary="torus", tol=1e-3), "restrict-fft" and "restrict-dense" (boundary="restrict", method="fft" /
+"dense"; dense on small cases only), and "torus+dirichlet" / "restrict+dirichlet" (the boundary update on a space with
+a Dirichlet condition on one named boundary, skipped on meshes with a single boundary name; their statistics leave
+out the vertices within one length of the Dirichlet edge, whose variance is meant to drop to zero). The report ends
+with a table of the stationary priors side by side. Each prior runs in its own process with a time limit.
 Results: results/runs/<host>_<date>_stationary/ (results.jsonl, report.md) or --out-dir.
 """
 
@@ -43,7 +46,9 @@ PROFILES = {
                  ("square", 0.025, 2, 1.0), ("lshape", 0.05, 2, 1.0), ("holes", 0.05, 2, 2.0),
                  ("cube", 0.15, 1, 1.0)],
 }
-PRIORS = ["neumann", "robin", "torus", "restrict-fft", "restrict-dense", "torus+dirichlet"]
+PRIORS = ["neumann", "robin", "torus", "restrict-fft", "restrict-dense", "torus+dirichlet", "restrict+dirichlet"]
+STATIONARY = {"torus": ("torus", "auto"), "torus+dirichlet": ("torus", "auto"), "restrict-fft": ("restrict", "fft"),
+              "restrict-dense": ("restrict", "dense"), "restrict+dirichlet": ("restrict", "fft")}
 
 
 def make_mesh(domain, h):
@@ -77,7 +82,7 @@ def run_one(domain, h, order, nu, prior, seed=0):
     from ngsrng.stationary import MAX_DENSE, basis_at, matern_function
 
     mesh = make_mesh(domain, h)
-    dirichlet = prior == "torus+dirichlet"
+    dirichlet = prior.endswith("+dirichlet")
     if dirichlet and len(set(mesh.GetBoundaries())) < 2:
         return {"domain": domain, "h": h, "order": order, "nu": nu, "prior": prior,
                 "skipped": "one boundary name: no Dirichlet edge separate from the rest"}
@@ -93,14 +98,13 @@ def run_one(domain, h, order, nu, prior, seed=0):
         if prior == "robin":
             out["beta_over_kappa"] = corr.robin_beta(fes) / corr.kappa()
     else:
-        cons, meth = {"torus": ("torus", "auto"), "torus+dirichlet": ("torus", "auto"),
-                      "restrict-fft": ("restrict", "fft"), "restrict-dense": ("restrict", "dense")}[prior]
+        cons, meth = STATIONARY[prior]
         if meth == "dense":
             from ngsrng.quadrature import QuadratureRule
             from ngsrng.space import SpaceInfo
             if QuadratureRule.count(SpaceInfo(fes)) > MAX_DENSE:
                 return {**out, "skipped": f"more than {MAX_DENSE} quadrature points"}
-        g = ngsrng.StationaryMatern(fes, LENGTH, nu, construction=cons, method=meth, seed=seed)
+        g = ngsrng.matern_correlation(LENGTH, nu, boundary=cons, method=meth).bind(fes, seed=seed)  # StationaryMatern
         out["source"] = g.plan["source"]
         out["conditioning"] = g.plan["conditioning"]
     buf = np.empty((fes.ndof, 16))
@@ -183,7 +187,7 @@ def report(results, path):
     lines = ["# Stationary Matérn priors: accuracy and cost", "",
              f"Correlation length {LENGTH}. Variance: [min, max] and rms of log(variance) at the mesh vertices "
              "(target 1); correlation error: max / rms of |rho_h - rho_Matern| over vertex pairs closer than two "
-             "lengths. torus+dirichlet: statistics away from the Dirichlet edge.", ""]
+             "lengths. +dirichlet: statistics away from the Dirichlet edge.", ""]
     cases = []
     for r in results:
         key = (r["domain"], r["h"], r["order"], r["nu"])
@@ -196,6 +200,17 @@ def report(results, path):
                   "| prior | variance (all) | variance (boundary) | corr. error | set-up s | ms/sample | details |",
                   "|---|---|---|---|---|---|---|"]
         lines += [fmt(r) for r in rs] + [""]
+    stat = [r for r in results if r["prior"] in STATIONARY and "variance" in r]
+    if stat:
+        lines += ["## The stationary constructions side by side", "",
+                  "rms of log(variance) at all vertices, max correlation error, set-up seconds, ms per sample.", "",
+                  "| case | prior | rms log var | max corr. error | set-up s | ms/sample | nrand |",
+                  "|---|---|---|---|---|---|---|"]
+        for r in stat:
+            lines.append(f"| {r['domain']}, h = {r['h']}, P{r['order']}, nu = {r['nu']:g} | {r['prior']} | "
+                         f"{r['variance']['rms_log']:.4f} | {r['corr_error']['max']:.3f} | {r['setup_s']:.1f} | "
+                         f"{r['ms_per_sample']:.2f} | {r['nrand']} |")
+        lines.append("")
     with open(path, "w") as fh:
         fh.write("\n".join(lines))
 

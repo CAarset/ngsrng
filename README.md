@@ -239,10 +239,13 @@ varying along the boundary (it trades a dip at the boundary for an overshoot fur
 field whose law does not depend on position:
 
 ```python
-prior = ngsrng.StationaryMatern(X, 0.3, nu=2, construction="torus")   # or construction="restrict"
-rng = ngsrng.default_rng(X, correlation=prior)                       # every family, spawn, pickling
+corr = ngsrng.matern_correlation(0.3, nu=2, boundary="torus")        # or boundary="restrict" (method="fft"/"dense")
+rng = ngsrng.default_rng(X, correlation=corr)                        # every family, spawn, pickling
+prior = corr.bind(X)                                                 # the sampler itself: ngsrng.StationaryMatern
 post = prior.condition(points=xy, noise=1e-4, data=y)                # exact posteriors, variance maps, ...
 ```
+`boundary="torus"` / `"restrict"` take StationaryMatern's options (`method`, `tol`, `resolution`, `max_dense`,
+`method_options`); `ngsrng.StationaryMatern(X, length, nu, construction=...)` builds the sampler directly.
 - `construction="torus"`: the Matérn SPDE on a periodic box around the domain (a structured periodic mesh;
   NGSolve's `Periodic`), restricted to the domain. Shifts of the torus commute with the Laplacian, so the field is
   exactly stationary and its variance exactly constant, for any domain inside the box. Its covariance is the

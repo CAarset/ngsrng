@@ -15,13 +15,19 @@ Stadler 2018 and Villa & O'Leary-Roseberry 2024, suits nu = 1 in 2D; nu = 5 need
 ``beta=None`` to estimate the beta whose pointwise variance stays closest to constant (:func:`ngsrng.tune_robin`).
 ``ngsrng.pointwise_variance`` shows the result exactly. With this normalisation, ``normal(loc, scale,
 correlation=matern(...))`` has pointwise standard deviation ~scale, as in numpy.
+
+No local boundary condition keeps the variance exactly constant and the correlations Matérn near the boundary.
+``boundary="torus"`` and ``boundary="restrict"`` use no boundary condition: the field is
+:class:`ngsrng.StationaryMatern` (the SPDE on a periodic box around the domain, or the Matérn covariance of R^d
+restricted to the domain; on spaces with Dirichlet dofs, conditioned on its trace there). Their options (``method``,
+``tol``, ``resolution``, ``max_dense``, ``method_options``) are passed on; ``bind(fes)`` returns the sampler.
 """
 
 from dataclasses import dataclass, field
 from math import gamma, pi, sqrt
 
-from .specs import PDEPrecision, matern_dg
 from .specs import matern as _matern_h1
+from .specs import matern_dg
 
 
 class _Required:
@@ -35,6 +41,10 @@ class _Required:
 
 
 REQUIRED = _Required()
+
+BOUNDARIES = ("neumann", "robin", "torus", "restrict")
+STATIONARY = ("torus", "restrict")  # no boundary condition: ngsrng.StationaryMatern with construction=boundary
+STATIONARY_OPTIONS = ("method", "tol", "resolution", "max_dense", "method_options")
 
 ROBIN_REQUIRED = (
     "boundary='robin' needs the Robin coefficient beta (the condition du/dn + beta u = 0; it has no default, since the "
@@ -51,12 +61,13 @@ class MaternCorrelation:
     rtol: float = 1e-7
     boundary: str = "neumann"
     beta: float | None = REQUIRED  # Robin coefficient (boundary="robin" only): a number, or None to estimate it
+    options: dict = field(default_factory=dict)  # boundary="torus" / "restrict": options of StationaryMatern
     # tuned coefficients per space, kept with the correlation so that pickled copies (worker processes) reuse them
     _tuned: dict = field(default_factory=dict, init=False, repr=False, compare=False)
 
     def __post_init__(self):
-        if self.boundary not in ("neumann", "robin"):
-            raise ValueError("boundary must be 'neumann' or 'robin'")
+        if self.boundary not in BOUNDARIES:
+            raise ValueError("boundary must be 'neumann', 'robin', 'torus' or 'restrict'")
         if self.boundary == "robin":
             if self.beta is REQUIRED:
                 raise ValueError(ROBIN_REQUIRED)
@@ -64,12 +75,31 @@ class MaternCorrelation:
                 raise ValueError("the Robin coefficient beta must be nonnegative")
         elif self.beta is not REQUIRED:
             raise ValueError("beta is the coefficient of the Robin condition: pass boundary='robin' as well (the "
-                             "natural condition, 'neumann', has no parameter)")
+                             "other choices, 'neumann', 'torus' and 'restrict', have no coefficient)")
+        unknown = sorted(set(self.options) - set(STATIONARY_OPTIONS))
+        if unknown:
+            raise TypeError(f"unknown option(s) {unknown}; boundary='torus' / 'restrict' take "
+                            f"{', '.join(STATIONARY_OPTIONS)}")
+        if self.options and self.boundary not in STATIONARY:
+            raise ValueError(f"{', '.join(sorted(self.options))}: options of boundary='torus' or 'restrict' "
+                             "(ngsrng.StationaryMatern), not of boundary='neumann' or 'robin'")
+
+    @property
+    def stationary(self) -> bool:
+        """True for the choices without a boundary condition ("torus", "restrict")."""
+        return self.boundary in STATIONARY
 
     def kappa(self) -> float:
         return sqrt(8.0 * self.nu) / self.length
 
-    def bind(self, fes) -> PDEPrecision:
+    def bind(self, fes, seed=None):
+        """The precision on ``fes`` (a :class:`ngsrng.PDEPrecision`), or, for boundary="torus" / "restrict", the
+        sampler itself (a :class:`ngsrng.StationaryMatern`, with randomness ``seed``)."""
+        if self.stationary:
+            from .stationary import StationaryMatern
+
+            return StationaryMatern(fes, self.length, self.nu, construction=self.boundary, seed=seed, rtol=self.rtol,
+                                    **self.options)
         d = fes.mesh.dim
         kappa = self.kappa()
         power = self.nu + d / 2
@@ -101,20 +131,22 @@ class MaternCorrelation:
 
 
 def matern(length: float, nu: float = 1.0, rtol: float = 1e-7, boundary: str = "neumann", beta=REQUIRED, *,
-           robin=REQUIRED) -> MaternCorrelation:
+           robin=REQUIRED, **options) -> MaternCorrelation:
     """Unit-variance Matern correlation with range ``length`` and smoothness ``nu`` (samples are C^(nu-epsilon)).
 
-    ``boundary``: "neumann" (the natural condition; variance inflated near the boundary) or "robin", with the Robin
+    ``boundary``: "neumann" (the natural condition; variance inflated near the boundary), "robin", with the Robin
     coefficient ``beta`` (du/dn + beta u = 0), which has no default: a number, or ``None`` to estimate the beta that
     keeps the pointwise variance closest to constant (:func:`ngsrng.tune_robin`: seconds per space, cached;
-    ``.robin_tuning(fes)`` reports the estimate and the remaining deviation).
+    ``.robin_tuning(fes)`` reports the estimate and the remaining deviation), or no boundary condition at all:
+    "torus" or "restrict", the stationary field of :class:`ngsrng.StationaryMatern` (constant variance up to the
+    boundary; ``options``: its ``method``, ``tol``, ``resolution``, ``max_dense``, ``method_options``).
     """
     if robin is not REQUIRED:
         raise TypeError("robin= (a factor of kappa) was replaced by beta=, the Robin coefficient itself (beta = factor "
                         "* kappa with kappa = sqrt(8 nu) / length); beta=None estimates it for the space")
     if length <= 0 or nu <= 0:
         raise ValueError("length and nu must be positive")
-    return MaternCorrelation(length, nu, rtol, boundary, beta)
+    return MaternCorrelation(length, nu, rtol, boundary, beta, dict(options))
 
 
 def bind(spec, fes):

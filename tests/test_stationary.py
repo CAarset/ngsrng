@@ -250,6 +250,33 @@ def test_one_and_three_dimensions(dim):
         assert g.sample(2).shape == (fes.ndof, 2)
 
 
+def test_matern_correlation_boundary_options(coarse):
+    """boundary="torus" / "restrict" in matern_correlation: bind returns the sampler; the generator builds it with
+    its own randomness, caches it, spawns and pickles it."""
+    fes = ngs.H1(coarse, order=2)
+    for boundary, options in (("torus", {}), ("restrict", {"method": "fft"})):
+        corr = ngsrng.matern_correlation(LENGTH, 2.0, boundary=boundary, **options)
+        assert corr.stationary and corr.options == options
+        g = corr.bind(fes, seed=3)
+        assert isinstance(g, ngsrng.StationaryMatern) and g.construction == boundary
+        rng = ngsrng.default_rng(fes, seed=1, correlation=corr, dtype="float64")
+        gauss = rng.gaussian()
+        assert isinstance(gauss, ngsrng.StationaryMatern) and rng.gaussian() is gauss
+        assert 0 < np.asarray(rng.uniform(size=2)).min()
+        twin = pickle.loads(pickle.dumps(rng))
+        np.testing.assert_allclose(np.asarray(twin.normal(size=2)), np.asarray(rng.normal(size=2)), atol=1e-12)
+        a, b = rng.spawn(2)
+        assert np.abs(np.asarray(a.normal(size=1)) - np.asarray(b.normal(size=1))).max() > 0.1
+    with pytest.raises(ValueError, match="pass boundary='robin' as well"):
+        ngsrng.matern_correlation(LENGTH, 2.0, boundary="torus", beta=1.0)
+    with pytest.raises(ValueError, match="options of boundary='torus' or 'restrict'"):
+        ngsrng.matern_correlation(LENGTH, 2.0, method="fft")
+    with pytest.raises(TypeError, match="unknown option"):
+        ngsrng.matern_correlation(LENGTH, 2.0, boundary="torus", padding=1.0)
+    with pytest.raises(ValueError, match="boundary must be"):
+        ngsrng.matern_correlation(LENGTH, 2.0, boundary="periodic")
+
+
 def test_errors(coarse):
     fes = ngs.H1(coarse, order=1)
     with pytest.raises(ValueError, match="construction has no default"):
