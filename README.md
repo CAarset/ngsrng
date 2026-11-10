@@ -10,7 +10,8 @@ operator layer. Every other family is built on such a Gaussian random function. 
 and benchmarks several algorithms and picks one automatically.
 
 **Tutorial:** [examples/demo.ipynb](examples/demo.ipynb) walks through the features with pictures: Gaussian fields,
-the numpy-style distributions, representations, a PDE with a random coefficient, a Bayesian inverse problem,
+constant variance up to the boundary (Neumann, Robin, torus and restrict on an irregular domain), the numpy-style
+distributions, representations, a PDE with a random coefficient, a Bayesian inverse problem,
 low-rank models, covariances given as operators (variance maps, traces, sample covariances), and 1D / curved / DG /
 3D settings. FE functions are shown with NGSolve's `Draw` (interactive);
 side-by-side panels use the local `ngsplot` package, which paints the same pictures as `Draw` with matplotlib.
@@ -434,7 +435,7 @@ Gaussian's `plan` records its algorithms and its `"randomness"`.
 | `ngsrng/` | The package. `gaussian.py` (sampler and automatic selection), `noise.py` (white noise), `solvers.py`, `rational.py` (fractional powers), `observations.py`, `posterior.py`, `lowrank.py`, `randomized.py` (randomised subspace iteration), `covariance.py` (variance maps, traces, covariance functions, sample covariances), `quadrature.py`, `generator.py` (numpy-style API), `correlation.py`, `robin.py` (Robin factor per domain), `stationary.py` (Matérn fields with constant variance: torus, restricted kernel, the Dirichlet boundary update), `observed.py` (observed Gaussians), `distributions/` (inversion, copula marginals, quadratic forms, scale mixtures, KL expansions), `seeding.py` (seeds and generators), `tuning.py` (calibrated choices), `calibrate.py` and `calibration/` (the calibration), `data/default_tuning.json` (the shipped calibration), `reference.py` (dense ground truth), `space.py`, `backend.py`, `specs.py` |
 | `tests/` | One test file per module; `python -m pytest` |
 | `bench/` | Developer checks: `calibrate.py` (tests, validation, calibration, boundary, stationary-prior and GPU benchmarks in one run), `boundary_scaling.py`, `stationary.py`, `gpu_batch.py` |
-| `examples/` | `demo.ipynb`: the user tutorial; `stokes_inverse.ipynb`: advanced walkthrough of a linear Bayesian inverse problem with a Stokes forward model; `hydraulic_tomography_3d.ipynb`: nonlinear 3D problem with heavy-tailed noise, Laplace approximation and MCMC. All executed (interactive `Draw` views and static panels included) |
+| `examples/` | `demo.ipynb`: the user tutorial (`stationary_demo.py`: its irregular domain and variance panels); `stokes_inverse.ipynb`: advanced walkthrough of a linear Bayesian inverse problem with a Stokes forward model; `hydraulic_tomography_3d.ipynb`: nonlinear 3D problem with heavy-tailed noise, Laplace approximation and MCMC. All executed (interactive `Draw` views and static panels included) |
 | `results/` | `calibrate/` and `runs/` (generated, git-ignored), `gpu_box/` (the 2026-11-02 A100 run), `prototype/` (archived early results) |
 
 ## Installation
