@@ -150,7 +150,7 @@ def _point_rows(fes, points):
     rows, cols, vals = [], [], []
     for i, p in enumerate(points):
         el = mesh(*p).nr
-        if el < 0:  # NGSolve 6.2.2608 segfaults assembling a point evaluation outside the mesh (known issue 15)
+        if el < 0:  # NGSolve 6.2.2608 segfaults assembling a point evaluation outside the mesh
             raise ValueError(f"point {tuple(float(c) for c in p)} lies outside the mesh")
         sv = v(*p).Assemble()
         row = {}

@@ -416,7 +416,7 @@ class LinearObservations:
         eigendecomposition (public as ``posterior(noise_scaling=...)``).
         """
         sc = self._scaling(scaling)
-        # NumPy BLAS threads busy-wait against NGSolve's threads even on these small l x l problems (known issue 9)
+        # NumPy BLAS threads busy-wait against NGSolve's threads even on these small l x l problems
         prior = self.prior
         with numpy_blas_threads(getattr(prior, "_cpu_blas_threads", 1) if getattr(prior, "engine", "") != "torch"
                                 else None):

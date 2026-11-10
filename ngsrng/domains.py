@@ -1,10 +1,37 @@
-from netgen.geom2d import unit_square
-from netgen.occ import WorkPlane, Rectangle, Circle, MoveTo, Glue, X, Y, Z, OCCGeometry, Axis
+"""Two-dimensional test geometries as NGSolve meshes.
+
+Every domain is a class: ``NGSCircle(maxh=0.05).mesh`` is the NGSolve mesh (curved to order 3, except the plain
+unit square). ``outer_bnd`` names the exterior boundary (e.g. ``"left|right|bottom|top"``, usable as
+``dirichlet=``), and some domains record ``centre`` (of their inner subdomain(s)) and ``corners``. Subdomains and
+boundaries are named in each class's docstring.
+"""
+
 import ngsolve as ngs
 import numpy as np
+from netgen.geom2d import unit_square
+from netgen.occ import Axis, Glue, MoveTo, OCCGeometry, Rectangle, WorkPlane, X, Y, Z
+
+__all__ = [
+    "NGSGeo",
+    "NGSSimple",
+    "NGSCircle",
+    "NGSSquare",
+    "NGSSquareHole",
+    "NGSTriples",
+    "NGSLShaped",
+    "NGSBentChannel",
+    "NGSPerforated",
+    "NGSGappy",
+    "NGSDoubleSlit",
+    "NGSEllipseInPolygon",
+    "NGSDoubleHalfPipes",
+    "NGSCapillary",
+]
 
 
 class NGSGeo:
+    """Base class: a geometry ``self.geo`` meshed with mesh size ``maxh`` into ``self.mesh`` (an NGSolve mesh)."""
+
     def __init__(self, maxh, **kwargs):
         self.maxh = maxh
         self.outer_bnd = "outer"
@@ -16,14 +43,14 @@ class NGSGeo:
         else:
             ngs_mesh = ngs.Mesh(result)
         ngs_mesh.Curve(3)
-        self.mesh = Mesh(ngs_mesh)
+        self.mesh = ngs_mesh
 
 
 class NGSSimple(NGSGeo):
     """Plain unit square (no internal subdomain). BC names: bottom|right|top|left."""
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.mesh = Mesh(unit_square.GenerateMesh(maxh=self.maxh))
+        self.mesh = ngs.Mesh(unit_square.GenerateMesh(maxh=self.maxh))
 
         self.corners = ((0,0), (0,1), (1,1), (1,0))
         self.centre = (0.5, 0.5)
@@ -37,8 +64,7 @@ class NGSCircle(NGSGeo):
     """
     def __init__(self, size=0.3, **kwargs):
         super().__init__(**kwargs)
-        size = size
-        size = 0.3
+        size = 0.3  # the inner radius is fixed: the size argument is not used
         centre = 0.5
 
         # Outer disk
@@ -124,7 +150,7 @@ class NGSSquareHole(NGSGeo):
         channel_h = MoveTo(gap,1/2-channel_size/2).Rectangle(block_size,channel_size).Face()
         channel_v = MoveTo(1/2-channel_size/2,gap).Rectangle(channel_size,block_size).Face()
         block = block - channel_h - channel_v
-        
+
         self.centre = (1/2,1/2)
         inner = WorkPlane().Circle(self.centre[0], self.centre[1], size).Face()
         inner.edges.name = "interface"
@@ -270,7 +296,7 @@ class NGSPerforated(NGSGeo):
     def __init__(self, n=3, hole_r=0.03, size=0.12, **kwargs):
         super().__init__(**kwargs)
         domain = Rectangle(1, 1).Face()
-        
+
         domain.edges.name = "outer"
         domain.edges.Max(X).name = "right"
         domain.edges.Min(X).name = "left"
@@ -640,7 +666,7 @@ class NGSCapillary(NGSGeo):
         hub = WorkPlane().Circle(self.centre[0], self.centre[1], R_inner).Face()
         hub.edges.name = "interface"
         hub.faces.name = "inner"
-        
+
         # Domain = (tubes ∩ outer_disk) − hub
         capillary = tube_union * outer_disk - hub
         capillary.faces.name = "capillary"

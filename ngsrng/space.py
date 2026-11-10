@@ -20,7 +20,8 @@ def assemble(fes, form) -> sp.csr_matrix:
     terms = form(u, v)
     if fes.type.startswith("Discontinuous"):
         # one integral at a time: NGSolve 6.2.2608 segfaults assembling two or more ds integrals together on a
-        # Discontinuous space; coef * symbol rebuilds an integral with its region and options
+        # Discontinuous space (docs/upstream/ngsolve_discontinuous_ds_crash.py); coef * symbol rebuilds an integral
+        # with its region and options
         parts = [_assemble(fes, p.coef * p.symbol) for p in terms]
         if len(parts) > 1:
             return sum(parts[1:], parts[0]).tocsr()

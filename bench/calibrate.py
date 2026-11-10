@@ -227,6 +227,9 @@ def main():
         if name == "throughput" and manifest.get("env") and not manifest["env"].get("cuda_usable"):
             print("[calibrate] throughput: no CUDA device, skipped", flush=True)
             continue
+        if name == "validate" and not os.path.exists(os.path.join(ROOT, cmd[1])):
+            print(f"[calibrate] validate: {cmd[1]} is not in this checkout, skipped", flush=True)
+            continue
         if manifest["steps"].get(name, {}).get("status") == "ok":
             print(f"[calibrate] {name}: already ok, skipped", flush=True)
             continue

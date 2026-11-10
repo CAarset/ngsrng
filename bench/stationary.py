@@ -75,7 +75,7 @@ def make_mesh(domain, h):
 def run_one(domain, h, order, nu, prior, seed=0):
     """One prior on one case, in this process: a dict of results."""
     sys.path.insert(0, ROOT)
-    import ngsrng  # noqa: F401, I001  (torch before NGSolve: known issue 1)
+    import ngsrng  # noqa: F401, I001  (torch before NGSolve)
     import ngsolve as ngs
     import numpy as np
     import torch

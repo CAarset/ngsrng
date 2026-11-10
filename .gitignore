@@ -219,13 +219,16 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# ngsrng: benchmark runs are generated, machine-specific output (python bench/run_all.py)
-results/runs/
-results/gpu_box/
-results/calibrate/
+# ngsrng: run outputs stay local
+/results/
+*.md
+!README.md
 
-# Empty placeholder files that the Claude Code sandbox mounts into the working tree (bind-mount targets); never
-# content of this repository
+# Assistant and sandbox files (Claude Code settings, agent notes, placeholder dotfiles mounted into the working tree)
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+AGENTS.md
 /.bash_profile
 /.bashrc
 /.gitconfig
@@ -237,7 +240,6 @@ results/calibrate/
 /.vscode
 /.zprofile
 /.zshrc
-/.claude/
 
 # env/ is the development environment's project (env/pyproject.toml), not a virtualenv: tracked; its lock and uv
 # cache are not (env/.venv is covered by .venv above)

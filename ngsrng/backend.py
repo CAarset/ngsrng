@@ -22,7 +22,7 @@ class ImportOrderWarning(UserWarning):
 
 
 def check_import_order():
-    """Warn if NGSolve was imported before torch and its OpenBLAS shadows MKL's batched GEMM (known issue 1).
+    """Warn if NGSolve was imported before torch and its OpenBLAS shadows MKL's batched GEMM.
 
     NGSolve loads its bundled OpenBLAS for the whole process; that OpenBLAS exports ``cblas_dgemm_batch`` and its
     relatives under MKL's names, and torch, loaded after it, binds its batched CPU products (``torch.matmul`` /

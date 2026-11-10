@@ -69,4 +69,4 @@ __all__ += ["BoundarySampler", "boundary_covariance", "boundary_dofs", "boundary
 
 from .backend import check_import_order  # noqa: E402
 
-check_import_order()  # warns if ngsolve was imported before torch (sys.modules keeps the order): known issue 1
+check_import_order()  # warns if ngsolve was imported before torch (sys.modules keeps the order)
