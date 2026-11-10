@@ -28,6 +28,7 @@ from .posterior import LinearObservations, MatheronPosterior, downdate
 from .robin import RobinTuning, tune_robin
 from .space import SpaceInfo
 from .specs import AssembledPrecision, OperatorCovariance, OperatorPrecision, PDEPrecision, matern, matern_dg
+from .stationary import StationaryMatern
 
 __all__ = [
     "default_rng",
@@ -59,6 +60,7 @@ __all__ = [
     "OperatorPrecision",
     "OperatorCovariance",
     "MaternCorrelation",
+    "StationaryMatern",
     "matern_correlation",
     "matern",
     "matern_dg",

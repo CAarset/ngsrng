@@ -232,6 +232,44 @@ Precisions:
 
 Boundary conditions belong to the covariance: Dirichlet through the space, Robin through the form, Neumann implicitly.
 
+### Constant variance up to the boundary: stationary Matérn fields
+A Matérn field from the SPDE on the domain needs a boundary condition, and no local one keeps the pointwise variance
+constant and the correlations Matérn near the boundary: not Neumann, and not Robin with any coefficient, constant or
+varying along the boundary (it trades a dip at the boundary for an overshoot further in). `StationaryMatern` is the
+field whose law does not depend on position:
+
+```python
+prior = ngsrng.StationaryMatern(X, 0.3, nu=2, construction="torus")   # or construction="restrict"
+rng = ngsrng.default_rng(X, correlation=prior)                       # every family, spawn, pickling
+post = prior.condition(points=xy, noise=1e-4, data=y)                # exact posteriors, variance maps, ...
+```
+- `construction="torus"`: the Matérn SPDE on a periodic box around the domain (a structured periodic mesh;
+  NGSolve's `Periodic`), restricted to the domain. Shifts of the torus commute with the Laplacian, so the field is
+  exactly stationary and its variance exactly constant, for any domain inside the box. Its covariance is the
+  periodised Matérn: the images of other points lie at least the padding away, chosen so that their correlation is
+  at most `tol` (default 1e-3: about 2.9 correlation lengths for nu = 1). Sparse, any smoothness (the rational route
+  for fractional powers).
+- `construction="restrict"`: the Matérn covariance of R^d restricted to the domain, exactly stationary and
+  isotropic. `method="dense"`: the exact kernel at the quadrature points (up to 3000 points; an O(n^3)
+  eigendecomposition); `method="fft"`: circulant embedding on a regular grid over the bounding box, exact at the grid
+  nodes, multilinear in between; O(N log N) per sample in the grid size, whatever the mesh.
+- `construction` has no default: the two are different fields. Either is represented on `X` by the L2 projection of
+  its values at the quadrature points (degree 4p), so the variance is constant up to the discretisation. Unit
+  square, length 0.3, P2: variance at the vertices within [0.998, 1.009] (torus, nu = 2) and [0.988, 1.024] (nu = 1)
+  at h = 0.05, within about 4-6% at h = 0.1; Neumann reaches 4 in the corners, the estimated Robin coefficient
+  [0.65, 1.15] (nu = 2, h = 0.1). Correlation errors against the Matérn function: 0.03 (torus, nu = 2) against 0.17
+  (Robin) and 0.26 (Neumann). Cost there: 1-4 ms per sample against 0.4-1 ms for the Neumann prior
+  (`python bench/stationary.py`).
+- **Dirichlet boundaries:** on a space with `dirichlet=`, the field is the stationary one *conditioned* on its trace
+  there taking the values of `mean` (zero by default): exact Gaussian conditioning (Matheron form; n_D applications
+  of the factor at set-up, the regression kept when small and applied matrix-free otherwise). The variance is zero
+  on the Dirichlet boundary and stationary about a correlation length away. This is not the Dirichlet SPDE: the two
+  agree only for power 1, where the field is Markov (on the half-line with nu = 3/2 the SPDE's variance is
+  1 - e^-2kx (1 + 2kx), the conditioned field's 1 - e^-2kx (1 + kx)^2).
+- Limits: CPU only, scalar spaces, one element type. Long correlation lengths need large boxes (the torus padding
+  grows with the length; the FFT embedding is enlarged until positive semidefinite). Correlations are Euclidean, also
+  across holes and notches of the domain.
+
 ### Posteriors (linear Gaussian Bayesian inverse problems)
 ```python
 from ngsrng.posterior import LinearObservations
@@ -390,9 +428,9 @@ Gaussian's `plan` records its algorithms and its `"randomness"`.
 ## Repository layout
 | Path | Contents |
 |---|---|
-| `ngsrng/` | The package. `gaussian.py` (sampler and automatic selection), `noise.py` (white noise), `solvers.py`, `rational.py` (fractional powers), `observations.py`, `posterior.py`, `lowrank.py`, `randomized.py` (randomised subspace iteration), `covariance.py` (variance maps, traces, covariance functions, sample covariances), `quadrature.py`, `generator.py` (numpy-style API), `correlation.py`, `robin.py` (Robin factor per domain), `observed.py` (observed Gaussians), `distributions/` (inversion, copula marginals, quadratic forms, scale mixtures, KL expansions), `seeding.py` (seeds and generators), `tuning.py` (calibrated choices), `calibrate.py` and `calibration/` (the calibration), `data/default_tuning.json` (the shipped calibration), `reference.py` (dense ground truth), `space.py`, `backend.py`, `specs.py` |
+| `ngsrng/` | The package. `gaussian.py` (sampler and automatic selection), `noise.py` (white noise), `solvers.py`, `rational.py` (fractional powers), `observations.py`, `posterior.py`, `lowrank.py`, `randomized.py` (randomised subspace iteration), `covariance.py` (variance maps, traces, covariance functions, sample covariances), `quadrature.py`, `generator.py` (numpy-style API), `correlation.py`, `robin.py` (Robin factor per domain), `stationary.py` (Matérn fields with constant variance: torus, restricted kernel, the Dirichlet boundary update), `observed.py` (observed Gaussians), `distributions/` (inversion, copula marginals, quadratic forms, scale mixtures, KL expansions), `seeding.py` (seeds and generators), `tuning.py` (calibrated choices), `calibrate.py` and `calibration/` (the calibration), `data/default_tuning.json` (the shipped calibration), `reference.py` (dense ground truth), `space.py`, `backend.py`, `specs.py` |
 | `tests/` | One test file per module; `python -m pytest` |
-| `bench/` | Developer checks: `calibrate.py` (tests, validation, calibration, boundary and GPU benchmarks in one run), `boundary_scaling.py`, `gpu_batch.py` |
+| `bench/` | Developer checks: `calibrate.py` (tests, validation, calibration, boundary, stationary-prior and GPU benchmarks in one run), `boundary_scaling.py`, `stationary.py`, `gpu_batch.py` |
 | `examples/` | `demo.ipynb`: the user tutorial; `stokes_inverse.ipynb`: advanced walkthrough of a linear Bayesian inverse problem with a Stokes forward model; `hydraulic_tomography_3d.ipynb`: nonlinear 3D problem with heavy-tailed noise, Laplace approximation and MCMC. All executed (interactive `Draw` views and static panels included) |
 | `results/` | `calibrate/` and `runs/` (generated, git-ignored), `gpu_box/` (the 2026-11-02 A100 run), `prototype/` (archived early results) |
 

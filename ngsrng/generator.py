@@ -59,6 +59,9 @@ from .posterior import MatheronPosterior
 from .seeding import Source, as_source, draw
 from .space import SpaceInfo, mass_form
 from .specs import AssembledPrecision, OperatorCovariance, OperatorPrecision, PDEPrecision
+from .stationary import StationaryMatern
+
+GAUSSIAN_TYPES = (Gaussian, LowRankGaussian, MatheronPosterior, StationaryMatern)  # used as they are
 
 DISCRETE = {"poisson", "binomial", "bernoulli", "negative_binomial", "geometric", "logseries", "zipf",
             "hypergeometric"}
@@ -145,8 +148,8 @@ REQUIRED = object()
 def _as_spec(key, value):
     """``covariance=`` also takes an NGSolve BaseMatrix, BilinearForm or callable: wrapped in an OperatorCovariance
     with its default convention (pass an OperatorCovariance for another one)."""
-    known = (Gaussian, LowRankGaussian, MatheronPosterior, OperatorCovariance, MaternCorrelation, PDEPrecision,
-             AssembledPrecision, OperatorPrecision, numbers.Real, dict)
+    known = (*GAUSSIAN_TYPES, OperatorCovariance, MaternCorrelation, PDEPrecision, AssembledPrecision,
+             OperatorPrecision, numbers.Real, dict)
     if key == "covariance" and not isinstance(value, known) and (
             isinstance(value, (ngs.BaseMatrix, ngs.BilinearForm)) or callable(value)):
         return OperatorCovariance(value)
@@ -284,8 +287,9 @@ class Generator:
         Gaussian and mixing stream the generator creates then gets its own child stream.
     correlation (or precision, covariance) : default spatial structure: a correlation length (Matern, nu = 1), a dict of
         :func:`ngsrng.matern_correlation` arguments, a :class:`MaternCorrelation`, a precision spec (PDEPrecision,
-        AssembledPrecision, OperatorPrecision), a Gaussian, LowRankGaussian or MatheronPosterior object (e.g. a
-        posterior, a sample covariance), or a covariance given as an operator: an :class:`OperatorCovariance`, or
+        AssembledPrecision, OperatorPrecision), a Gaussian, LowRankGaussian, MatheronPosterior or StationaryMatern
+        object (e.g. a posterior, a sample covariance, a Matérn field with constant variance up to the boundary), or a
+        covariance given as an operator: an :class:`OperatorCovariance`, or
         (with ``covariance=``) an NGSolve BaseMatrix, BilinearForm or callable, wrapped in one with its default
         convention.
         Can be overridden per call with ``correlation=``, ``precision=`` or ``covariance=``.
@@ -377,7 +381,7 @@ class Generator:
                 continue
             if isinstance(g, Gaussian) and g._prior is None:
                 own[id(g)] = g._reseeded(self._seed())
-            elif isinstance(g, LowRankGaussian):  # e.g. an operator covariance's KL: share the modes
+            elif isinstance(g, (LowRankGaussian, StationaryMatern)):  # e.g. an operator covariance's KL: share
                 own[id(g)] = copy.copy(g)
                 own[id(g)].source = as_source(self._seed())
             else:
@@ -410,7 +414,7 @@ class Generator:
         if spec is None:
             raise ValueError("no spatial structure: pass correlation= (e.g. a correlation length or "
                              "ngsrng.matern_correlation(...)) to default_rng or to the call")
-        if isinstance(spec, (Gaussian, LowRankGaussian, MatheronPosterior)):
+        if isinstance(spec, GAUSSIAN_TYPES):
             return spec
         if isinstance(spec, numbers.Real):
             spec = matern(float(spec))

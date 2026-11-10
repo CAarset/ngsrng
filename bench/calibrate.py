@@ -17,6 +17,9 @@ Steps, in order:
                tuning, overriding the shipped default (python -m ngsrng.tuning show); 13 min on the A100 box
   boundary     bench/boundary_scaling.py --profile calibrate: the cost of restricted and conditioned boundary draws
                against plain ones, on the CPU and the GPU (5 min)
+  stationary   bench/stationary.py: Matérn priors with constant variance (StationaryMatern: torus, restrict-fft,
+               restrict-dense, the Dirichlet boundary update) against Neumann and Robin priors: exact variances and
+               correlation errors, then set-up and per-sample cost (--quick: a few minutes)
   throughput   (GPU only) bench/gpu_batch.py --quick: device checks, fractional powers (accuracy, 1e6 dofs, float32
                arithmetic), in-place batch throughput and the cost of float64 arithmetic (11 min)
 
@@ -94,6 +97,8 @@ def steps(cfg, run):
     bprofile = "quick" if cfg["quick"] else "standard" if cfg["large"] else "calibrate"
     plan.append(("boundary", [PY, "bench/boundary_scaling.py", "--profile", bprofile,
                               "--out-dir", os.path.join(out, "boundary")], 60 * MIN, "out/boundary/report.md"))
+    plan.append(("stationary", [PY, "bench/stationary.py", "--profile", "quick" if cfg["quick"] else "standard",
+                                "--out-dir", os.path.join(out, "stationary")], 90 * MIN, "out/stationary/report.md"))
     plan.append(("throughput", [PY, "bench/gpu_batch.py", "--quick", "--out-dir", os.path.join(out, "throughput")],
                  60 * MIN, "out/throughput/report.md"))
     return plan
