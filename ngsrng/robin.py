@@ -134,7 +134,7 @@ def tune_robin(fes, length: float, nu: float = 1.0, *, rtol: float = 1e-7, spaci
         device = "cuda" if torch.cuda.is_available() else "cpu"
     device = str(torch.device(device))
     key = (_fingerprint(fes), float(length), float(nu), float(rtol), float(spacing), int(max_probes), lo, hi,
-           float(xtol), repr(method), bool(compare))
+           float(xtol), repr(method), bool(compare), device)  # device: the result reports where it ran, and how long
     if key in _CACHE:
         _CACHE.move_to_end(key)
         return _CACHE[key]

@@ -79,6 +79,7 @@ def test_device_and_engine_do_not_change_the_estimate(square):
     a = ngsrng.tune_robin(square, 0.5, 1.0)
     b = ngsrng.tune_robin(square, 0.5, 1.0, method={"engine": "torch"})
     assert b.beta == pytest.approx(a.beta, rel=2e-3) and a.device == "cpu"
+    assert ngsrng.tune_robin(square, 0.5, 1.0, device="cpu") is a  # cached per device
 
 
 def test_estimated_beta_of_matern_correlation(square):
