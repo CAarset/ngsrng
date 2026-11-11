@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If ngsrng helps your research, please cite it as below."
+type: software
+title: "ngsrng: random functions on finite element spaces"
+abstract: >-
+  ngsrng samples random functions (Gaussian, log-normal, uniform, gamma, Student-t, Wishart and other random
+  fields) in NGSolve finite element spaces, with numpy's sampling API, on CPU and GPU. It includes exact Matérn
+  priors, posteriors of Bayesian inverse problems, variance maps and trace estimators.
+authors:
+  - family-names: Aarset
+    given-names: Christian
+    orcid: "https://orcid.org/0000-0001-8163-9305"
+version: 0.0.1
+license: MIT
+repository-code: "https://github.com/CAarset/ngsrng"
+url: "https://github.com/CAarset/ngsrng"
+keywords:
+  - random fields
+  - Gaussian random fields
+  - finite element method
+  - NGSolve
+  - Matérn
+  - SPDE
+  - uncertainty quantification
+  - Bayesian inverse problems
+  - PyTorch

@@ -220,11 +220,12 @@ Every sampler must have an in-place form (`out=`); [tests/test_inplace.py](tests
 
 ## Citing
 
-If ngsrng helps your research, please cite it:
+If ngsrng helps your research, please cite it (GitHub's "Cite this repository" button reads
+[CITATION.cff](CITATION.cff)):
 
 ```bibtex
 @software{ngsrng,
-  author  = {Aarset, C.},
+  author  = {Aarset, Christian},
   title   = {ngsrng: random functions on finite element spaces},
   year    = {2026},
   version = {0.0.1},
