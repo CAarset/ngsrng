@@ -119,6 +119,16 @@ def test_shipped_default_is_usable():
     assert g.plan["solver"] == "ngsolve-direct(sparsecholesky)"
 
 
+
+def test_shipped_default_has_no_machine_details():
+    """The shipped calibration names the hardware class only: no hostname, OS build, memory or repository state."""
+    with open(tuning.SHIPPED) as fh:
+        data = json.load(fh)
+    env = data.get("environment", {})
+    assert not {"host", "platform", "mem_total_gb", "mem_available_gb", "git"} & set(env)
+    assert set(env.get("cuda", {})) <= {"device", "cuda"}
+    assert all(run.startswith("shipped default") for run in [data["run"], *data.get("runs", {}).values()])
+
 def _table(tmp_path, noise=None, prior=None, name="t.json"):
     path = tmp_path / name
     path.write_text(json.dumps({"run": "t", "noise": {"cpu-ngsolve": noise or {}},

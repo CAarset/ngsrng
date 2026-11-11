@@ -60,11 +60,12 @@ class NGSSimple(NGSGeo):
 
 class NGSCircle(NGSGeo):
     """Outer circle with inner circular subdomain and rectangular scatterer.
+    ``size`` is the radius of the inner disk; the scatterer sits at distance 1.2 * size from the centre.
     BC names: outer (exterior boundary), interface (inner circle), scat (rectangle).
     """
     def __init__(self, size=0.3, **kwargs):
         super().__init__(**kwargs)
-        size = 0.3  # the inner radius is fixed: the size argument is not used
+        assert 0 < size < 0.73, "size (the inner radius) must be in (0, 0.73) for the scatterer to fit in the disk"
         centre = 0.5
 
         # Outer disk
@@ -349,16 +350,15 @@ class NGSPerforated(NGSGeo):
         self.make()
 
 class NGSGappy(NGSGeo):
-    """Description
+    """Unit square with two facing half-disk holes (radius ``hole_r``) separated by a channel of width ``gap``, and a
+    small square inner subdomain (side ``size``) near the left side, level with the channel.
+    BC names: outer (the square's sides), scatter (the holes), interface (inner square).
     """
     def __init__(self, n=3, hole_r=0.35, gap=0.05, size=0.1, **kwargs):
         super().__init__(**kwargs)
         domain = Rectangle(1, 1).Face()
         self.corners = ((0,0), (0,1), (1,1), (1,0))
-        domain.edges.Max(X).name = "right"
-        domain.edges.Min(X).name = "left"
-        domain.edges.Min(Y).name = "bottom"
-        domain.edges.Max(Y).name = "top"
+        domain.edges.name = "outer"
 
         # Inner subdomain: centred in the matrix, halfway between two hole rows
         cx = 0.075
@@ -373,13 +373,10 @@ class NGSGappy(NGSGeo):
             h.edges.name = "scatter"
             domain = domain - h
             inner = inner - h
-        domain = domain - inner
-
         inner.edges.name = "interface"
+        domain = domain - inner
         inner.faces.name = "inner"
-        domain.edges.name = "outer"
 
-        self.outer_bnd = "left|right|bottom|top"
         shape = Glue([inner,domain])
         self.geo = OCCGeometry(shape, dim=2)
         self.make()

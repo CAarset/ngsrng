@@ -1,11 +1,11 @@
-"""The developer's full check of a machine: tests, validation, calibration, boundary and GPU benchmarks, with logs and
-a summary. (Users calibrate with ``python -m ngsrng.calibrate``, which needs no repository; this script runs it as
-its calibration step.)
+"""The developer's full check of a machine: tests, calibration, boundary and GPU benchmarks, with logs and a summary.
+(Users calibrate with ``python -m ngsrng.calibrate``, which needs no repository; this script runs it as its
+calibration step.)
 
     python bench/calibrate.py                     # everything below, 34 min on the A100 box (2026-11-03)
     python bench/calibrate.py --quick             # a few minutes: harness check (installs no tuning)
     python bench/calibrate.py --large             # calibration up to 1e6 dofs (large CPU/GPU boxes, an hour or more)
-    python bench/calibrate.py --skip boundary,throughput   # tests, validation and calibration only (~20 min)
+    python bench/calibrate.py --skip boundary,throughput   # tests and calibration only (~20 min)
     python bench/calibrate.py --resume results/calibrate/<run>   # rerun only the steps that did not finish
 
 Steps, in order:
@@ -165,7 +165,7 @@ def summary(run, manifest):
     env = manifest.get("env")
     if env:
         lines.append("\n## Environment\n\n```\n" + json.dumps(env, indent=1) + "\n```")
-    for name, pattern in (("tests", ("passed", "failed", "error")), ("validate", ("ALL CHECKS", "FAILED:")),
+    for name, pattern in (("tests", ("passed", "failed", "error")),
                           ("calibrate", ("finished in", "installed tuning")),
                           ("throughput", ("checks:", "fractional checks:"))):
         path = os.path.join(run, "logs", f"{name}.log")
@@ -185,7 +185,7 @@ def summary(run, manifest):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--quick", action="store_true", help="core tests, quick validation, smoke calibration")
+    ap.add_argument("--quick", action="store_true", help="core tests, smoke calibration")
     ap.add_argument("--large", action="store_true", help="calibrate up to 1e6 dofs")
     ap.add_argument("--steps", default=None, help="comma-separated subset of the steps")
     ap.add_argument("--skip", default="", help="comma-separated steps to leave out")
@@ -226,9 +226,6 @@ def main():
             continue
         if name == "throughput" and manifest.get("env") and not manifest["env"].get("cuda_usable"):
             print("[calibrate] throughput: no CUDA device, skipped", flush=True)
-            continue
-        if name == "validate" and not os.path.exists(os.path.join(ROOT, cmd[1])):
-            print(f"[calibrate] validate: {cmd[1]} is not in this checkout, skipped", flush=True)
             continue
         if manifest["steps"].get(name, {}).get("status") == "ok":
             print(f"[calibrate] {name}: already ok, skipped", flush=True)

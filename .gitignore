@@ -223,6 +223,19 @@ __marimo__/
 /results/
 *.md
 !README.md
+# LaTeX sources, bibliographies and build files are never committed
+*.tex
+*.bib
+*.pdf
+*.aux
+*.bbl
+*.blg
+*.bcf
+*.run.xml
+*.toc
+*.fls
+*.fdb_latexmk
+*.synctex.gz
 
 # Assistant and sandbox files (Claude Code settings, agent notes, placeholder dotfiles mounted into the working tree)
 .claude/
