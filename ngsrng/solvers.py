@@ -99,7 +99,7 @@ class NGSolveDirect(_NGSolveBase):
         a = self._bilinear_form()
         with ngs.TaskManager():
             a.Assemble()
-            self.inv = a.mat.Inverse(self.space.fes.FreeDofs(), inverse=self.inverse)
+            self.inv = a.mat.Inverse(self.space.freedofs, inverse=self.inverse)  # the SpaceInfo's free dofs
         self.mat = a.mat
 
     def apply(self, x):

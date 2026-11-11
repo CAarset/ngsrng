@@ -71,6 +71,13 @@ class SpaceInfo:
         return len(self.free)
 
     @property
+    def freedofs(self) -> ngs.BitArray:
+        """``free`` as an NGSolve BitArray, the form NGSolve's solvers take."""
+        mask = np.zeros(self.ndof, dtype=bool)
+        mask[self.free] = True
+        return ngs.BitArray(mask.tolist())
+
+    @property
     def order(self) -> int:
         return self.fes.globalorder
 

@@ -45,7 +45,13 @@ Sigma_DD costs n_D applications of the factor and its transpose; Sigma_FD Sigma_
 applied matrix-free otherwise (one more application of the factor and its transpose per batch). The variance is zero
 on the Dirichlet boundary and returns to its interior value within about a correlation length. This is not the
 Dirichlet SPDE: on the half-line with nu = 3/2 the conditioned variance is 1 - e^-2kx (1 + kx)^2, the SPDE's
-1 - e^-2kx (1 + 2kx).
+1 - e^-2kx (1 + 2kx). Pointwise families (uniform, gamma, ...) built on such a field are standardised by the field
+before the boundary update, as those built on a posterior are by its prior (``unconditioned``): on the boundary they
+take the transform of the data, and their spread grows back within about a correlation length.
+
+**Spaces on part of the mesh** (``definedon``, with or without ``Compress``): the field lives on the elements that
+carry the space. Its quadrature points, the extent of the torus box or FFT grid, and the default resolution come from
+those elements only.
 
 Samplers have the interface of the other Gaussians (``apply``/``apply_t``/``nrand``/``mean``/``space``, in-place
 ``sample(n, out=)``, seeding, pickling) and can be passed as ``correlation=`` to :func:`ngsrng.default_rng`.
@@ -109,12 +115,52 @@ def _variance_scale(dim, length, nu) -> float:
     return 1.0 / math.sqrt(var)
 
 
-def _median_edge(mesh) -> float:
+def _median_edge(mesh, active=None) -> float:
+    """Median edge length of the mesh, or of its ``active`` elements (a mask over the volume elements)."""
     xyz = np.array([v.point for v in mesh.vertices], dtype=float)
-    lens = [np.linalg.norm(xyz[e.vertices[0].nr] - xyz[e.vertices[1].nr]) for e in mesh.edges]
-    if not lens:  # 1D meshes: the element lengths
-        lens = [np.linalg.norm(xyz[el.vertices[0].nr] - xyz[el.vertices[1].nr]) for el in mesh.Elements(ngs.VOL)]
-    return float(np.median(lens))
+    if active is None or active.all():
+        lens = [np.linalg.norm(xyz[e.vertices[0].nr] - xyz[e.vertices[1].nr]) for e in mesh.edges]
+        if not lens:  # 1D meshes: the element lengths
+            lens = [np.linalg.norm(xyz[el.vertices[0].nr] - xyz[el.vertices[1].nr]) for el in mesh.Elements(ngs.VOL)]
+        return float(np.median(lens))
+    els = [mesh[ngs.ElementId(ngs.VOL, int(i))] for i in np.flatnonzero(active)]
+    if mesh.dim == 1:
+        pairs = [(el.vertices[0].nr, el.vertices[1].nr) for el in els]
+    else:
+        edges = {e.nr for el in els for e in el.edges}
+        pairs = [tuple(v.nr for v in mesh[ngs.NodeId(ngs.EDGE, e)].vertices) for e in edges]
+    return float(np.median([np.linalg.norm(xyz[a] - xyz[b]) for a, b in pairs]))
+
+
+class _UsedDofs(SpaceInfo):
+    """The space of the field before its boundary update: the same FE space with every *used* dof free, those on a
+    Dirichlet boundary too. Dofs no element uses (outside ``definedon``) stay out. The same space object rather than
+    a rebuilt twin, so that compressed and other wrapped spaces keep their dof numbering."""
+
+    def __post_init__(self):
+        self.free = np.flatnonzero(self.mass.diagonal() > 0)
+
+
+def _active_elements(space, quad) -> np.ndarray:
+    """Mask of the mesh's volume elements that carry used dofs of ``space`` (every element, unless the space lives
+    on part of the mesh: ``definedon``, ``Compress``)."""
+    if (abs(quad.b).sum(axis=0) > 0).all():  # every quadrature point carries basis functions: the whole mesh
+        return np.ones(space.mesh.ne, dtype=bool)
+    used = np.zeros(space.ndof, dtype=bool)
+    used[space.free] = True
+    out = np.zeros(space.mesh.ne, dtype=bool)
+    for el in space.fes.Elements(ngs.VOL):
+        dofs = [d for d in el.dofs if d >= 0]
+        out[el.nr] = bool(dofs) and bool(used[dofs].any())
+    return out
+
+
+def _points_of(quad, active) -> np.ndarray:
+    """Indices of the quadrature points (IntegrationRuleSpace dofs) on the ``active`` elements, in increasing order."""
+    if active.all():
+        return np.arange(quad.npoints)
+    keep = [quad.irs.GetDofNrs(ngs.ElementId(ngs.VOL, int(i))) for i in np.flatnonzero(active)]
+    return np.sort(np.concatenate([np.asarray(k, dtype=int) for k in keep]))
 
 
 def basis_at(fes, points) -> sp.csr_matrix:
@@ -370,16 +416,20 @@ class StationaryMatern(InPlace, Rebuildable):
         start = time.perf_counter()
         self.length, self.nu, self.construction, self.tol = float(length), float(nu), construction, float(tol)
         self.space = SpaceInfo(fes)
-        self._full = SpaceInfo(_without_dirichlet(fes))
+        self._full = _UsedDofs(fes)  # the field before the boundary update lives on every used dof
         mesh = fes.mesh
         d = mesh.dim
         quad = QuadratureRule(self._full)  # degree 4p: a projection, not an interpolation of rough point values
-        points = quad.points
-        self._b = quad.b.tocsr()  # ndof x nq: B_iq = w_q phi_i(x_q)
+        # only the elements that carry the space (definedon, Compress): their points, extent and mesh size
+        active = _active_elements(self._full, quad)
+        keep = _points_of(quad, active)
+        points = quad.points[keep]
+        self._b = quad.b.tocsr() if active.all() else quad.b.tocsc()[:, keep].tocsr()  # ndof x nq: w_q phi_i(x_q)
         lo, hi = points.min(0), points.max(0)
-        xyz = np.array([v.point for v in mesh.vertices], dtype=float)[:, :d]
+        corners = np.unique([v.nr for el in mesh.Elements(ngs.VOL) if active[el.nr] for v in el.vertices])
+        xyz = np.array([mesh.vertices[int(v)].point for v in corners], dtype=float)[:, :d]
         lo, hi = np.minimum(lo, xyz.min(0)), np.maximum(hi, xyz.max(0))
-        h = _median_edge(mesh) if resolution is None else float(resolution)
+        h = _median_edge(mesh, active) if resolution is None else float(resolution)
         if method is None:
             method = "dense" if len(points) <= max_dense else "fft"
         if method == "spde":
@@ -397,10 +447,8 @@ class StationaryMatern(InPlace, Rebuildable):
         self.device = torch.device("cpu")
         self._prior = None
         self._maps, self._post_maps, self._conditioning = [], [], []  # derived samplers
-        # the boundary update: condition on the Dirichlet dofs (those carrying mass; unused dofs are left out)
-        used = np.flatnonzero(self._full.mass.diagonal() > 0)
-        free = self.space.free
-        self._dir = np.setdiff1d(used, free)
+        # the boundary update: condition on the Dirichlet dofs (the used dofs that are not free)
+        self._dir = np.setdiff1d(self._full.free, self.space.free)
         self._cond = None
         if self._dir.size:
             self._setup_conditioning()
@@ -410,14 +458,31 @@ class StationaryMatern(InPlace, Rebuildable):
                                                                        "mode": self._cond[0]},
                      "setup_s": None}
         self.plan["setup_s"] = round(time.perf_counter() - start, 3)
+        # pointwise families standardise a conditioned field by the field it was conditioned from (as posteriors by
+        # their prior): here the field before the boundary update (ngsrng.distributions.pointwise)
+        self.unconditioned = None if self._cond is None else self._unconditioned()
+
+    def _unconditioned(self):
+        """The field before its boundary update: same source, mean and randomness, all used dofs free."""
+        view = copy.copy(self)
+        view.space, view._cond, view._dir, view.unconditioned = self._full, None, np.empty(0, dtype=int), None
+        view._maps, view._post_maps, view._conditioning, view._prior = [], [], [], None
+        view.plan = {**self.plan, "space": self._full.describe(), "conditioning": None}
+        return view
 
     # ---- the factor on all dofs, before the boundary update: eta -> M^-1 B g(eta) ----
     def _project(self, eta):
         g = self._src.values(np.ascontiguousarray(eta, dtype=np.float64))
-        return self._mass.apply(torch.from_numpy(np.ascontiguousarray(self._b @ g))).numpy()
+        bg = self._b @ g
+        used = self._full.free  # unused dofs (outside definedon) carry nothing
+        out = np.zeros_like(bg)
+        out[used] = self._mass.apply(torch.from_numpy(np.ascontiguousarray(bg[used]))).numpy()
+        return out
 
     def _project_t(self, y):
-        z = self._mass.apply(torch.from_numpy(np.ascontiguousarray(y, dtype=np.float64))).numpy()
+        used, y = self._full.free, np.asarray(y, dtype=np.float64)
+        z = np.zeros(y.shape)
+        z[used] = self._mass.apply(torch.from_numpy(np.ascontiguousarray(y[used]))).numpy()
         return self._src.values_t(np.ascontiguousarray(self._b.T @ z))
 
     def _setup_conditioning(self):
@@ -556,18 +621,3 @@ class StationaryMatern(InPlace, Rebuildable):
     def __repr__(self):
         return f"StationaryMatern(length={self.length}, nu={self.nu}, construction={self.construction!r}, " \
                f"method={self.method!r}, nrand={self.nrand})"
-
-
-def _without_dirichlet(fes):
-    """The same space without Dirichlet flags (identical dof numbering): the field lives on all dofs before the
-    boundary update."""
-    flags = fes.flags.ToDict()
-    dir_keys = [k for k in flags if k.startswith("dirichlet")]
-    if not dir_keys:
-        return fes
-    for k in dir_keys:
-        flags.pop(k)
-    twin = ngs.FESpace(fes.type, fes.mesh, **flags)
-    if twin.ndof != fes.ndof:
-        raise RuntimeError("could not build the space without its Dirichlet condition")
-    return twin

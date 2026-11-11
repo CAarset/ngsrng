@@ -217,6 +217,66 @@ def test_posteriors_and_observations(coarse):
     assert ngsrng.ObservedGaussian(prior, points=pts, scale=np.sqrt(noise_var)).sample(5).shape == (2, 5)
 
 
+@pytest.mark.parametrize("dirichlet", [None, "interface"])
+def test_subdomain_spaces(dirichlet):
+    """A space on part of the mesh (definedon, with or without Compress, with or without a Dirichlet part): the field
+    lives on the subdomain's elements only (their quadrature points and extent), and the compressed and uncompressed
+    spaces give the same field, dof for dof."""
+    from ngsrng.domains import NGSSquare
+    from ngsrng.quadrature import QuadratureRule
+    from ngsrng.space import SpaceInfo
+
+    mesh = NGSSquare(maxh=0.1).mesh  # unit square; the subdomain "inner" is bounded by "interface"
+    base = ngs.H1(mesh, order=2, definedon="inner", **({} if dirichlet is None else {"dirichlet": dirichlet}))
+    comp = ngs.Compress(base)
+    fields = [ngsrng.StationaryMatern(v, 0.1, 2.0, construction="torus", seed=1) for v in (base, comp)]
+    per_element = QuadratureRule.count(SpaceInfo(ngs.H1(mesh, order=2)), 4) // mesh.ne
+    inner = sum(el.mat == "inner" for el in mesh.Elements(ngs.VOL))
+    for f in fields:
+        assert f.plan["quadrature_points"] == inner * per_element
+        assert max(f.plan["source"]["box"]) < 1.0  # the subdomain (0.3 wide) and its padding, not the whole mesh
+        assert f.sample(3).shape == (f.space.ndof, 3) and isinstance(f.sample(), ngs.GridFunction)
+    # compressed dof -> dof of the uncompressed space, from the element dof lists
+    to_base = np.full(comp.ndof, -1)
+    for el in mesh.Elements(ngs.VOL):
+        for c, b in zip(comp.GetDofNrs(el), base.GetDofNrs(el)):
+            if c >= 0:
+                to_base[c] = b
+    rows = np.searchsorted(fields[0].space.free, to_base[fields[1].space.free])
+    eye = torch.eye(fields[0].nrand, dtype=torch.float64)
+    lb, lc = (f.apply(eye).numpy() for f in fields)
+    np.testing.assert_allclose(lc, lb[rows], atol=1e-10 * np.abs(lb).max())
+    if dirichlet is not None:
+        s = fields[1].sample(4).numpy()
+        fixed = ~np.array(comp.FreeDofs(), bool)
+        assert fixed.any() and np.abs(s[fixed]).max() == 0.0  # conditioned on zero data on the interface
+
+
+def test_pointwise_families_on_a_dirichlet_field(coarse):
+    """On a space with Dirichlet dofs the field is conditioned on boundary data, and its pointwise families are
+    standardised by the field before that conditioning, as posteriors by their prior: the boundary values are the
+    transform of the data (the median for zero data) and the spread grows back away from the boundary. bnd= keeps
+    the trace dofs fixed by dirichlet=, so a Bernstein trace stays inside the range."""
+    from ngsrng.boundary import boundary_dofs
+
+    fes = ngs.H1(coarse, order=2, dirichlet="bottom")
+    rng = ngsrng.default_rng(fes, seed=3, dtype="float64",
+                             correlation=ngsrng.matern_correlation(LENGTH, nu=2, boundary="torus"))
+    assert rng.info("uniform", -0.2, 1.0, representation="bernstein")["standardised_by"].startswith("prior")
+    u = np.asarray(rng.uniform(-0.2, 1.0, size=300, representation="bernstein"))
+    fixed = np.flatnonzero(~np.array(fes.FreeDofs(), bool))
+    np.testing.assert_allclose(u[:, fixed[fixed < coarse.nv]], 0.4, atol=1e-12)  # vertex dofs: the median
+    xyz = vertices(coarse)
+    far = xyz[np.argmin(np.linalg.norm(xyz - [0.5, 0.7], axis=1))]  # a vertex: exact marginals there
+    vals = basis_at(fes, np.array([[0.5, 0.02], far])) @ u.T
+    assert vals.var(1)[0] < 0.25 * vals.var(1)[1] and vals.var(1)[1] == pytest.approx(1.2**2 / 12, rel=0.3)
+    g = np.asarray(rng.uniform(-0.2, 1.0, size=20, representation="bernstein", bnd="left"))
+    on_trace = np.setdiff1d(boundary_dofs(fes, "left", free_only=False), boundary_dofs(fes, "left"))
+    assert on_trace.size and np.allclose(g[:, on_trace[on_trace < coarse.nv]], 0.4)
+    trace = basis_at(fes, np.column_stack([np.full(41, 1e-9), np.linspace(1e-9, 1 - 1e-9, 41)])) @ g.T
+    assert -0.2 <= trace.min() and trace.max() <= 1.0
+
+
 def test_lshape_and_fractional_smoothness():
     """A non-convex domain with a re-entrant corner, and a fractional power (nu = 1.5 in 2D: the rational route on the
     torus)."""

@@ -64,6 +64,16 @@ def is_conditioned(gauss) -> bool:
     return prior_of(gauss) is not gauss
 
 
+def reference_of(gauss):
+    """The Gaussian whose pointwise mean and standard deviation standardise "prior"-standardised families: the prior
+    a conditioned Gaussian was derived from and, for a field conditioned on boundary data when it was built (a
+    :class:`~ngsrng.StationaryMatern` on a space with Dirichlet dofs), the field before that conditioning. The
+    boundary data then enter the family through the transform, as observations do for posteriors."""
+    prior = prior_of(gauss)
+    unconditioned = getattr(prior, "unconditioned", None)
+    return prior if unconditioned is None else unconditioned
+
+
 def warn_copies_of_posterior():
     warnings.warn(
         "this family combines several independent copies of the Gaussian; with a conditioned Gaussian every copy is "
@@ -94,7 +104,8 @@ class GaussianAtPoints(Rebuildable):  # pickles; the NGSolve evaluation matrix i
 
     ``standardize_by``: whose pointwise mean and standard deviation standardise the values,
     z = (g - m_ref) / std_ref:
-    - "prior" (default): the prior a conditioned Gaussian was derived from (the Gaussian itself for priors). A
+    - "prior" (default): the prior a conditioned Gaussian was derived from (the Gaussian itself for priors; for a
+      StationaryMatern conditioned on Dirichlet data, the field before that conditioning: :func:`reference_of`). A
       pointwise family built on a posterior is then exactly the posterior of the same family built on the prior,
       given linear observations of the underlying Gaussian;
     - "own": the Gaussian itself (its copula only: a posterior's mean and variance are divided out).
@@ -139,7 +150,7 @@ class GaussianAtPoints(Rebuildable):  # pickles; the NGSolve evaluation matrix i
             self.rule, self.coords = None, np.atleast_2d(np.asarray(points, dtype=float))
             self.eval_full = observation_operator(gauss.space.fes, points=self.coords)
         self.standardize_by = standardize_by
-        self.reference = prior_of(gauss) if standardize_by == "prior" else gauss
+        self.reference = reference_of(gauss) if standardize_by == "prior" else gauss
         self.mean = self.eval_full @ gauss.mean
         self.center = self.eval_full @ self.reference.mean
         self.device_capable = getattr(gauss, "engine", None) == "torch" and gauss.device.type == "cuda"
@@ -258,12 +269,21 @@ class GaussianAtPoints(Rebuildable):  # pickles; the NGSolve evaluation matrix i
         return z
 
     def _pin(self):
-        """Points where the reference Gaussian is deterministic (e.g. on a Dirichlet boundary of the covariance):
-        their standardised value is set to 0, i.e. the median of the target distribution."""
+        """Points where the reference Gaussian is deterministic (e.g. on a Dirichlet boundary of the covariance, or
+        outside the part of the mesh the space lives on): their standardised value is set to 0, i.e. the median of the
+        target distribution."""
         if self.std is not None:
             pinned = self.std <= 1e-12 * max(self.std.max(), 1e-300)
             if pinned.any():
                 self.std = np.where(pinned, np.inf, self.std)
+
+
+def _standardised_by(points) -> str:
+    """For ``info``: whose mean and standard deviation standardise the values."""
+    unconditioned = getattr(prior_of(points.gauss), "unconditioned", None)
+    if unconditioned is not None and points.reference is unconditioned:
+        return "prior (the field before its boundary update)"
+    return points.standardize_by if is_conditioned(points.gauss) else "own (prior)"
 
 
 class PointwiseField(InPlace):
@@ -304,7 +324,7 @@ class PointwiseField(InPlace):
         return {
             "representation": self.representation,
             "standardisation": p.std_method,
-            "standardised_by": p.standardize_by if is_conditioned(p.gauss) else "own (prior)",
+            "standardised_by": _standardised_by(p),
             "point_values": p.point_values,
             "points": p.npoints,
             "device": "gpu" if self.on_device else "cpu",

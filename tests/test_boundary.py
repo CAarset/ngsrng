@@ -139,6 +139,19 @@ def test_restrict_is_marginal(mesh):
     assert np.all(b[:, other] == 0.0)
 
 
+def test_restrict_keeps_dirichlet_trace_dofs(mesh):
+    """Restriction zeroes the DoFs off the boundary only: trace DoFs fixed by dirichlet= keep their values (zeroing
+    them would change the boundary values)."""
+    fes = ngs.H1(mesh, order=2, dirichlet="bottom")
+    make = lambda: ngsrng.default_rng(fes, seed=4, correlation=ngsrng.matern_correlation(0.3, nu=1))  # noqa: E731
+    full = np.asarray(make().uniform(size=3, representation="bernstein"))
+    restricted = np.asarray(make().uniform(size=3, representation="bernstein", bnd="left"))
+    trace = boundary_dofs(fes, "left", free_only=False)
+    assert np.setdiff1d(trace, boundary_dofs(fes, "left")).size  # the corner shared with the Dirichlet boundary
+    np.testing.assert_allclose(restricted[:, trace], full[:, trace], rtol=0, atol=1e-12)  # two set-ups: rounding
+    assert not restricted[:, np.setdiff1d(np.arange(fes.ndof), trace)].any()
+
+
 def test_restrict_single_sample_is_gridfunction(mesh):
     fes = h1(mesh, 1)
     d = boundary_dofs(fes, "left")

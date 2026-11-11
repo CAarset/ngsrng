@@ -197,7 +197,9 @@ class BoundarySampler(Rebuildable):
         self._pos = np.searchsorted(free, self.dofs)
         self._free = np.zeros(free.size, dtype=bool)
         self._free[self._pos] = True
-        self._off = np.setdiff1d(np.arange(self.fes.ndof), self.dofs)
+        # restriction keeps every DoF with a trace, the Dirichlet ones too: zeroing a fixed trace DoF would change the
+        # boundary values (and break the range of a Bernstein-built function)
+        self._off = np.setdiff1d(np.arange(self.fes.ndof), boundary_dofs(self.fes, self.name, free_only=False))
         self._int_pos = np.flatnonzero(~self._free)  # free dofs off Gamma: positions among the free dofs ...
         self._int_dofs = free[self._int_pos]          # ... and dof numbers; the lifting acts only there
         self._device_ops = {}      # per device: the correction's operators for torch rows
@@ -435,7 +437,8 @@ class BoundarySampler(Rebuildable):
         return base - self._correction(base[self.dofs] - np.asarray(values, dtype=np.float64).ravel())[0]
 
     def restrict(self, rows):
-        """Zero every DoF that carries no trace (in place). The exact marginal of the boundary DoFs."""
+        """Zero every DoF that carries no trace (in place); trace DoFs, free or fixed by ``dirichlet=``, keep their
+        values. The exact marginal of the boundary DoFs."""
         off = _index(rows, self._off)
         if rows.ndim == 1:
             rows[off] = 0
