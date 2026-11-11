@@ -1,0 +1,33 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    name: pytest (CPU, Python 3.13)
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      NGSRNG_QUIET: "1"  # no calibration notice on a fresh runner
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+          enable-cache: true
+          cache-dependency-glob: "**/pyproject.toml"
+      - name: Install ngsrng with PyTorch's CPU build
+        run: uv sync --project env --extra cpu
+      - name: Run the test suite (GPU tests are skipped without a CUDA device)
+        run: uv run --project env --extra cpu pytest -q -rfE --durations=15  # the extra again, or uv re-syncs without it

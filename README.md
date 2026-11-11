@@ -4,6 +4,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/CAarset/ngsrng/actions/workflows/tests.yml"><img src="https://github.com/CAarset/ngsrng/actions/workflows/tests.yml/badge.svg" alt="Tests"></a>
   <a href="https://www.python.org"><img src="https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white" alt="Python 3.11+"></a>
   <a href="https://ngsolve.org"><img src="https://img.shields.io/badge/NGSolve-6.2%2B-1f5f99" alt="NGSolve 6.2+"></a>
   <a href="https://pytorch.org"><img src="https://img.shields.io/badge/PyTorch-2.6%2B-EE4C2C?logo=pytorch&logoColor=white" alt="PyTorch 2.6+"></a>
@@ -211,8 +212,8 @@ best CPU solver by:
 ## Development
 
 ```bash
-uv run --project env pytest          # GPU tests are skipped without a usable CUDA device
-uvx ruff check .                     # lint (configured in pyproject.toml)
+uv run --project env --extra cpu pytest   # the extra you synced; GPU tests are skipped without a CUDA device
+uvx ruff check .                          # lint (configured in pyproject.toml)
 ```
 
 Every sampler must have an in-place form (`out=`); [tests/test_inplace.py](tests/test_inplace.py) enforces it.

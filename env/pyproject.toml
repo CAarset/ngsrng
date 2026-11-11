@@ -1,7 +1,8 @@
 # ngsrng's development environment, and the template for projects that depend on ngsrng.
 #
 #     uv sync --project env --extra cpu        # exactly one accelerator: cpu | cuda | rocm
-#     uv run --project env pytest              # (from the repository root)
+#     uv run --project env --extra cpu pytest  # from the repository root; repeat the extra, or uv run re-syncs
+#                                              # without it (and installs PyPI's torch)
 #
 # A separate, non-package project: uv reads a dependency's [tool.uv.sources], so the choice of PyTorch build cannot
 # live in ngsrng's own pyproject.toml without clashing with every dependent's choice. Dependents copy the torch

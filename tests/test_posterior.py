@@ -236,7 +236,8 @@ def test_dense_observation_matrix_stays_dense(engine, monkeypatch):
     import scipy.sparse as sp
 
     fes = ngs.H1(ngs.Mesh(ngs.unit_square.GenerateMesh(maxh=0.25)), order=2, dirichlet="left")
-    prior = ngsrng.Gaussian(fes, ngsrng.matern(5.0, 2), dtype="float64", seed=0, method={"engine": engine})
+    # tol: the torch engine may solve iteratively (Jacobi PCG when pyamg is absent); converge it far below the checks
+    prior = ngsrng.Gaussian(fes, ngsrng.matern(5.0, 2), dtype="float64", tol=1e-13, seed=0, method={"engine": engine})
     g = np.random.default_rng(0).standard_normal((7, fes.ndof))
     assert isinstance(ngsrng.observation_operator(fes, g), np.ndarray)
     with pytest.raises(ValueError, match="identically zero"):
