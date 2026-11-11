@@ -220,8 +220,7 @@ Every sampler must have an in-place form (`out=`); [tests/test_inplace.py](tests
 
 ## Citing
 
-If ngsrng helps your research, please cite it (GitHub's "Cite this repository" button reads
-[CITATION.cff](CITATION.cff)):
+If ngsrng helps your research, please cite it:
 
 ```bibtex
 @software{ngsrng,
@@ -233,8 +232,7 @@ If ngsrng helps your research, please cite it (GitHub's "Cite this repository" b
 }
 ```
 
-The randomised low-rank algorithms follow [Aarset (2024), Algorithm 2](https://arxiv.org/abs/2410.16590), and
-[Halko, Martinsson & Tropp (2011)](https://doi.org/10.1137/090771806).
+The randomised low-rank algorithms follow [Halko, Martinsson & Tropp (2011)](https://doi.org/10.1137/090771806).
 
 ## License
 

@@ -25,6 +25,8 @@ warnings.simplefilter("ignore")
 
 def show(ax, field, mesh=None, title=None, width=520, **kw):
     extra = {} if isinstance(field, ngs.GridFunction) else {"mesh": mesh}
+    if (field.space.mesh if isinstance(field, ngs.GridFunction) else mesh).dim == 2:
+        extra["subdomains"] = False  # no lines between subdomains, only the boundary (2D meshes only)
     ngsplot.Plot(field, ax=ax, colorbar=False, width=width, height=None, fit="box", **extra, **LOOK, **kw)
     ax.set_axis_off()
     if title:
