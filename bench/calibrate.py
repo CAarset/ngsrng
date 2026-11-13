@@ -25,6 +25,9 @@ Steps, in order:
   routes       (GPU only) bench/gpu_routes.py: every computation with a device and a host route (pointwise families
                and their FE representations, KL, low-rank and Matheron sampling, posterior and covariance set-ups),
                both routes timed interleaved, with their agreement and host<->device traffic: gain / loss per case
+  syncs        (GPU only) bench/solver_syncs.py: the torch solvers' per-iteration convergence test against variants
+               with fewer host synchronisations (every k iterations, lagged, CUDA graphs) and a batched gamma
+               sampler; benchmark-only variants, most informative on AMD GPUs (AMG-PCG is their solver)
 
 Each step runs as a subprocess with a time limit (enforced also while it prints nothing). Its output goes to the
 console and to logs/<step>.log, its status and duration to manifest.json, so an interrupted or failed run is continued
@@ -106,6 +109,8 @@ def steps(cfg, run):
                  60 * MIN, "out/throughput/report.md"))
     plan.append(("routes", [PY, "bench/gpu_routes.py", *(["--quick"] if cfg["quick"] else []),
                             "--out", os.path.join(out, "routes")], 90 * MIN, "out/routes/report.md"))
+    plan.append(("syncs", [PY, "bench/solver_syncs.py", *(["--quick"] if cfg["quick"] else []),
+                           "--out", os.path.join(out, "syncs")], 60 * MIN, "out/syncs/report.md"))
     return plan
 
 
@@ -173,7 +178,8 @@ def summary(run, manifest):
     for name, pattern in (("tests", ("passed", "failed", "error")),
                           ("calibrate", ("finished in", "installed tuning")),
                           ("throughput", ("checks:", "fractional checks:")),
-                          ("routes", ("loss", "No losses"))):
+                          ("routes", ("loss", "No losses")),
+                          ("syncs", ("gain", "No gains"))):
         path = os.path.join(run, "logs", f"{name}.log")
         if os.path.exists(path):
             hits = [ln for ln in open(path) if any(p in ln for p in pattern)][-3:]
@@ -230,7 +236,7 @@ def main():
     for name, cmd, timeout, report in plan:
         if name not in chosen:
             continue
-        if name in ("throughput", "routes") and manifest.get("env") and not manifest["env"].get("cuda_usable"):
+        if name in ("throughput", "routes", "syncs") and manifest.get("env") and not manifest["env"].get("cuda_usable"):
             print(f"[calibrate] {name}: no CUDA device, skipped", flush=True)
             continue
         if manifest["steps"].get(name, {}).get("status") == "ok":

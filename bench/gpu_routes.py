@@ -16,7 +16,9 @@ repetitions (median times, so that load on a shared GPU affects both alike), and
 
 Cases (fix numbers of the GPU audit): the in-place fill against the allocating fallback (1); pointwise families at
 quadrature points, in the L2 projection, in the Bernstein form, with ``bnd=`` (2); KL set-up and sampling,
-LowRankGaussian sampling, Matheron set-up and sampling (3); posterior factorisations, pointwise variances (4).
+LowRankGaussian sampling, Matheron set-up and sampling (3); posterior factorisations, pointwise variances (4); and
+apply_precision on GPU blocks, ``transformed`` with NumPy's and torch's own functions, stationary Matérn fields
+(FFT and torus) on the GPU against the CPU (5).
 
 Results go to results/runs/<host>_<date>_gpuroutes/ (results.jsonl, report.md). A loss is a reason to change the
 default route (``compute`` / the KL, posterior and covariance set-ups default to the device on a GPU).
@@ -194,6 +196,28 @@ def cases(fes, g, args):
             return ngsrng.local_covariance(g, method, compute=c, **opts).values(e)
         out[f"4 pointwise variance ({method})"] = {"device": lambda f=lc: f("auto"), "host": lambda f=lc: f("host"),
                                                    "setup": True}
+    c = once("c", lambda: torch.randn(space.nfree, k, device="cuda", dtype=torch.float64))
+    out["5 apply_precision (power 2)"] = {  # the host route: the block to the CPU, SciPy and NGSolve, back
+        "device": lambda: g.apply_precision(c), "host": lambda: g.apply_precision(c.cpu()).to("cuda")}
+    out["5 transformed(np.tanh)"] = family("transformed", np.tanh)
+    out["5 transformed(torch.tanh)"] = family("transformed", torch.tanh)
+
+    def stationary(construction, device):
+        return once(("stationary", construction, device), lambda: ngsrng.StationaryMatern(
+            fes, 0.3, 1.0, construction=construction, method="fft" if construction == "restrict" else "auto",
+            seed=1, device=device))
+    for construction in ("restrict", "torus"):
+        label = "FFT" if construction == "restrict" else "torus"
+        out[f"5 stationary Matérn sampling ({label})"] = {
+            "device": lambda c_=construction: stationary(c_, "cuda").sample(k),
+            "host": lambda c_=construction: stationary(c_, "cpu").sample(k).to("cuda"),
+            "compare": (lambda c_=construction: stationary(c_, "cuda").apply(stationary_eta(c_)),
+                        lambda c_=construction: stationary(c_, "cpu").apply(stationary_eta(c_))),
+        }
+
+    def stationary_eta(construction):  # the same noise for both routes
+        return once(("eta", construction), lambda: torch.randn(stationary(construction, "cpu").nrand, 4,
+                                                              dtype=torch.float64))
     return out
 
 
