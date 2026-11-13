@@ -83,7 +83,7 @@ ngsrng needs Python 3.11+, NGSolve 6.2+ and PyTorch 2.6+. Install it with exactl
 | Extra | Hardware | What it adds |
 |---|---|---|
 | `cpu` | any | PyTorch's CPU build |
-| `cuda` | NVIDIA GPUs | nvmath-python, for the cuDSS sparse direct solver |
+| `cuda` | NVIDIA GPUs | nvmath-python for the cuDSS sparse direct solver, pyamg for problems too large for it |
 | `rocm` | AMD GPUs | pyamg and AMD's ROCm SDK |
 
 ```bash

@@ -36,9 +36,11 @@ from .backend import (
     Scratch,
     available_memory,
     compute_device,
+    device_free_memory,
     numpy_blas_threads,
     same_device,
     sparse_to_torch,
+    torch_device_of,
 )
 from .inplace import InPlace
 from .observations import CHUNK, dense_if_full, observation_operator, whiten, whitener
@@ -52,15 +54,16 @@ from .space import coefficient_columns, coefficient_vector
 def check_memory(prior, columns, rows_per_column, what, hint):
     """Raise MemoryError before a set-up allocates ``columns`` dense float64 columns of ``rows_per_column`` entries in
     total (e.g. nrand + 2 nfree per observation for an exact posterior) beyond the available host memory, and, for
-    a prior on a CUDA device, its F^T and Q (2 nrand per column) beyond the free device memory."""
+    a prior on a CUDA device, its F^T and Q (2 nrand per column) beyond the free device memory (including what torch
+    holds cached but unused: it reuses that for these tensors)."""
     need = 8.0 * columns * rows_per_column
     avail = available_memory()
     if avail is not None and need > avail:
         raise MemoryError(f"{what} needs ~{need / 2**30:.1f} GiB of dense low-rank factors ({columns} columns), "
                           f"{avail / 2**30:.1f} GiB available. {hint}")
-    device = getattr(prior, "device", None)
-    if getattr(prior, "engine", None) == "torch" and device is not None and device.type == "cuda":
-        dev_need, dev_free = 16.0 * columns * prior.nrand, torch.cuda.mem_get_info(device)[0]
+    device = torch_device_of(prior)
+    if device is not None and device.type == "cuda":
+        dev_need, dev_free = 16.0 * columns * prior.nrand, device_free_memory(device)
         if dev_need > dev_free:
             raise MemoryError(f"{what} needs ~{dev_need / 2**30:.1f} GiB on {device}, {dev_free / 2**30:.1f} GiB "
                               f"free. {hint}")

@@ -293,6 +293,7 @@ def test_accelerator_extra(monkeypatch):
     monkeypatch.setattr("ngsrng.solvers.cudss_available", lambda: True)
     fits, issues = tuning.accelerator_extra()
     assert fits == "cuda" and any("CPU-only build, but the GPU is NVIDIA" in i for i in issues)
+    assert any("pyamg is missing: no AMG-preconditioned CG where a cuDSS factorisation" in i for i in issues)
     import os
 
     real = os.path.exists

@@ -448,6 +448,9 @@ def accelerator_extra() -> tuple[str, list[str]]:
                       f"{vendor[fits]}: install the {fits.upper() if fits == 'rocm' else 'CUDA'} build of torch")
     if fits == "cuda" and not cudss_available():
         issues.append("nvmath-python[cu13] is missing: no cuDSS, the NVIDIA GPU's sparse direct solver")
+    if fits == "cuda" and not pyamg_available():
+        issues.append("pyamg is missing: no AMG-preconditioned CG where a cuDSS factorisation does not fit in device "
+                      "memory")
     if fits == "rocm" and not pyamg_available():
         issues.append("pyamg is missing: no AMG-preconditioned CG, the AMD GPU's solver")
     if fits == "cpu" and build != "cpu":

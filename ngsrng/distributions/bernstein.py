@@ -28,7 +28,16 @@ import numpy as np
 import scipy.sparse as sp
 import torch
 
-from ..backend import DeviceCache, Rebuildable, Scratch, ngs_sparse, parallel_ranges, sparse_to_torch
+from ..backend import (
+    DeviceCache,
+    Rebuildable,
+    Scratch,
+    available_memory,
+    device_free_memory,
+    ngs_sparse,
+    parallel_ranges,
+    sparse_to_torch,
+)
 from ..quadrature import QuadratureRule
 from ..space import SpaceInfo
 
@@ -112,7 +121,11 @@ class BernsteinForm:
         bm = self.rule.b
         self._mass = SymmetricFactor(bm @ sp.diags(1.0 / self.rule.weights) @ bm.T)  # same-rule mass, all dofs
         self._mapped = None
+        self._ops = None  # the conversion's sparse operators (made on first use; see _operators)
         self._device = DeviceCache()  # the conversion's operators on torch devices (to_coefficients of tensors)
+
+    def __getstate__(self):  # the operators are rebuilt on first use (P is about as large as the rule's matrices)
+        return {**self.__dict__, "_ops": None}
 
     # ---------------------------------------------------------------- reference element
 
@@ -194,40 +207,70 @@ class BernsteinForm:
     def to_coefficients(self, b):
         """Bernstein coefficients (npoints, k) -> NGSolve coefficients (ndof, k) of sum_j b_j B_j, and the largest
         deviation at the rule points (a measure of the rounding error of the conversion). A torch tensor is converted
-        on its device in float64 (cuDSS on NVIDIA GPUs, Jacobi PCG elsewhere), giving torch tensors."""
+        on its device in float64 (cuDSS on NVIDIA GPUs, Jacobi PCG elsewhere), giving torch tensors.
+
+        The conversion is one sparse product with the precomposed R = B P and a mass solve: no values at the rule
+        points (P b, ne nq per column: 79 per dof in 3D P1) are formed for it. Only the rounding check needs them; it
+        runs in one block when that fits in a quarter of the free host memory (half of the free device memory), in
+        column blocks otherwise."""
         if isinstance(b, torch.Tensor):
             return self._to_coefficients_torch(b)
         b = np.asarray(b, dtype=float)
-        vals = b[self.local_to_global]  # (ne, nloc, k)
-        uq = np.einsum("enk,nq->eqk", vals, self.bq).reshape(-1, b.shape[1])
-        c = self._mass.solve(np.asarray(self.rule.b @ uq))
-        resid = np.abs(self.rule.evaluation_full @ c - uq).max(axis=0)
+        p, r = self._operators()
+        c = self._mass.solve(np.asarray(r @ b))
+        e, avail = self.rule.evaluation_full, available_memory()
+        step = self._check_step(b.shape[1], None if avail is None else 0.25 * avail)
+        resid = np.concatenate([np.abs(e @ c[:, j:j + step] - p @ b[:, j:j + step]).max(axis=0)
+                                for j in range(0, b.shape[1], step)])
         return c, resid
+
+    def _operators(self):
+        """P (Bernstein coefficients -> values at the rule points: ne nq x npoints) and R = B P (-> the conversion's
+        load: ndof x npoints), sparse, made on first use."""
+        if self._ops is None:
+            ne, (nloc, nq) = self.ne, self.bq.shape
+            rows = (np.arange(ne)[:, None, None] * nq + np.arange(nq)[None, None, :]).repeat(nloc, 1)
+            cols = np.broadcast_to(self.local_to_global[:, :, None], rows.shape)
+            vals = np.broadcast_to(self.bq[None], rows.shape)
+            p = sp.csr_matrix((vals.ravel(), (rows.ravel(), cols.ravel())), shape=(ne * nq, self.npoints))
+            r = (self.rule.b @ p).tocsr()
+            for m in (p, r):  # sorted now: copying them to a device (sparse_to_torch sorts in place) changes nothing
+                m.sort_indices()
+            self._ops = (p, r)
+        return self._ops
+
+    def _check_step(self, k, budget):
+        """Columns per block of the rounding check: all k when its temporaries (about four values per rule point and
+        column) fit in ``budget`` bytes (None: unknown, all), fewer otherwise."""
+        if budget is None:
+            return max(1, k)
+        per_column = 32.0 * self.ne * self.bq.shape[1]
+        return max(1, min(k, int(budget // per_column)))
 
     def _device_ops(self, device):
         key = str(device)
         if key not in self._device:
             from ..solvers import device_spd_solver
 
+            p, r = self._operators()
             f64 = torch.float64
-            self._device[key] = (
-                torch.from_numpy(self.local_to_global).to(device),
-                torch.from_numpy(np.ascontiguousarray(self.bq)).to(device, f64),
-                sparse_to_torch(self.rule.b.tocsr(), device, f64),
-                sparse_to_torch(self.rule.evaluation_full, device, f64),
-                device_spd_solver(self._mass.a, device),
-            )
+            self._device[key] = (sparse_to_torch(p, device, f64), sparse_to_torch(r, device, f64),
+                                 sparse_to_torch(self.rule.evaluation_full, device, f64),
+                                 device_spd_solver(self._mass.a, device))
         return self._device[key]
 
     def _to_coefficients_torch(self, b):
-        l2g, bq, rule_b, evaluation, mass = self._device_ops(b.device)
+        p, r, evaluation, mass = self._device_ops(b.device)
         b = b.to(torch.float64)
-        k, (nloc, nq) = b.shape[1], bq.shape
-        vals = b[l2g]  # (ne, nloc, k)
-        # values at the rule points, uq[e, q, k] = sum_n vals[e, n, k] bq[n, q]: one 2D GEMM (no batched product)
-        uq = (vals.permute(0, 2, 1).reshape(-1, nloc) @ bq).reshape(self.ne, k, nq).permute(0, 2, 1).reshape(-1, k)
-        c = mass.apply(rule_b @ uq)
-        resid = (evaluation @ c - uq).abs().amax(dim=0)
+        c = mass.apply(r @ b)
+        if b.device.type == "cuda":
+            budget = 0.5 * device_free_memory(b.device)
+        else:
+            avail = available_memory()
+            budget = None if avail is None else 0.25 * avail
+        step = self._check_step(b.shape[1], budget)
+        resid = torch.cat([(evaluation @ c[:, j:j + step] - p @ b[:, j:j + step]).abs().amax(dim=0)
+                           for j in range(0, b.shape[1], step)])
         return c, resid
 
 

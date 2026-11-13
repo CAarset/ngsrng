@@ -15,9 +15,10 @@ dependencies = ["ngsolve>=6.2", "numpy", "scipy", "torch", "threadpoolctl"]
 # Accelerator, exactly one per environment: cpu | cuda | rocm (python -m ngsrng.tuning show says which fits the
 # machine). torch stays unqualified in the dependencies: the environment's project picks PyTorch's build for the device
 # (env/pyproject.toml for ngsrng's own; dependents copy its torch sources, see the README). Each extra adds ngsrng's
-# GPU solver: cuDSS on NVIDIA GPUs, AMG-preconditioned CG on AMD GPUs.
+# GPU solvers: cuDSS on NVIDIA GPUs (and AMG-preconditioned CG where its factor does not fit in device memory),
+# AMG-preconditioned CG on AMD GPUs.
 cpu = ["torch>=2.6"]
-cuda = ["torch>=2.6", "nvmath-python[cu13]"]
+cuda = ["torch>=2.6", "nvmath-python[cu13]", "pyamg"]
 # PyTorch's ROCm wheels depend on AMD's ROCm SDK packages, published on PyTorch's ROCm index rather than on PyPI; uv
 # takes a package from a named index only if it is a direct dependency, so they are listed here, one device package
 # per GPU architecture: keep the gfx list in step with the index (here and in [tool.uv.sources]).

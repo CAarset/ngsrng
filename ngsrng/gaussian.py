@@ -18,6 +18,8 @@ from .backend import (
     Scratch,
     available_threads,
     device_copy,
+    device_free_memory,
+    is_allocation_failure,
     ngs_sparse,
     numpy_blas_threads,
     parallel_ranges,
@@ -267,11 +269,12 @@ class Gaussian(InPlace, Rebuildable):
     def _shifted_width(self, nshift):
         """cuDSS right-hand-side width for the ``nshift`` shifted solvers of a fractional power: every solver keeps
         width x n device buffers, so the width shrinks until all of them fit in a quarter of the free device memory
-        (a 1e6-dof 1D problem with ~40 shifts ran out of 40 GB at width 32 in float64)."""
+        (a 1e6-dof 1D problem with ~40 shifts ran out of 40 GB at width 32 in float64). Free memory includes what
+        torch holds cached but unused."""
         width = int(self.method.get("cudss_width", 32))
         if self.engine != "torch" or self.device.type != "cuda":
             return width
-        free, _ = torch.cuda.mem_get_info(self.device)
+        free = device_free_memory(self.device)
         per_column = 2 * self.space.nfree * torch.empty(0, dtype=self._work_dtype).element_size()
         fit = int(0.25 * free // max(1, nshift * per_column))
         if fit < width:
@@ -454,7 +457,7 @@ class Gaussian(InPlace, Rebuildable):
         choice is used if it is offered and available here and builds without error; otherwise the built-in rule."""
         s, choice = self.space, self.method.get("solver", "auto")
         dtype = self._work_dtype if dtype is None else dtype
-        if choice != "auto":
+        if choice != "auto":  # an explicit choice is kept (cuDSS still retries after releasing torch's cache)
             return self._make_solver(choice, form, dtype, width)
         rec = self._tuned_prior(self._platform)
         if rec is not None:
@@ -475,7 +478,26 @@ class Gaussian(InPlace, Rebuildable):
                 except Exception as err:  # noqa: BLE001 - a suggestion that cannot be built here yields to the rule
                     why = f"{m['solver']} failed: {type(err).__name__}: {err}"[:200]
             self._tuning_note("solver", rec, False, why)
-        return self._make_solver(self._rule_solver(form), form, dtype, width)
+        rule = self._rule_solver(form)
+        try:
+            return self._make_solver(rule, form, dtype, width)
+        except Exception as err:
+            if rule != "cudss" or not is_allocation_failure(err):
+                raise
+            return self._cudss_fallback(form, dtype, width, err)
+
+    def _cudss_fallback(self, form, dtype, width, err):
+        """The automatic choice when cuDSS's factor does not fit in device memory even after releasing torch's cache:
+        AMG-preconditioned CG on the device (Jacobi PCG for the mass matrix), never the host."""
+        n = self.space.nfree
+        if form is not mass_form and not pyamg_available():
+            raise RuntimeError(f"cuDSS ran out of device memory factorising the {n} x {n} system, and pyamg (the "
+                               "AMG-preconditioned CG that replaces it there; part of the cuda extra) is not "
+                               "installed: pip install pyamg") from err
+        warnings.warn(f"cuDSS ran out of device memory factorising the {n} x {n} system: AMG-preconditioned CG on "
+                      f"{self.device} instead", RuntimeWarning, stacklevel=4)
+        self.plan["solver_choice"] = "amg-pcg (cuDSS out of device memory)"
+        return self._make_solver("amg-pcg", form, dtype, width)
 
     def _make_solver(self, name, form, dtype, width=None, inverse=None, precond=None):
         s = self.space

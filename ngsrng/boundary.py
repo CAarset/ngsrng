@@ -316,7 +316,7 @@ class BoundarySampler(Rebuildable):
         return self._device_ops[key]
 
     def _build_device_ops(self, dev):
-        from .backend import sparse_to_torch
+        from .backend import is_allocation_failure, sparse_to_torch
 
         f64 = _torch.float64
         if self._sparse_form is not None:
@@ -325,7 +325,11 @@ class BoundarySampler(Rebuildable):
             q, ii, bb = self._q_free(), self._int_pos, self._pos
             qib = sparse_to_torch(q[ii][:, bb].tocsr(), dev, f64)
             if cudss_available():
-                return "sparse", CudssDirect(q[ii][:, ii], dev, f64), qib
+                try:
+                    return "sparse", CudssDirect(q[ii][:, ii], dev, f64), qib
+                except Exception as err:  # the factor does not fit even after releasing torch's cache: AMG-PCG
+                    if not is_allocation_failure(err) or not pyamg_available():
+                        raise
             if pyamg_available():  # no GPU sparse direct solver (AMD): AMG-preconditioned CG, solved tightly
                 return "sparse", TorchAMGPCG(q[ii][:, ii], dev, f64, tol=1e-12), qib
             return None

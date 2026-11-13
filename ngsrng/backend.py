@@ -149,6 +149,34 @@ def _batched_gemm_shadowed() -> bool:
     return False
 
 
+def device_free_memory(device) -> float:
+    """Bytes available to new allocations on a GPU: the device's free memory plus what torch's caching allocator holds
+    reserved but unused. torch reuses that cache for its own tensors, and releases it (``torch.cuda.empty_cache``)
+    for other libraries such as cuDSS, which allocate outside it; ``torch.cuda.mem_get_info`` alone counts it as
+    taken, so a large computation would make every later check fail."""
+    device = torch.device(device)
+    free, _ = torch.cuda.mem_get_info(device)
+    return float(free + torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device))
+
+
+def is_allocation_failure(err) -> bool:
+    """Whether an exception is a GPU allocation failure (torch's out-of-memory error, cuDSS's ALLOC_FAILED)."""
+    return isinstance(err, torch.OutOfMemoryError) or "ALLOC_FAILED" in str(err) or "out of memory" in str(err)
+
+
+def retry_after_release(make):
+    """``make()``, and once more after releasing torch's cached GPU memory if it fails to allocate: libraries that
+    allocate outside torch's caching allocator (cuDSS) cannot use the memory torch keeps reserved after earlier
+    work. Costs nothing unless the first attempt fails."""
+    try:
+        return make()
+    except Exception as err:
+        if not is_allocation_failure(err) or not torch.cuda.is_available():
+            raise
+    torch.cuda.empty_cache()
+    return make()
+
+
 def cuda_usable() -> bool:
     if not torch.cuda.is_available():
         return False

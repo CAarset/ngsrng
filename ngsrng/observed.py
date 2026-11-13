@@ -30,6 +30,7 @@ from .backend import (
     Rebuildable,
     available_memory,
     device_copy,
+    device_free_memory,
     mean_array,
     ngs_sparse,
     resolve_device,
@@ -367,7 +368,6 @@ def _coefficients(loc, space, field_mean):
 
 def _free_memory(device) -> float:
     if torch.device(device).type == "cuda":
-        free, _ = torch.cuda.mem_get_info(torch.device(device))
-        return float(free)
+        return device_free_memory(device)
     avail = available_memory()
     return float(avail) if avail is not None else 4.0 * 2**30

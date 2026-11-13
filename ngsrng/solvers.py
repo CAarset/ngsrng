@@ -9,7 +9,15 @@ import scipy.sparse as sp
 import torch
 from ngsolve.krylovspace import CGSolver
 
-from .backend import Rebuildable, Scratch, fixed_numpy_global_rng, parallel_ranges, sparse_to_torch
+from .backend import (
+    Rebuildable,
+    Scratch,
+    fixed_numpy_global_rng,
+    is_allocation_failure,
+    parallel_ranges,
+    retry_after_release,
+    sparse_to_torch,
+)
 from .space import SpaceInfo, mass_form
 
 
@@ -213,6 +221,15 @@ class CudssDirect(Solver, Rebuildable):
         self._factorize()
 
     def _factorize(self):
+        """Analysis and factorisation; on an allocation failure once more after releasing torch's cached memory
+        (cuDSS allocates outside torch's caching allocator, so the memory torch keeps reserved is not available to
+        it)."""
+        def build():
+            self.free()
+            self._build()
+        retry_after_release(build)
+
+    def _build(self):
         import logging
 
         import nvmath.sparse.advanced as adv
@@ -236,7 +253,7 @@ class CudssDirect(Solver, Rebuildable):
             self._rhs[r:].zero_()
         self._rhs[:r].copy_(block.T)
         self._solver.reset_operands(b=self._rhs.T)
-        return self._solver.solve()[:, :r]
+        return retry_after_release(self._solver.solve)[:, :r]
 
     def apply(self, x):
         squeeze = x.ndim == 1
@@ -312,9 +329,16 @@ def device_spd_solver(a: sp.spmatrix, device, dtype=torch.float64, tol=1e-13):
     cuDSS (exact, as the CPU's sparse Cholesky) on NVIDIA GPUs with nvmath-python, else Jacobi-preconditioned CG
     to the relative residual ``tol`` (AMD GPUs, the CPU)."""
     device = torch.device(device)
+    pcg_tol = tol if dtype == torch.float64 else max(tol, 1e-6)
     if device.type == "cuda" and cudss_available():
-        return CudssDirect(a, device, dtype)
-    return TorchPCG(sp.csr_matrix(a), device, dtype, tol=tol if dtype == torch.float64 else max(tol, 1e-6))
+        try:
+            return CudssDirect(a, device, dtype)
+        except Exception as err:  # the factor does not fit even after releasing torch's cache: Jacobi PCG
+            if not is_allocation_failure(err):
+                raise
+            warnings.warn(f"cuDSS could not factorise a {a.shape[0]} x {a.shape[0]} mass-type matrix (out of device "
+                          "memory): Jacobi-preconditioned CG instead", RuntimeWarning, stacklevel=2)
+    return TorchPCG(sp.csr_matrix(a), device, dtype, tol=pcg_tol)
 
 
 def pyamg_available() -> bool:

@@ -330,3 +330,97 @@ def test_stationary_matern_follows_the_generator_device(fes):
     u = rng.uniform(size=4)  # unchanged syntax: the field and the transform on the GPU
     assert rng.gaussian().device.type == "cuda" and u.device.type == "cuda" and rng.info("uniform")["device"] == "gpu"
     assert float(u.min()) > 0 and float(u.max()) < 1
+
+
+# ------------------------------------------------------------------ GPU memory: torch's cache, cuDSS, fallbacks
+
+
+def test_retry_after_release(monkeypatch):
+    """An allocation failure is retried once after releasing torch's cache; other errors are not retried."""
+    from ngsrng.backend import is_allocation_failure, retry_after_release
+
+    released, calls = [], []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: released.append(1))
+
+    def flaky():
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("cuDSSError: ALLOC_FAILED (2)")
+        return "ok"
+
+    assert retry_after_release(flaky) == "ok" and released == [1] and len(calls) == 2
+    with pytest.raises(ValueError):
+        retry_after_release(lambda: (_ for _ in ()).throw(ValueError("not memory")))
+    assert released == [1]
+    assert is_allocation_failure(torch.OutOfMemoryError("CUDA out of memory")) and not is_allocation_failure(KeyError())
+
+
+@pytest.mark.skipif(not ngsrng.solvers.pyamg_available(), reason="needs pyamg")
+def test_cudss_out_of_memory_falls_back_to_amg(fes, monkeypatch):
+    """The automatic choice: if cuDSS's factor does not fit (even after releasing torch's cache), AMG-preconditioned
+    CG on the same device, with a warning; an explicit solver="cudss" is not replaced."""
+    from ngsrng.gaussian import Gaussian
+
+    orig = Gaussian._make_solver
+
+    def no_room(self, name, *a, **k):
+        if name == "cudss":
+            raise RuntimeError("cuDSSError: ALLOC_FAILED (2)")
+        return orig(self, name, *a, **k)
+
+    monkeypatch.setattr(Gaussian, "_make_solver", no_room)
+    monkeypatch.setattr(Gaussian, "_rule_solver", lambda self, form: "cudss")
+    with pytest.warns(RuntimeWarning, match="AMG-preconditioned CG"):
+        g = ngsrng.Gaussian(fes, ngsrng.matern(5.0, 2), method={"engine": "torch", "tuning": False}, dtype="float64")
+    assert g.plan["solver"] == "torch-pcg(amg)" and "cuDSS out of device memory" in g.plan["solver_choice"]
+    with pytest.raises(RuntimeError, match="ALLOC_FAILED"):
+        ngsrng.Gaussian(fes, ngsrng.matern(5.0, 2), method={"engine": "torch", "solver": "cudss"})
+
+
+@cuda
+def test_free_memory_counts_torch_cache():
+    """Memory torch holds cached but unused is available: no false alarm from the set-up checks after a large
+    computation (torch.cuda.mem_get_info alone counts it as taken)."""
+    from ngsrng.backend import device_free_memory
+    from ngsrng.posterior import check_memory
+
+    dev = torch.device("cuda", torch.cuda.current_device())
+    torch.cuda.empty_cache()
+    free = torch.cuda.mem_get_info(dev)[0]
+    x = torch.empty(int(0.8 * free / 8), dtype=torch.float64, device=dev)
+    del x  # now cached by torch, not free for the device
+    assert torch.cuda.mem_get_info(dev)[0] < 0.5 * free and device_free_memory(dev) > 0.9 * free
+    prior = type("Prior", (), {"engine": "torch", "device": dev, "nrand": 1000})()
+    check_memory(prior, int(0.5 * free / 16 / 1000), 1, "a set-up", "")  # needs half the memory: no MemoryError
+    torch.cuda.empty_cache()
+
+
+def _old_bernstein(bf, b):  # the conversion before precomposition: values at all rule points formed
+    vals = b[bf.local_to_global]
+    uq = np.einsum("enk,nq->eqk", vals, bf.bq).reshape(-1, b.shape[1])
+    c = bf._mass.solve(np.asarray(bf.rule.b @ uq))
+    return c, np.abs(bf.rule.evaluation_full @ c - uq).max(axis=0)
+
+
+@pytest.mark.parametrize("order", [1, 2])
+def test_precomposed_bernstein_conversion(fes, order, monkeypatch):
+    """The precomposed conversion gives the former one's coefficients and rounding check, on the host and on a torch
+    device, and the check gives the same in column blocks (a small memory budget) as in one block."""
+    from ngsrng.distributions.bernstein import BernsteinForm
+
+    space = ngsrng.SpaceInfo(ngs.H1(fes.mesh, order=order, dirichlet="left"))
+    bf = BernsteinForm(space)
+    b = np.random.default_rng(0).random((bf.npoints, 7))
+    c_old, r_old = _old_bernstein(bf, b)
+    c, r = bf.to_coefficients(b)
+    assert rel(c, c_old) < 1e-13 and np.all(r < 1e-12) and np.all(r_old < 1e-12)
+    for device in ["cpu"] + (["cuda"] if cuda_usable() else []):
+        ct, rt = bf.to_coefficients(torch.from_numpy(b).to(device))
+        tol = 1e-12 if device == "cuda" else 1e-10  # cuDSS is exact; on a CPU device the mass solve is Jacobi PCG
+        assert ct.device.type == device and rel(ct, c_old) < tol and float(rt.max()) < 1e-11
+    monkeypatch.setattr("ngsrng.distributions.bernstein.available_memory", lambda: 1.0)  # one column per block
+    assert bf._check_step(7, 1.0) == 1
+    c_blocks, r_blocks = bf.to_coefficients(b)
+    assert np.array_equal(c_blocks, c) and np.allclose(r_blocks, r, rtol=0, atol=1e-15)
+    assert bf.__getstate__()["_ops"] is None  # the operators are rebuilt after unpickling, not pickled
