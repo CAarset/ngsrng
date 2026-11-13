@@ -22,6 +22,9 @@ Steps, in order:
                correlation errors, then set-up and per-sample cost (--quick: a few minutes)
   throughput   (GPU only) bench/gpu_batch.py --quick: device checks, fractional powers (accuracy, 1e6 dofs, float32
                arithmetic), in-place batch throughput and the cost of float64 arithmetic (11 min)
+  routes       (GPU only) bench/gpu_routes.py: every computation with a device and a host route (pointwise families
+               and their FE representations, KL, low-rank and Matheron sampling, posterior and covariance set-ups),
+               both routes timed interleaved, with their agreement and host<->device traffic: gain / loss per case
 
 Each step runs as a subprocess with a time limit (enforced also while it prints nothing). Its output goes to the
 console and to logs/<step>.log, its status and duration to manifest.json, so an interrupted or failed run is continued
@@ -101,6 +104,8 @@ def steps(cfg, run):
                                 "--out-dir", os.path.join(out, "stationary")], 90 * MIN, "out/stationary/report.md"))
     plan.append(("throughput", [PY, "bench/gpu_batch.py", "--quick", "--out-dir", os.path.join(out, "throughput")],
                  60 * MIN, "out/throughput/report.md"))
+    plan.append(("routes", [PY, "bench/gpu_routes.py", *(["--quick"] if cfg["quick"] else []),
+                            "--out", os.path.join(out, "routes")], 90 * MIN, "out/routes/report.md"))
     return plan
 
 
@@ -167,7 +172,8 @@ def summary(run, manifest):
         lines.append("\n## Environment\n\n```\n" + json.dumps(env, indent=1) + "\n```")
     for name, pattern in (("tests", ("passed", "failed", "error")),
                           ("calibrate", ("finished in", "installed tuning")),
-                          ("throughput", ("checks:", "fractional checks:"))):
+                          ("throughput", ("checks:", "fractional checks:")),
+                          ("routes", ("loss", "No losses"))):
         path = os.path.join(run, "logs", f"{name}.log")
         if os.path.exists(path):
             hits = [ln for ln in open(path) if any(p in ln for p in pattern)][-3:]
@@ -224,8 +230,8 @@ def main():
     for name, cmd, timeout, report in plan:
         if name not in chosen:
             continue
-        if name == "throughput" and manifest.get("env") and not manifest["env"].get("cuda_usable"):
-            print("[calibrate] throughput: no CUDA device, skipped", flush=True)
+        if name in ("throughput", "routes") and manifest.get("env") and not manifest["env"].get("cuda_usable"):
+            print(f"[calibrate] {name}: no CUDA device, skipped", flush=True)
             continue
         if manifest["steps"].get(name, {}).get("status") == "ok":
             print(f"[calibrate] {name}: already ok, skipped", flush=True)

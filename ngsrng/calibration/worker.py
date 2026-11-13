@@ -276,6 +276,11 @@ def run_prior(task: Task, fes, rec: dict, ref: Reference):
 # ------------------------------------------------------------------ posterior suite
 
 
+def _dense(g):
+    """An observation operator as a dense array (sparse, or already dense for full rows, e.g. Gaussian averages)."""
+    return g.toarray() if hasattr(g, "toarray") else np.asarray(g)
+
+
 class PosteriorContext:
     """Per-group cache: priors per platform, observation sets, and float64 reference predictive covariances."""
 
@@ -319,7 +324,7 @@ class PosteriorContext:
             y, var = self.data(m)
             obs = LinearObservations(prior, averages=(self.centers(m), 0.05, "gaussian"), noise=var, factorize=False)
             mat = MatheronPosterior(obs, data=y)
-            gs = obs.gf.toarray() @ mat.bmat  # G Sigma0 G^T
+            gs = _dense(obs.gf) @ mat.bmat  # G Sigma0 G^T
             pred = gs - gs @ sla.cho_solve(mat.kd_chol, gs)
             self.refs[m] = (pred, mat.mean)
         return self.refs[m]
@@ -334,6 +339,11 @@ class PosteriorContext:
 def run_posterior(task: Task, ctx: PosteriorContext, rec: dict):
     from ngsrng.posterior import LinearObservations, MatheronPosterior
 
+    from .cases import HOST_VARIANTS
+
+    method = HOST_VARIANTS.get(task.method, task.method)  # a "-host" variant: the same construction, set up on the host
+    compute = "host" if task.method in HOST_VARIANTS else "auto"
+    rec["compute"] = compute
     m = int(task.options["m"])
     prior = ctx.prior(task.engine, task.device, task.dtype)
     sync = sync_for(task.device)
@@ -341,21 +351,21 @@ def run_posterior(task: Task, ctx: PosteriorContext, rec: dict):
     y, var = ctx.data(m)
     obs_kw = dict(averages=(ctx.centers(m), 0.05, "gaussian"), noise=var)
     t = time.perf_counter()
-    if task.method == "matheron":
+    if method == "matheron":
         obs = LinearObservations(prior, factorize=False, **obs_kw)
-        post = MatheronPosterior(obs, data=y)
+        post = MatheronPosterior(obs, data=y, compute=compute)
         rec["setup_s"] = time.perf_counter() - t
     else:
-        rank = 32 if task.method.startswith("fe-space-rank32") else None
-        form = "noise" if task.method == "noise-space" else "fe"
-        low = "power" if task.method.endswith("-power") else "subspace"
-        obs = LinearObservations(prior, rank=rank, low_rank_method=low, **obs_kw)
+        rank = 32 if method.startswith("fe-space-rank32") else None
+        form = "noise" if method == "noise-space" else "fe"
+        low = "power" if method.endswith("-power") else "subspace"
+        obs = LinearObservations(prior, rank=rank, low_rank_method=low, compute=compute, **obs_kw)
         rec["noise_space_rank"] = obs.rank
         if form == "fe":
             obs._get_lq()  # L Q is part of the FE-space setup
         rec["setup_s"] = time.perf_counter() - t
         weights = None
-        if task.method == "fe-space-reweighted":
+        if method == "fe-space-reweighted":
             # a re-weighted posterior and one sample from it (after the first, which builds the shared copies)
             w = np.random.default_rng(0).gamma(2.0, 0.5, m)
             obs.posterior(data=y, noise_scaling=w).sample(1)
@@ -366,7 +376,7 @@ def run_posterior(task: Task, ctx: PosteriorContext, rec: dict):
         post = obs.posterior(data=y, form=form, noise_scaling=weights)
         rec["posterior_s"] = time.perf_counter() - t  # forming the posterior (incl. mean) from the factorisation
     rec["per_sample_s"], _ = timeit(lambda: post.sample(1), sync, min_time=0.3, max_reps=5)
-    batch = 4 if task.engine == "ngsolve" or task.method == "matheron" else 32
+    batch = 4 if task.engine == "ngsolve" or (method == "matheron" and compute == "host") else 32
     tb, _ = timeit(lambda: post.sample(batch), sync, min_time=0.0, max_reps=1, min_reps=1)
     rec.update(
         batch=batch, per_sample_batch_s=tb / batch, overhead_vs_prior=rec["per_sample_s"] / rec["prior_per_sample_s"]
@@ -374,8 +384,8 @@ def run_posterior(task: Task, ctx: PosteriorContext, rec: dict):
     space = prior.space
     if m <= 100:
         pred_ref, mean_ref = ctx.reference(m)
-        gf = obs.gf.toarray()
-        if task.method == "matheron":
+        gf = _dense(obs.gf)
+        if method == "matheron":
             pred = gf @ post.bmat
             pred = pred - pred @ sla.cho_solve(post.kd_chol, pred)
         else:
@@ -400,7 +410,7 @@ def run_posterior(task: Task, ctx: PosteriorContext, rec: dict):
             if task.engine == "ngsolve"
             else exact_covariance(ctx.prior("ngsolve", "cpu", "float64"))
         )
-        g = obs.gf.toarray()
+        g = _dense(obs.gf)
         gs0 = g @ s0  # Woodbury form; the precision form is ill-conditioned for informative data
         sp_ = s0 - gs0.T @ np.linalg.solve(np.diag(var) + gs0 @ g.T, gs0)
         rec.update({f"law_{k}": v for k, v in covariance_errors(sampler_covariance(post), sp_).items()})
@@ -477,11 +487,15 @@ def run_distributions(task: Task, fes, rec: dict):
         rec["out_per_sample_s"], _ = timeit(lambda: dist.sample(out=buf), sync, min_time=0.2, max_reps=3)
         rec["out_per_sample_s"] /= OUT_BATCH
         info = dist.info
-        for key in ("law", "inversion", "chi_inversion", "standardisation", "points", "device", "gaussian_fields",
-                    "mixing", "algorithm"):
+        for key in ("law", "inversion", "chi_inversion", "standardisation", "points", "device", "compute",
+                    "gaussian_fields", "mixing", "algorithm"):
             if key in info:
                 rec[key] = info[key]
+        rec.setdefault("compute", opts.get("compute", "auto"))
         x = dist.sample(DIST_SAMPLES, output="numpy")
+    if opts.get("representation") in ("projection", "bernstein"):
+        rec["check"] = "FE coefficients: marginals not checked"  # the tests compare these with the host route
+        return
     _dist_check(task.method, name, args, x, gauss, rec)
 
 
@@ -511,10 +525,17 @@ def run_lowrank(task: Task, fes, rec: dict, ref: LowRankReference):
         gauss = ngsrng.Gaussian(fes, prior_spec(fes, task.kind, 2), device=task.device, dtype=task.dtype, seed=0,
                                 method={"engine": task.engine})
     r = min(r, gauss.space.nfree // 2)
+    compute, sync = task.options.get("compute", "auto"), sync_for(task.device)
     t = time.perf_counter()
-    kl = ngsrng.karhunen_loeve(gauss, r, power_iterations=q, method=task.method, seed=1)
+    kl = ngsrng.karhunen_loeve(gauss, r, power_iterations=q, method=task.method, seed=1, compute=compute)
+    if sync:
+        sync()
     rec.update(setup_s=time.perf_counter() - t, rank=kl.nrand, applications=(2 * q + 2) if task.method == "subspace"
-               else (2 * q + 3))
+               else (2 * q + 3), compute=compute, result_device=str(kl.device))
+    sync = sync_for(str(kl.device.type))
+    kl.sample(8)
+    rec["per_sample_s"], _ = timeit(lambda: kl.sample(64), sync, min_time=0.2, max_reps=5)
+    rec["per_sample_s"] /= 64
     if ref.lam is not None:
         lam = ref.lam
         k = min(kl.nrand, r)
@@ -535,13 +556,27 @@ class CovarianceContext:
 
         from .cases import COVARIANCE_EXACT_LIMIT
 
+        self.fes, self.kind = fes, kind
         self.prior = ngsrng.Gaussian(fes, prior_spec(fes, kind, 2), dtype="float64", seed=0)
         lo, hi = 0.1, 0.9
-        pts = np.random.default_rng(0).uniform(lo, hi, (40, fes.mesh.dim))
-        self.sources = {"prior": self.prior, "posterior": self.prior.condition(points=pts, noise=1e-2)}
+        self.pts = np.random.default_rng(0).uniform(lo, hi, (40, fes.mesh.dim))
+        self.sources = {"prior": self.prior, "posterior": self.prior.condition(points=self.pts, noise=1e-2)}
+        self.gpu_sources = None
         self.eval = QuadratureRule(self.prior.space).evaluation
         self.exact = {}
         self.exact_ok = self.prior.space.nfree <= COVARIANCE_EXACT_LIMIT
+
+    def sources_on(self, device):
+        """The prior and posterior on the CPU engine, or on the GPU's torch engine (float64, cuDSS by default)."""
+        if device != "cuda":
+            return self.sources
+        if self.gpu_sources is None:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                g = ngsrng.Gaussian(self.fes, prior_spec(self.fes, self.kind, 2), dtype="float64", seed=0,
+                                    device="cuda")
+            self.gpu_sources = {"prior": g, "posterior": g.condition(points=self.pts, noise=1e-2)}
+        return self.gpu_sources
 
     def reference(self, source):
         if source not in self.exact and self.exact_ok:
@@ -557,22 +592,28 @@ def run_covariance(task: Task, ctx: CovarianceContext, rec: dict):
     from .cases import COVARIANCE_VARIANCE
 
     kind, name = task.method.split(":")
-    source = task.solver.split("-p")[0]
+    source = task.solver.split("-p")[0].removesuffix("-host")
+    compute = task.options.get("compute", "auto")
+    sources = ctx.sources_on(task.device)
     ref = ctx.reference(source)
+    sync = sync_for(task.device)
     t = time.perf_counter()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         if kind == "variance":
             method, opts = COVARIANCE_VARIANCE[name]
-            lc = ngsrng.local_covariance(ctx.sources[source], method, seed=1, **opts)
+            lc = ngsrng.local_covariance(sources[source], method, seed=1, compute=compute, **opts)
+            if sync:
+                sync()
             v, se = lc.values(ctx.eval, stderr=True)
-            rec.update(setup_s=time.perf_counter() - t, applications=lc.applications, method_used=lc.method)
+            rec.update(setup_s=time.perf_counter() - t, applications=lc.applications, method_used=lc.method,
+                       compute=compute)
             if ref is not None:
                 rel = np.abs(v / ref[0] - 1)
                 rec.update(rel_err_rms=float(np.sqrt(np.mean(rel**2))), rel_err_max=float(rel.max()),
                            stderr_rel_median=float(np.median(se / ref[0])))
         else:
-            est = ngsrng.covariance_trace(ctx.sources[source], name, probes=int(task.options["probes"]), seed=1)
+            est = ngsrng.covariance_trace(sources[source], name, probes=int(task.options["probes"]), seed=1)
             rec.update(setup_s=time.perf_counter() - t, applications=est.applications, trace=est.value,
                        stderr_rel=est.stderr / abs(est.value))
             if ref is not None:

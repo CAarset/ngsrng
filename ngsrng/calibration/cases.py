@@ -122,6 +122,9 @@ def choose(recs):
 # the Gaussian step of IRLS and of Gibbs samplers for heavy-tailed noise)
 POSTERIOR_METHODS = ["fe-space", "fe-space-reweighted", "noise-space", "fe-space-rank32", "fe-space-rank32-power",
                      "matheron"]
+# On a GPU, the same constructions with their set-up (and, for Matheron, the sampling) on the host (compute="host",
+# the route before the device set-ups existed): device vs host is decided by these pairs.
+HOST_VARIANTS = {"fe-space-host": "fe-space", "fe-space-rank32-host": "fe-space-rank32", "matheron-host": "matheron"}
 POSTERIOR_DENSE_LIMIT = 4e8  # setup keeps G (m x ndof) and L^T G^T (nrand x m) dense
 
 # Distribution families on the default Matern prior (power 2), through ngsrng.Generator. Every algorithm variant of a
@@ -150,6 +153,16 @@ DISTRIBUTION_CASES = {
     "student-t5-copula": ("standard_t", (5,), {"construction": "copula"}),
     "nig": ("normal_inverse_gaussian", (0.05,), {}),
     "variance-gamma": ("variance_gamma", (0.05,), {}),
+    # FE representations (coefficients: the L2 projection, the bound-preserving Bernstein form) and KL expansions,
+    # whose post-processing runs on the Gaussian's device by default ("compute"); the "-host" variants (GPU only) run
+    # it with NumPy/NGSolve on the CPU, the route before the device paths existed
+    "uniform-projection": ("uniform", (), {"representation": "projection"}),
+    "uniform-projection-host": ("uniform", (), {"representation": "projection", "compute": "host"}),
+    "uniform-bernstein": ("uniform", (), {"representation": "bernstein"}),
+    "uniform-bernstein-host": ("uniform", (), {"representation": "bernstein", "compute": "host"}),
+    "gamma-table-host": ("gamma", (2.0,), {"method": "table", "compute": "host"}),
+    "karhunen-loeve-r50": ("karhunen_loeve", (), {"rank": 50}),
+    "karhunen-loeve-r50-host": ("karhunen_loeve", (), {"rank": 50, "compute": "host"}),
 }
 
 # Truncated Karhunen-Loeve expansions of the default Matern prior (power 2): randomised subspace iteration on the
@@ -171,6 +184,7 @@ COVARIANCE_VARIANCE = {
     "mc-2000": ("mc", {"samples": 2000}),
 }
 COVARIANCE_TRACE = ["hutchinson", "hutch++", "xnystrace"]
+# On a GPU, the variance methods run with their set-up on the device ("auto") and on the host ("host")
 COVARIANCE_PROBES = [30, 120]
 COVARIANCE_SOURCES = ["prior", "posterior"]
 COVARIANCE_EXACT_LIMIT = 20000
@@ -313,10 +327,10 @@ def build_groups(profile: str, suites, devices, max_ndof=None):
                 for m in cfg["posterior_obs"]:
                     if m * t > POSTERIOR_DENSE_LIMIT:
                         continue
-                    for method in POSTERIOR_METHODS:
+                    for method in POSTERIOR_METHODS + list(HOST_VARIANTS):
                         if method.startswith("fe-space-rank32") and m <= 32:
                             continue
-                        platforms = [("ngsolve", "cpu", "float64")]
+                        platforms = [] if method in HOST_VARIANTS else [("ngsolve", "cpu", "float64")]
                         if "cuda" in devices:
                             platforms += [("torch", "cuda", "float64"), ("torch", "cuda", "float32")]
                         for eng, dev, dt in platforms:
@@ -333,6 +347,7 @@ def build_groups(profile: str, suites, devices, max_ndof=None):
                     Task("distributions", d, k, p, t, eng, dev, dt, fam, "", 2)
                     for fam in DISTRIBUTION_CASES
                     for eng, dev, dt in platforms
+                    if dev != "cpu" or not fam.endswith("-host")  # on the CPU engine the host route is the only one
                 ]
                 groups.append(Group("distributions", d, k, p, t, tasks))
     if "lowrank" in suites:
@@ -342,20 +357,29 @@ def build_groups(profile: str, suites, devices, max_ndof=None):
                     [("torch", "cuda", "float32")] if "cuda" in devices else []
                 )
                 tasks = [
-                    Task("lowrank", d, k, p, t, eng, dev, dt, method, f"rank{r}-q{q}", 2, {"rank": r, "q": q})
+                    Task("lowrank", d, k, p, t, eng, dev, dt, method, f"rank{r}-q{q}{host}", 2,
+                         {"rank": r, "q": q, "compute": "host" if host else "auto"})
                     for method in LOWRANK_METHODS
                     for r in LOWRANK_RANKS
                     for q in LOWRANK_ITERATIONS
                     for eng, dev, dt in platforms
+                    for host in ([""] if dev == "cpu" else ["", "-host"])  # GPU: set-up on the device and the host
                 ]
                 groups.append(Group("lowrank", d, k, p, t, tasks))
     if "covariance" in suites:
         for d, k, p in [(d, k, p) for d in cfg["dims"] for k in ("H1", "L2") for p in cfg["posterior_orders"][k]]:
             for t in targets:
+                gpu = [("", "auto"), ("-host", "host")] if "cuda" in devices else []
                 tasks = [
                     Task("covariance", d, k, p, t, "ngsolve", "cpu", "float64", f"variance:{name}", source, 2)
                     for source in COVARIANCE_SOURCES
                     for name in COVARIANCE_VARIANCE
+                ] + [
+                    Task("covariance", d, k, p, t, "torch", "cuda", "float64", f"variance:{name}", f"{source}{suffix}",
+                         2, {"compute": compute})
+                    for source in COVARIANCE_SOURCES
+                    for name in COVARIANCE_VARIANCE
+                    for suffix, compute in gpu
                 ] + [
                     Task("covariance", d, k, p, t, "ngsolve", "cpu", "float64", f"trace:{m}", f"{source}-p{n}", 2,
                          {"probes": n})

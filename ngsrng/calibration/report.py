@@ -262,8 +262,9 @@ def posterior_section(df, recs):
         "## 3. Posteriors under linear observations (m local averages, A^-2 prior)\n",
         "fe-space / noise-space = the exact low-rank update applied to the prior sample / to the white noise; "
         "fe-space-reweighted = fe-space plus the cost of a re-weighted posterior and one sample from it "
-        "(reweight_and_sample_s); fe-space-rank32 = randomised low-rank version; matheron = pathwise conditioning "
-        "(reference implementation, CPU dense algebra).\n",
+        "(reweight_and_sample_s); fe-space-rank32 = randomised low-rank version; matheron = pathwise conditioning. "
+        "On a GPU, '-host' = the same construction with its set-up (Matheron: also its sampling) on the host "
+        "(compute='host', the route before the device set-ups): the device/host pairs decide the default.\n",
     ]
     df = df.assign(platform=platform(df))
     df["m"] = df.solver.str.replace("obs", "").astype(int)
@@ -288,6 +289,7 @@ def posterior_section(df, recs):
             (sub.get("pred_cov_rel_err", pd.Series(0, index=sub.index)).fillna(0) <= sub.dtype.map(TOL))
             & (~sub.method.str.startswith("fe-space-rank32"))
             & (sub.method != "fe-space-reweighted")  # the same sampler as fe-space
+            & (~sub.method.str.endswith("-host"))  # the same samplers, set up on the host
         ]
         if len(valid):
             b = valid.loc[valid.per_sample_s.idxmin()]
@@ -315,7 +317,9 @@ def distributions_section(df):
         "Every algorithm variant of a family is timed: inversion (closed / table / ppf / discrete table) and "
         "construction (chi^2 squares vs copula, Wishart process vs Bartlett, t-process vs t-copula). Pointwise "
         "families live at quadrature points; Student-t processes and type-G fields are FE functions. Validity: KS "
-        "p-value of known marginals (should not be tiny), Poisson mean error, variance ratio vs theory (~1).\n",
+        "p-value of known marginals (should not be tiny), Poisson mean error, variance ratio vs theory (~1). "
+        "'-host' cases (GPU only) process the Gaussian's draws on the host (compute='host'): against their device "
+        "counterparts they decide where the post-processing runs.\n",
     ]
     df = df.assign(platform=platform(df))
     ok = df[df.status == "ok"]
@@ -326,6 +330,8 @@ def distributions_section(df):
             "per_sample_s",
             "out_per_sample_s",
             "overhead_vs_gauss",
+            "compute",
+            "device",
             "inversion",
             "standardisation",
             "points",
@@ -349,12 +355,13 @@ def lowrank_section(df):
         "## 3c. Truncated Karhunen-Loeve expansions (Matern A^-2 prior)\n",
         "subspace = randomised subspace iteration on the factor L (Aarset 2024, Alg. 2; 2q + 2 applications); "
         "covariance = range finder on C = L L^T M with Rayleigh-Ritz (2q + 3 applications). Errors against the dense "
-        "eigendecomposition (small problems only).\n",
+        "eigendecomposition (small problems only). '-host' (GPU only): the set-up with NumPy on the host and a CPU "
+        "result (compute='host'); per_sample_s: sampling the expansion where it lives.\n",
     ]
     df = df.assign(platform=platform(df))
     ok = df[df.status == "ok"]
-    cols = [c for c in ("setup_s", "applications", "rank", "eig_rel_err_max", "eig_rel_err_last",
-                        "trace_captured_ratio") if c in ok]
+    cols = [c for c in ("setup_s", "per_sample_s", "result_device", "applications", "rank", "eig_rel_err_max",
+                        "eig_rel_err_last", "trace_captured_ratio") if c in ok]
     last = ok.sort_values("ndof").groupby(["dim", "kind", "order", "platform", "method", "solver"]).tail(1)
     tab = last.set_index(["dim", "kind", "order", "ndof", "platform", "solver", "method"])[cols].sort_index()
     out.append(md(tab.map(_cell), floatfmt="s"))
@@ -370,8 +377,10 @@ def covariance_section(df):
         "Variance: exact = local covariance from all columns (prior) or prior + exact low-rank update (posterior); "
         "lowrank = exact randomised low-rank part + Monte Carlo residual; mc = Monte Carlo. Relative errors at the "
         "quadrature points against the exact local covariance. Trace: relative error against the exact trace; "
-        "applications = applications of L or L^T.\n",
+        "applications = applications of L or L^T. On a GPU, '-host' = the variance set-up with NumPy on the host "
+        "(compute='host') instead of on the device.\n",
     ]
+    df = df.assign(platform=platform(df))
     ok = df[df.status == "ok"]
     for kind in ("variance", "trace"):
         part = ok[ok.method.str.startswith(kind)]
@@ -379,8 +388,8 @@ def covariance_section(df):
             continue
         cols = [c for c in ("setup_s", "applications", "rel_err_rms", "rel_err_max", "stderr_rel_median", "rel_err",
                             "stderr_rel") if c in part and part[c].notna().any()]
-        last = part.sort_values("ndof").groupby(["dim", "kind", "order", "method", "solver"]).tail(1)
-        tab = last.set_index(["dim", "kind", "order", "ndof", "solver", "method"])[cols].sort_index()
+        last = part.sort_values("ndof").groupby(["dim", "kind", "order", "platform", "method", "solver"]).tail(1)
+        tab = last.set_index(["dim", "kind", "order", "ndof", "platform", "solver", "method"])[cols].sort_index()
         out.append(md(tab.map(_cell), floatfmt="s"))
     return "\n".join(out)
 
