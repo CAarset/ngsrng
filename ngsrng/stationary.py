@@ -55,7 +55,8 @@ those elements only.
 
 Samplers have the interface of the other Gaussians (``apply``/``apply_t``/``nrand``/``mean``/``space``, in-place
 ``sample(n, out=)``, seeding, pickling) and can be passed as ``correlation=`` to :func:`ngsrng.default_rng`.
-CPU only; scalar spaces with one element type.
+Scalar spaces with one element type. On a GPU (``device="cuda"``) everything runs there: the FFT, the torus
+Gaussian, the projection and the boundary update.
 """
 
 import copy
@@ -71,7 +72,7 @@ import torch
 from scipy.optimize import brentq
 from scipy.special import kv
 
-from .backend import Rebuildable, available_memory
+from .backend import DeviceCache, Rebuildable, available_memory, device_copy, resolve_device, sparse_to_torch
 from .inplace import InPlace
 from .quadrature import QuadratureRule
 from .seeding import as_source, inherit
@@ -86,6 +87,16 @@ EMBEDDING_GROWTH = 1.25  # circulant embedding: enlarge the periodic grid by thi
 EMBEDDING_MAX_FACTOR = 8  # ... up to this many times the grid (per direction)
 EMBEDDING_TOL = 1e-10  # negative embedding eigenvalues below this fraction of the largest count as rounding
 FFT_BLOCK_VALUES = 2**22  # complex values per FFT block (64 MB): the columns of a block share one transform
+FFT_BLOCK_VALUES_CUDA = 2**24  # on a GPU (256 MB): larger batched transforms
+F64 = torch.float64
+
+
+def _sparse_pair(cache, key, mat, device):
+    """A SciPy matrix and its transpose as float64 sparse tensors on ``device``, made once per device."""
+    k = (key, str(device))
+    if k not in cache:
+        cache[k] = (sparse_to_torch(mat, device, F64), sparse_to_torch(mat.T.tocsr(), device, F64))
+    return cache[k]
 
 
 def matern_function(r, length, nu):
@@ -200,7 +211,8 @@ class _TorusSource:
 
     method = "spde"
 
-    def __init__(self, points, lo, hi, length, nu, tol, resolution, order, rtol, gauss_method):
+    def __init__(self, points, lo, hi, length, nu, tol, resolution, order, rtol, gauss_method, device="cpu",
+                 torch_engine=False):
         from ngsolve.meshes import Make1DMesh, MakeStructured2DMesh, MakeStructured3DMesh
 
         from .gaussian import Gaussian
@@ -225,8 +237,12 @@ class _TorusSource:
         kappa = math.sqrt(8.0 * nu) / length
         spec = matern(kappa, nu + d / 2, _variance_scale(d, length, nu))
         spec.rtol = rtol
-        self.gauss = Gaussian(fes, spec, dtype="float64", seed=0, method=gauss_method)  # randomness comes as eta
+        if torch_engine:  # the Gaussian computes on the same device as the field (a CPU device: the torch engine)
+            gauss_method = {**(gauss_method or {}), "engine": "torch"}
+        self.gauss = Gaussian(fes, spec, dtype="float64", seed=0, method=gauss_method,  # randomness comes as eta
+                              device=device)
         self.e = basis_at(fes, points)[:, self.gauss.space.free].tocsr()
+        self._device = DeviceCache()
         self.nrand = self.gauss.nrand
         self.info = {"padding": self.padding, "box": [float(x) for x in self.box], "cells": n,
                      "ndof": int(self.gauss.space.nfree), "order": order, "gaussian": self.gauss.plan}
@@ -236,6 +252,14 @@ class _TorusSource:
 
     def values_t(self, g):
         return self.gauss.apply_t(torch.from_numpy(np.ascontiguousarray(self.e.T @ g))).numpy()
+
+    def values_torch(self, eta):
+        e, _ = _sparse_pair(self._device, "e", self.e, eta.device)
+        return e @ self.gauss.apply(eta).to(F64)
+
+    def values_t_torch(self, g):
+        _, et = _sparse_pair(self._device, "e", self.e, g.device)
+        return self.gauss.apply_t(et @ g).to(F64)
 
 
 class _Affine1:  # mesh mappings: callable classes, not lambdas (samplers pickle)
@@ -287,6 +311,18 @@ class _DenseSource:
 
     def values_t(self, g):
         return self.r.T @ g
+
+    def _r(self, device):
+        cache = self.__dict__.setdefault("_device", DeviceCache())
+        if str(device) not in cache:
+            cache[str(device)] = torch.from_numpy(np.ascontiguousarray(self.r)).to(device)
+        return cache[str(device)]
+
+    def values_torch(self, eta):
+        return self._r(eta.device) @ eta
+
+    def values_t_torch(self, g):
+        return self._r(g.device).T @ g
 
 
 class _GridSource:
@@ -382,6 +418,43 @@ class _GridSource:
             out[self.M:, j0:j1] = (-a * u.imag).reshape(self.M, -1)
         return out
 
+    # On a torch device: the same maps with the sample axis first, (k, *m), so that cuFFT batches over it.
+
+    def _a(self, device):
+        cache = self.__dict__.setdefault("_device", DeviceCache())
+        if ("a", str(device)) not in cache:
+            cache[("a", str(device))] = torch.from_numpy(np.ascontiguousarray(self.a)).to(device)
+        return cache[("a", str(device))]
+
+    def _blocks_torch(self, k, device):
+        values = FFT_BLOCK_VALUES_CUDA if torch.device(device).type == "cuda" else FFT_BLOCK_VALUES
+        step = max(1, values // self.M)
+        return [(j, min(k, j + step)) for j in range(0, k, step)]
+
+    def values_torch(self, eta):
+        dev, k, d = eta.device, eta.shape[1], len(self.m)
+        w, _ = _sparse_pair(self.__dict__.setdefault("_device", DeviceCache()), "w", self.w, dev)
+        a, crop = self._a(dev), (slice(None),) + self._crop()
+        out = torch.empty((self.w.shape[0], k), dtype=F64, device=dev)
+        for j0, j1 in self._blocks_torch(k, dev):
+            xi = torch.complex(eta[: self.M, j0:j1].T, eta[self.M:, j0:j1].T).reshape(j1 - j0, *self.m)
+            y = torch.fft.fftn(a * xi, dim=tuple(range(1, d + 1))).real[crop]
+            out[:, j0:j1] = w @ y.reshape(j1 - j0, -1).T.contiguous()
+        return out
+
+    def values_t_torch(self, g):
+        dev, k, d = g.device, g.shape[1], len(self.m)
+        _, wt = _sparse_pair(self.__dict__.setdefault("_device", DeviceCache()), "w", self.w, dev)
+        a, crop = self._a(dev), (slice(None),) + self._crop()
+        out = torch.empty((self.nrand, k), dtype=F64, device=dev)
+        for j0, j1 in self._blocks_torch(k, dev):
+            grid = torch.zeros((j1 - j0, *self.m), dtype=F64, device=dev)
+            grid[crop] = (wt @ g[:, j0:j1].contiguous()).T.reshape(j1 - j0, *self.n)
+            u = torch.fft.fftn(grid, dim=tuple(range(1, d + 1)))
+            out[: self.M, j0:j1] = (a * u.real).reshape(j1 - j0, self.M).T
+            out[self.M:, j0:j1] = (-a * u.imag).reshape(j1 - j0, self.M).T
+        return out
+
 
 class StationaryMatern(InPlace, Rebuildable):
     """Matérn Gaussian random function on ``fes`` whose law does not depend on position (see the module docstring):
@@ -396,10 +469,16 @@ class StationaryMatern(InPlace, Rebuildable):
     the field is conditioned on.
     ``method_options``: passed to the torus Gaussian as its ``method`` (solvers, noise). ``seed``: as for every
     sampler (:mod:`ngsrng.seeding`).
+
+    ``device``: "cpu" or a torch device such as "cuda": where the field is computed and sampled. On a GPU everything
+    runs there (the FFT, the torus Gaussian's solves, the projection and the boundary update), the samples are
+    tensors there and their random numbers are drawn there (so, as on the torch engine, seeded draws depend on how
+    a batch is split). ``engine``: "numpy" (the CPU's default) or "torch" (a GPU's; on the CPU only useful for
+    testing the torch code path).
     """
 
     def __init__(self, fes, length, nu=1.0, *, construction=None, method="auto", mean=None, seed=None, tol=1e-3,
-                 resolution=None, max_dense=MAX_DENSE, rtol=1e-7, method_options=None):
+                 resolution=None, max_dense=MAX_DENSE, rtol=1e-7, method_options=None, device="cpu", engine=None):
         if construction not in CONSTRUCTIONS:
             raise ValueError("construction has no default: 'torus' (the Matérn SPDE on a periodic box around the "
                              "domain: exactly stationary, periodised Matérn, sparse) or 'restrict' (the Matérn "
@@ -413,6 +492,13 @@ class StationaryMatern(InPlace, Rebuildable):
                              f"(available: {', '.join(CONSTRUCTIONS[construction])}, or 'auto')")
         if fes.TrialFunction().dim != 1:
             raise NotImplementedError("StationaryMatern needs a scalar space")
+        self.device = resolve_device(device)
+        engine = engine or ("numpy" if self.device.type == "cpu" else "torch")
+        if engine not in ("numpy", "torch"):
+            raise ValueError("engine must be 'numpy' or 'torch'")
+        if engine == "numpy" and self.device.type != "cpu":
+            raise ValueError("the NumPy engine runs on the CPU only")
+        self._torch, self._device = engine == "torch", DeviceCache()
         start = time.perf_counter()
         self.length, self.nu, self.construction, self.tol = float(length), float(nu), construction, float(tol)
         self.space = SpaceInfo(fes)
@@ -434,7 +520,7 @@ class StationaryMatern(InPlace, Rebuildable):
             method = "dense" if len(points) <= max_dense else "fft"
         if method == "spde":
             self._src = _TorusSource(points, lo, hi, self.length, self.nu, self.tol, h, max(1, self.space.order),
-                                     rtol, method_options)
+                                     rtol, method_options, self.device, self._torch)
         elif method == "dense":
             self._src = _DenseSource(points, self.length, self.nu, max_dense)
         else:
@@ -444,7 +530,6 @@ class StationaryMatern(InPlace, Rebuildable):
         self._mass = NGSolveDirect(self._full, mass_form)
         self._mean = np.zeros(fes.ndof) if mean is None else coefficient_vector(mean, self.space)
         self.source = as_source(seed)
-        self.device = torch.device("cpu")
         self._prior = None
         self._maps, self._post_maps, self._conditioning = [], [], []  # derived samplers
         # the boundary update: condition on the Dirichlet dofs (the used dofs that are not free)
@@ -456,7 +541,7 @@ class StationaryMatern(InPlace, Rebuildable):
                      "quadrature_points": int(len(points)), "source": self._src.info,
                      "conditioning": None if self._cond is None else {"dirichlet_dofs": int(self._dir.size),
                                                                        "mode": self._cond[0]},
-                     "setup_s": None}
+                     "device": str(self.device), "engine": engine, "setup_s": None}
         self.plan["setup_s"] = round(time.perf_counter() - start, 3)
         # pointwise families standardise a conditioned field by the field it was conditioned from (as posteriors by
         # their prior): here the field before the boundary update (ngsrng.distributions.pointwise)
@@ -485,13 +570,89 @@ class StationaryMatern(InPlace, Rebuildable):
         z[used] = self._mass.apply(torch.from_numpy(np.ascontiguousarray(y[used]))).numpy()
         return self._src.values_t(np.ascontiguousarray(self._b.T @ z))
 
+    # ---- the same on a torch device (float64 tensors there) ----
+    @property
+    def torch_device(self):
+        """The torch device this field computes on, or None (NumPy on the CPU)."""
+        return self.device if self._torch else None
+
+    def _projection_ops(self, device):
+        """B on the used dofs (n_used x npoints) and its transpose, a mass solver (cuDSS, or Jacobi PCG without
+        it) and the used dofs' indices, on ``device``."""
+        key = ("projection", str(device))
+        if key not in self._device:
+            from .solvers import device_spd_solver
+
+            used = self._full.free
+            b = self._b[used].tocsr()
+            self._device[key] = (sparse_to_torch(b, device, F64), sparse_to_torch(b.T.tocsr(), device, F64),
+                                 device_spd_solver(self._full.mass_free, device), torch.from_numpy(used).to(device))
+        return self._device[key]
+
+    def _project_torch(self, eta):
+        b, _, mass, used = self._projection_ops(eta.device)
+        out = torch.zeros((self.space.ndof, eta.shape[1]), dtype=F64, device=eta.device)
+        out[used] = mass.apply(b @ self._src.values_torch(eta))
+        return out
+
+    def _project_t_torch(self, y):
+        _, bt, mass, used = self._projection_ops(y.device)
+        return self._src.values_t_torch((bt @ mass.apply(y[used])).contiguous())
+
+    def _sigma_torch(self, x_full):
+        """Sigma x for full-dof columns x (before the boundary update), on x's device."""
+        return self._project_torch(self._project_t_torch(x_full))
+
+    def _cond_ops(self, device):
+        """The boundary update's dense regression, or the Cholesky factor of Sigma_DD (lower), on ``device``."""
+        key = ("conditioning", str(device))
+        if key not in self._device:
+            mode, op = self._cond
+            mat = op if mode == "dense" else np.tril(op[0])
+            self._device[key] = torch.from_numpy(np.ascontiguousarray(mat)).to(device)
+        return self._device[key]
+
+    def _base_apply_torch(self, x):
+        free = device_copy(self, self.space.free, x.device)
+        c = self._project_torch(x)
+        out = c[free]
+        if self._cond is not None:
+            op, dirichlet = self._cond_ops(x.device), device_copy(self, self._dir, x.device)
+            cd = c[dirichlet]
+            if self._cond[0] == "dense":
+                out = out - op @ cd
+            else:
+                z = torch.zeros_like(c)
+                z[dirichlet] = torch.cholesky_solve(cd, op)
+                out = out - self._sigma_torch(z)[free]
+        return out
+
+    def _base_apply_t_torch(self, v):
+        free = device_copy(self, self.space.free, v.device)
+        full = torch.zeros((self.space.ndof, v.shape[1]), dtype=F64, device=v.device)
+        full[free] = v
+        if self._cond is not None:
+            op, dirichlet = self._cond_ops(v.device), device_copy(self, self._dir, v.device)
+            if self._cond[0] == "dense":
+                full[dirichlet] = -op.T @ v
+            else:
+                z = torch.zeros_like(full)
+                z[free] = v
+                full[dirichlet] = -torch.cholesky_solve(self._sigma_torch(z)[dirichlet], op)
+        return self._project_t_torch(full)
+
     def _setup_conditioning(self):
         """Sigma_DD (n_D applications of the factor and its transpose) and its Cholesky factor; the regression
         Sigma_FD Sigma_DD^-1 when it is small."""
         nd, nf, ndof = self._dir.size, self.space.nfree, self.space.ndof
-        e = np.zeros((ndof, nd))
-        e[self._dir, np.arange(nd)] = 1.0
-        cols = self._project(self._project_t(e))  # Sigma[:, D], all dofs
+        if self._torch:  # the n_D applications on the device; Sigma[:, D] comes back once
+            e = torch.zeros((ndof, nd), dtype=F64, device=self.device)
+            e[torch.from_numpy(self._dir).to(self.device), torch.arange(nd, device=self.device)] = 1.0
+            cols = self._sigma_torch(e).cpu().numpy()
+        else:
+            e = np.zeros((ndof, nd))
+            e[self._dir, np.arange(nd)] = 1.0
+            cols = self._project(self._project_t(e))  # Sigma[:, D], all dofs
         sdd = cols[self._dir]
         sdd = 0.5 * (sdd + sdd.T)
         chol = sla.cho_factor(sdd + 1e-14 * np.trace(sdd) / nd * np.eye(nd), lower=True)
@@ -523,24 +684,24 @@ class StationaryMatern(InPlace, Rebuildable):
     def apply(self, eta: torch.Tensor) -> torch.Tensor:
         """eta (nrand x k) -> zero-mean free-dof coefficients (nfree x k). Derived samplers (posteriors) apply their
         noise-space maps before and their FE-space maps after the field's factor, as ``Gaussian`` does."""
-        x = eta.detach().cpu().double()
+        x = eta.detach().to(self.device, F64) if self._torch else eta.detach().cpu().double()
         squeeze = x.ndim == 1
         x = x[:, None] if squeeze else x
         for m in reversed(self._maps):
             x = m.apply_torch(x)
-        c = self._base_apply(x)
+        c = self._base_apply_torch(x) if self._torch else self._base_apply(x)
         for pm in self._post_maps:
             c = pm.apply_torch(c)
         return c[:, 0] if squeeze else c
 
     def apply_t(self, y: torch.Tensor) -> torch.Tensor:
         """Adjoint of ``apply``: (nfree x k) -> (nrand x k)."""
-        x = y.detach().cpu().double()
+        x = y.detach().to(self.device, F64) if self._torch else y.detach().cpu().double()
         squeeze = x.ndim == 1
         x = x[:, None] if squeeze else x
         for pm in reversed(self._post_maps):
             x = pm.apply_t_torch(x)
-        eta = self._base_apply_t(x)
+        eta = self._base_apply_t_torch(x) if self._torch else self._base_apply_t(x)
         for m in self._maps:
             eta = m.apply_torch(eta)
         return eta[:, 0] if squeeze else eta
@@ -582,11 +743,21 @@ class StationaryMatern(InPlace, Rebuildable):
         return torch.from_numpy(out[:, 0] if squeeze else out)
 
     def sample(self, n=None, out=None):
-        """One sample (GridFunction) or n samples (ndof x n, float64). ``out``: an ndof x n buffer filled in place and
-        returned (:mod:`ngsrng.inplace`)."""
+        """One sample (GridFunction) or n samples (ndof x n, float64; on the field's device). ``out``: an ndof x n
+        buffer filled in place and returned (:mod:`ngsrng.inplace`)."""
         if out is not None:
             return self._sample_out(n, out)
         ns = 1 if n is None else int(n)
+        if self._torch:  # the noise on the device: nrand is large for the FFT construction (twice the periodic grid)
+            dev = self.device
+            eta = torch.randn((self.nrand, ns), generator=self.source.streams().torch(dev), device=dev, dtype=F64)
+            x = device_copy(self, self._mean, dev, F64)[:, None].repeat(1, ns)
+            x[device_copy(self, self.space.free, dev)] += self.apply(eta)
+            if n is None:
+                gf = ngs.GridFunction(self.space.fes)
+                gf.vec.FV().NumPy()[:] = x[:, 0].cpu().numpy()
+                return gf
+            return x
         zeta = self.source.streams().numpy().standard_normal((ns, self.nrand)).T  # sample by sample: chunking-free
         x = np.repeat(self._mean[:, None], ns, axis=1)
         x[self.space.free] += self.apply(torch.from_numpy(zeta)).numpy()
@@ -620,4 +791,4 @@ class StationaryMatern(InPlace, Rebuildable):
 
     def __repr__(self):
         return f"StationaryMatern(length={self.length}, nu={self.nu}, construction={self.construction!r}, " \
-               f"method={self.method!r}, nrand={self.nrand})"
+               f"method={self.method!r}, nrand={self.nrand}, device={str(self.device)!r})"

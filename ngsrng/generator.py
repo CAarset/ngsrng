@@ -23,8 +23,9 @@ On a GPU the draws never leave it: point evaluation, the transforms, the project
 ``bnd=``, KL expansions, posteriors and their set-ups all run there. ``compute=`` (per call) chooses where a pointwise
 family or a KL expansion does this work: "auto" (the GPU, if the Gaussian has one and the family a torch path),
 "host" (NumPy and NGSolve on the CPU, the samples copied there) or "device" (the Gaussian's torch device, required).
-Families without a torch path (user functions in ``transformed``, scipy quantiles for shape parameters that vary in
-space or ``method="ppf"``) always compute on the host.
+Families without a torch path always compute on the host: scipy quantiles (shape parameters that vary in space,
+``method="ppf"``) and your own NumPy functions in ``transformed`` (NumPy ufuncs and torch functions are recognised and
+run on the device; ``torch=True`` declares your own function written for torch tensors).
 
 Algorithms are chosen automatically for every family (and never change its law); ``info(name, ...)`` or
 ``distribution(name, ...).info`` report the choice.
@@ -472,8 +473,8 @@ class Generator:
         if key not in self._gaussians:
             if isinstance(spec, OperatorCovariance):  # a KL expansion (computed with NumPy), sampling on the device
                 gauss = spec.bind(self.fes, seed=self._seed(), device=self.device)
-            elif isinstance(spec, MaternCorrelation) and spec.stationary:
-                gauss = spec.bind(self.fes, seed=self._seed())  # a sampler of its own (StationaryMatern: CPU, float64)
+            elif isinstance(spec, MaternCorrelation) and spec.stationary:  # a sampler of its own, on the device
+                gauss = spec.bind(self.fes, seed=self._seed(), device=self.device)
             else:
                 bound = spec.bind(self.fes) if hasattr(spec, "bind") else spec
                 if not isinstance(bound, (PDEPrecision, AssembledPrecision, OperatorPrecision)):
@@ -645,8 +646,8 @@ class Generator:
             p = params({"level": 0.0, "standardize": True})
             return indicator(pts(), p["level"], p["standardize"], representation=rep)
         if name == "transformed":
-            p = params({"func": REQUIRED, "standardize": False})
-            return transformed(pts(), p["func"], p["standardize"], representation=rep)
+            p = params({"func": REQUIRED, "standardize": False, "torch": None})
+            return transformed(pts(), p["func"], p["standardize"], representation=rep, torch=p["torch"])
         if name == "marginal":
             return marginal(pts(), params({"dist": REQUIRED})["dist"], method=method, tol=tol, representation=rep)
         if name.startswith("scipy:"):
@@ -881,7 +882,12 @@ class Generator:
         return self.sample("indicator", level, size=size, **kwargs)
 
     def transformed(self, func, size=None, **kwargs):
-        """Pointwise map func(g) of the Gaussian point values (NumPy)."""
+        """Pointwise map func(g) of the Gaussian point values (``standardize=True``: of the standardised values).
+
+        func gets the array type it is written for, on any device: NumPy ufuncs (``np.tanh``) run as their torch twins
+        on a GPU, torch functions (``torch.tanh``) get torch tensors (CPU tensors on the CPU engine); pass
+        ``torch=True`` for your own function written for torch tensors. Any other function gets NumPy arrays, so on a
+        GPU the values are copied to the host for it."""
         return self.sample("transformed", func, size=size, **kwargs)
 
     def marginal(self, dist, size=None, **kwargs):

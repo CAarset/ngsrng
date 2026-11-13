@@ -92,14 +92,14 @@ class MaternCorrelation:
     def kappa(self) -> float:
         return sqrt(8.0 * self.nu) / self.length
 
-    def bind(self, fes, seed=None):
+    def bind(self, fes, seed=None, device="cpu"):
         """The precision on ``fes`` (a :class:`ngsrng.PDEPrecision`), or, for boundary="torus" / "restrict", the
-        sampler itself (a :class:`ngsrng.StationaryMatern`, with randomness ``seed``)."""
+        sampler itself (a :class:`ngsrng.StationaryMatern`, with randomness ``seed``, computing on ``device``)."""
         if self.stationary:
             from .stationary import StationaryMatern
 
             return StationaryMatern(fes, self.length, self.nu, construction=self.boundary, seed=seed, rtol=self.rtol,
-                                    **self.options)
+                                    **{"device": device, **self.options})
         d = fes.mesh.dim
         kappa = self.kappa()
         power = self.nu + d / 2

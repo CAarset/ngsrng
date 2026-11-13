@@ -283,9 +283,10 @@ def indicator(points, level=0.0, standardize=True, representation="quadrature"):
                          label="indicator")
 
 
-def transformed(points, func, standardize=False, representation="quadrature"):
-    """General pointwise map f = func(g) of NumPy point values (``standardize=True``: of z)."""
-    return MarginalField(points, PointMap(func), standardize=standardize, representation=representation,
+def transformed(points, func, standardize=False, representation="quadrature", torch=None):
+    """General pointwise map f = func(g) of the point values (``standardize=True``: of z). ``torch``: whether func
+    is written for torch tensors (see :class:`PointMap`; None: recognised for NumPy ufuncs and torch functions)."""
+    return MarginalField(points, PointMap(func, torch), standardize=standardize, representation=representation,
                          label="transformed")
 
 
@@ -294,14 +295,51 @@ def _exceeds(g, xp, level):
 
 
 class PointMap:
-    """A user's pointwise map of NumPy values, as a transform (it pickles if ``func`` does: a module-level function,
-    not a lambda)."""
+    """A user's pointwise map, as a transform (it pickles if ``func`` does: a module-level function, not a lambda).
 
-    def __init__(self, func):
+    The values come as NumPy arrays or torch tensors, whichever ``func`` is written for, on whatever device the field
+    computes:
+
+    - a NumPy ufunc with a torch twin of the same name (``np.tanh``, ``np.exp``, ``np.sqrt``, ...): NumPy values on
+      the host, the twin (``torch.tanh``, ...) on a torch device;
+    - a torch function (``torch.tanh``, ``torch.special.expit``, ...), or any function with ``torch=True``: torch
+      tensors on the field's device, CPU tensors (sharing the NumPy values' memory) on the host;
+    - any other function: NumPy values, so on a GPU the values make a round trip to the host for this step.
+    """
+
+    def __init__(self, func, torch=None):
         self.func = func
+        if torch is None:
+            module = getattr(func, "__module__", None) or ""
+            torch = module == "torch" or module.startswith("torch.")
+        self.torch_func = bool(torch)
+        self.twin = _torch_twin(func) if not self.torch_func else None
+
+    @property
+    def torch_capable(self) -> bool:
+        return self.torch_func or self.twin is not None
 
     def __call__(self, x, xp):
-        return self.func(x)
+        if not xp.torch:
+            if not self.torch_func:
+                return self.func(x)
+            out = self.func(torch.from_numpy(np.ascontiguousarray(x)))
+            return out.numpy() if isinstance(out, torch.Tensor) else np.asarray(out)
+        if self.twin is not None:
+            return getattr(torch, self.twin)(x)
+        out = self.func(x)
+        if not isinstance(out, torch.Tensor):
+            raise TypeError(f"transformed: {getattr(self.func, '__name__', self.func)!r} returned "
+                            f"{type(out).__name__} for a torch tensor (torch=True promises torch tensors back)")
+        return out
+
+
+def _torch_twin(func):
+    """The name of torch's function of the same name as a unary NumPy ufunc (None for anything else)."""
+    if isinstance(func, np.ufunc) and func.nin == 1 and func.nout == 1 and callable(getattr(torch, func.__name__,
+                                                                                                None)):
+        return func.__name__
+    return None
 
 
 class DirichletField(PointwiseField):

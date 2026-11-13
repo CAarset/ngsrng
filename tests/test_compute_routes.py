@@ -127,8 +127,8 @@ def test_compute_option_errors(fes):
     with pytest.raises(ValueError, match="torch device"):
         cpu.uniform(size=2, compute="device")
     rng = ngsrng.default_rng(fes, seed=1, correlation=0.3, method={"engine": "torch"})
-    with pytest.raises(ValueError, match="no torch path"):
-        rng.transformed(np.tanh, size=2, compute="device")
+    with pytest.raises(ValueError, match="no torch path"):  # a user's NumPy function (np.tanh itself is recognised)
+        rng.transformed(lambda x: 1 / (1 + np.exp(-x)), size=2, compute="device")
     with pytest.raises(ValueError, match="applies to pointwise families"):
         rng.standard_t(4, size=2, compute="host")
     with pytest.raises(ValueError, match="compute must be"):
@@ -236,3 +236,97 @@ def test_correlated_gaussian_fields_stay_on_the_device(gauss, fes):
     if gauss.device.type == "cuda":
         assert isinstance(a, torch.Tensor) and a.device.type == "cuda"
     assert a.shape == b.shape == (4, fes.ndof)
+
+
+# ------------------------------------------------------------------ precision, user transforms, stationary fields
+
+
+@pytest.mark.parametrize("power", [1, 2, 3])
+def test_apply_precision_on_the_input_device(fes, power):
+    """A block on a GPU is processed there, with the host's result; CPU blocks as before. The Gaussian pickles
+    afterwards (its host operators used to hold lambdas)."""
+    g = ngsrng.Gaussian(fes, ngsrng.matern(5.0, power), dtype="float64", seed=1)
+    c = torch.randn(g.space.nfree, 3, dtype=torch.float64)
+    host = g.apply_precision(c)
+    assert host.device.type == "cpu"
+    pickle.loads(pickle.dumps(g))
+    if cuda_usable():
+        on = g.apply_precision(c.cuda())
+        assert on.device.type == "cuda" and rel(on, host) < 1e-12
+        assert rel(g.apply_precision(c[:, 0].cuda()), host[:, 0]) < 1e-12
+
+
+def _own_torch(x):  # a user's function written for torch tensors
+    return torch.special.expit(2 * x)
+
+
+def _own_numpy(x):
+    return 1 / (1 + np.exp(-2 * x))
+
+
+@pytest.mark.parametrize("func, kw, capable", [(np.tanh, {}, True), (torch.tanh, {}, True),
+                                               (_own_torch, {"torch": True}, True), (_own_numpy, {}, False)],
+                         ids=["np.tanh", "torch.tanh", "own-torch", "own-numpy"])
+def test_transformed_dispatches_by_function(gauss, fes, func, kw, capable):
+    """NumPy ufuncs and torch functions are recognised; torch=True declares a torch function of one's own. Each runs
+    on whatever device the field computes on and gives the host route's values; a NumPy function stays on the host."""
+    dh, xh = _draw(gauss, fes, "transformed", (func,), compute="host", **kw)
+    if not capable:
+        assert not dh.field.torch_capable
+        with pytest.raises(ValueError, match="no torch path"):
+            _draw(gauss, fes, "transformed", (func,), compute="device", **kw)
+        return
+    dd, xd = _draw(gauss, fes, "transformed", (func,), compute="device", **kw)
+    assert dd.field.on_device and rel(xd, xh) < 1e-12
+    ref = _draw(gauss, fes, "transformed", (_own_numpy if func is _own_torch else np.tanh,), compute="host")[1]
+    assert rel(xh, ref) < 1e-12  # the same map, whichever array type it is written for
+
+
+def test_transformed_torch_function_on_the_cpu_engine(fes):
+    rng = ngsrng.default_rng(fes, seed=1, correlation=0.3)  # NGSolve engine: NumPy values, wrapped as CPU tensors
+    torch.manual_seed(0)
+    a = rng.transformed(torch.tanh, size=3)
+    rng = ngsrng.default_rng(fes, seed=1, correlation=0.3)
+    torch.manual_seed(0)
+    assert isinstance(a, np.ndarray) and rel(a, rng.transformed(np.tanh, size=3)) < 1e-14
+
+
+def test_transformed_torch_promise_is_checked():
+    from ngsrng.distributions.pointwise import XP
+    from ngsrng.distributions.transforms import PointMap
+
+    with pytest.raises(TypeError, match="torch=True promises"):
+        PointMap(lambda x: np.asarray(x), torch=True)(torch.zeros(3), XP(True))
+
+
+STATIONARY = [("restrict", "dense"), ("restrict", "fft"), ("torus", "spde")]
+
+
+@pytest.mark.parametrize("construction, method", STATIONARY)
+@pytest.mark.parametrize("dirichlet", ["", "left"])
+def test_stationary_matern_torch_path_equals_numpy(construction, method, dirichlet):
+    """The torch code path (the torch engine on the CPU; and on CUDA) of every construction, with and without the
+    Dirichlet boundary update, against the NumPy path on the same random input."""
+    fes = ngs.H1(ngs.Mesh(ngs.unit_square.GenerateMesh(maxh=0.25)), order=1, dirichlet=dirichlet)
+    kw = dict(construction=construction, method=method, seed=1, resolution=0.15)
+    host = ngsrng.StationaryMatern(fes, 0.4, 1.0, **kw)
+    devices = [("cpu", "torch")] + ([("cuda", None)] if cuda_usable() else [])
+    eta = torch.randn(host.nrand, 3, dtype=torch.float64)
+    y = torch.randn(host.space.nfree, 3, dtype=torch.float64)
+    for device, engine in devices:
+        f = ngsrng.StationaryMatern(fes, 0.4, 1.0, device=device, engine=engine, **kw)
+        # the torus Gaussian solves by Jacobi PCG on the CPU torch engine (tol 1e-8), by cuDSS on CUDA
+        tol = 1e-6 if (method == "spde" and device == "cpu") else 1e-9
+        assert rel(f.apply(eta), host.apply(eta)) < tol and rel(f.apply_t(y), host.apply_t(y)) < tol
+        x = f.sample(3)
+        assert x.device.type == device and x.shape == (fes.ndof, 3)
+        assert rel(pickle.loads(pickle.dumps(f)).apply(eta), f.apply(eta)) < 1e-12
+
+
+@cuda
+def test_stationary_matern_follows_the_generator_device(fes):
+    rng = ngsrng.default_rng(fes, seed=0, device="cuda",
+                             correlation=ngsrng.matern_correlation(0.3, nu=1, boundary="restrict"))
+    u = rng.uniform(size=4)  # unchanged syntax: the field and the transform on the GPU
+    assert rng.gaussian().device.type == "cuda" and u.device.type == "cuda" and rng.info("uniform")["device"] == "gpu"
+    assert float(u.min()) > 0 and float(u.max()) < 1

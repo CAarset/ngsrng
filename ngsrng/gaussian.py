@@ -12,6 +12,7 @@ import torch
 from . import noise as nz
 from . import tuning as tn
 from .backend import (
+    DeviceCache,
     NormalStream,
     Rebuildable,
     Scratch,
@@ -36,6 +37,7 @@ from .solvers import (
     TorchAMGPCG,
     TorchPCG,
     cudss_available,
+    device_spd_solver,
     pyamg_available,
 )
 from .space import SpaceInfo, mass_form
@@ -662,12 +664,14 @@ class Gaussian(InPlace, Rebuildable):
         return self._cpu_torch["mass"]
 
     def apply_precision(self, c: torch.Tensor) -> torch.Tensor:
-        """Prior precision Sigma^-1 (primal -> dual) on free-dof vectors (nfree x k), returned in float64 on the CPU.
+        """Prior precision Sigma^-1 (primal -> dual) on free-dof vectors (nfree x k), in float64 on ``c``'s device.
 
         Integer-power PDE priors: Sigma^-1 = scale^-2 K (M^-1 K)^(power-1), using a sparse factorisation of M
         (diagonal M is free). Assembled precisions: scale^-2 Q. Apply-only precisions: their own action (on the
-        solver device). Fractional powers are sampled through a rational approximation whose precision has no closed
-        form, so they raise NotImplementedError.
+        solver device). A block on a GPU is processed there (K as a sparse matrix on the device; M^-1 by cuDSS, or by
+        Jacobi PCG to a relative residual of 1e-13 where cuDSS is missing); a CPU block with SciPy and NGSolve.
+        Fractional powers are sampled through a rational approximation whose precision has no closed form, so they
+        raise NotImplementedError.
         """
         if self._maps or self._post_maps:
             raise ValueError("apply_precision is defined for priors, not for conditioned Gaussians")
@@ -677,26 +681,48 @@ class Gaussian(InPlace, Rebuildable):
                                       "closed form")
         if isinstance(self.spec, OperatorPrecision):
             x = c[:, None] if c.ndim == 1 else c
-            out = self._apply_q(x.to(self._solver_device, self._work_dtype)).double().cpu() / self.scale**2
+            out = self._apply_q(x.to(self._solver_device, self._work_dtype)).to(c.device, torch.float64)
+            out = out / self.scale**2
             return out[:, 0] if c.ndim == 1 else out
-        s = self.space
-        x = c.detach().cpu().double().numpy()
+        power = self.spec.power if isinstance(self.spec, PDEPrecision) else 1
+        k, m = self._precision_ops(c.device, mass=power > 1)
+        if c.device.type != "cpu":
+            x = c.detach().to(torch.float64)
+            x = x[:, None] if x.ndim == 1 else x
+            v = k @ x
+            for _ in range(power - 1):
+                v = k @ (v / m if isinstance(m, torch.Tensor) else m.apply(v))
+            out = v / self.scale**2
+            return out[:, 0] if c.ndim == 1 else out
+        x = c.detach().double().numpy()
         x = x[:, None] if x.ndim == 1 else x
-        if not hasattr(self, "_prec_ops"):
-            k = s.assemble_free(self.spec.form)
-            if s.mass_is_diagonal:
-                dm = s.mass_free.diagonal()
-                minv = lambda v: v / dm[:, None]  # noqa: E731
-            else:
-                ms = NGSolveDirect(s, mass_form)
-                minv = lambda v: ms.apply(torch.from_numpy(v)).numpy()  # noqa: E731
-            self._prec_ops = (k, minv)
-        k, minv = self._prec_ops
         v = k @ x
-        for _ in range((self.spec.power if isinstance(self.spec, PDEPrecision) else 1) - 1):
-            v = k @ minv(v)
+        for _ in range(power - 1):
+            v = k @ (v / m if isinstance(m, np.ndarray) else m.apply(torch.from_numpy(v)).numpy())
         out = torch.from_numpy(np.ascontiguousarray(v / self.scale**2))
         return out[:, 0] if c.ndim == 1 else out
+
+    def _precision_ops(self, device, mass=True):
+        """(K, M^-1) for apply_precision: K on the free dofs (SciPy, or a sparse tensor on a GPU) and, if ``mass``,
+        the mass matrix's inverse as its diagonal (``(n, 1)``) or a solver (NGSolve, or cuDSS / Jacobi PCG on a GPU).
+        Host ops are kept with the Gaussian (they pickle); device ops in a cache that pickles empty."""
+        s = self.space
+        if not hasattr(self, "_prec_ops"):
+            dm = s.mass_free.diagonal()[:, None] if s.mass_is_diagonal else None
+            self._prec_ops = (s.assemble_free(self.spec.form), dm)
+        k, dm = self._prec_ops
+        if torch.device(device).type == "cpu":
+            if mass and dm is None:
+                self._prec_ops = k, dm = k, NGSolveDirect(s, mass_form)
+            return k, dm
+        cache = self.__dict__.setdefault("_precision_device", DeviceCache())
+        key = str(device)
+        if key not in cache:
+            cache[key] = [sparse_to_torch(k, device, torch.float64), None]
+        if mass and cache[key][1] is None:
+            cache[key][1] = (torch.from_numpy(np.ascontiguousarray(dm)).to(device) if isinstance(dm, np.ndarray)
+                             else device_spd_solver(s.mass_free, device, torch.float64))
+        return cache[key]
 
     def _derive(self, label, mean=None, *, eta_map=None, post_map=None, seed=None, exact=None):
         """A new Gaussian sharing this one's pipeline, with an extra noise-space or FE-space map and/or a new mean.

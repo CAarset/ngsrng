@@ -188,14 +188,15 @@ generator reports its choices: `rng.info(...)` and `Gaussian(...).plan`.
 - **Point values need some smoothness.** Matérn ν must be positive for the point-value families.
 - **Precision.** Results are float32 by default, but every computation runs in float64. Pass `dtype="float64"` for
   double-precision output.
-- **On a GPU, samples stay on the GPU**, through every family, FE representation, KL expansion and posterior
-  (stationary Matérn fields excepted, below). Two cases copy them to the CPU for one step: families that need scipy
-  (shape parameters that vary in space, `method="ppf"`) and your own NumPy function (`transformed`).
+- **On a GPU, samples stay on the GPU**, through every family, FE representation, KL expansion, posterior and
+  stationary Matérn field. Two cases copy them to the CPU for one step: families that need scipy (shape parameters
+  that vary in space, `method="ppf"`) and your own NumPy function in `transformed` (NumPy's and torch's own
+  functions, such as `np.tanh`, stay on the GPU; `torch=True` declares a function of your own written for torch).
 - **Covariances given only as operators** are sampled by truncated expansions, so their samples are slightly
   smoother than the true field.
 - **A `BilinearForm` is a precision, not a covariance.** ngsrng warns if you pass one as a covariance.
-- **Stationary Matérn fields** run on the CPU only, for scalar spaces with one element type. Their correlations use
-  Euclidean distance, also across holes.
+- **Stationary Matérn fields** need a scalar space with one element type. Their correlations use Euclidean
+  distance, also across holes.
 - **Reproducibility.**
   - Same seed on the same machine: identical up to rounding.
   - Across machines, solvers or versions: the same law, but different numbers.
