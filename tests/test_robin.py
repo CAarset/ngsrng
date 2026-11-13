@@ -76,8 +76,8 @@ def test_layer_quadrature_integrates_the_layer():
 
 def test_device_and_engine_do_not_change_the_estimate(square):
     """The torch engine (the GPU's code path, here on the CPU) gives the CPU engine's estimate."""
-    a = ngsrng.tune_robin(square, 0.5, 1.0)
-    b = ngsrng.tune_robin(square, 0.5, 1.0, method={"engine": "torch"})
+    a = ngsrng.tune_robin(square, 0.5, 1.0, device="cpu")  # "auto" would take a GPU where one is usable
+    b = ngsrng.tune_robin(square, 0.5, 1.0, device="cpu", method={"engine": "torch"})
     assert b.beta == pytest.approx(a.beta, rel=2e-3) and a.device == "cpu"
     assert ngsrng.tune_robin(square, 0.5, 1.0, device="cpu") is a  # cached per device
 

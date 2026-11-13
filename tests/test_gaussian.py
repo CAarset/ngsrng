@@ -246,8 +246,9 @@ def test_float64_arithmetic_by_default():
     if cuda_usable():
         with pytest.warns(UserWarning, match="single precision"):
             g = ngsrng.Gaussian(fes, ngsrng.matern(3.0), device="cuda", method={"work_dtype": "float32"})
-        assert g._work_dtype == torch.float32 and g._platform == "cuda-f32"
-        assert ngsrng.Gaussian(fes, ngsrng.matern(3.0), device="cuda")._platform == "cuda-f64"
+        # GPU tables are per device (tuning format 2): the platform names the card
+        assert g._work_dtype == torch.float32 and g._platform.startswith("cuda-f32@")
+        assert ngsrng.Gaussian(fes, ngsrng.matern(3.0), device="cuda")._platform.startswith("cuda-f64@")
 
 
 @pytest.mark.parametrize("noise,expected", [("lumped", "relative covariance error"), ("chebyshev", "1e-08")])
