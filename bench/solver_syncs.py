@@ -48,7 +48,7 @@ import ngsrng  # noqa: E402
 from ngsrng.blackbox import MultiShiftPCG  # noqa: E402
 from ngsrng.calibration.common import make_space  # noqa: E402
 from ngsrng.distributions.mixtures import torch_gamma  # noqa: E402
-from ngsrng.solvers import TorchAMGPCG, TorchPCG, pyamg_available  # noqa: E402
+from ngsrng.solvers import TorchAMGPCG, TorchPCG, device_spd_solver, pyamg_available  # noqa: E402
 from ngsrng.space import SpaceInfo  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -290,8 +290,9 @@ def run_solvers(fes, args, dev, fh, recs):
             if graph_error:
                 _finish({"case": label, "variant": "graph-8", "ndof": s.ndof, "width": width, "error": graph_error},
                         None, fh, recs)
-    # multi-shift PCG (apply-only precisions): 12 shifts over the spectrum's range, M^-1 by Jacobi PCG
-    mass = TorchPCG(s.mass_free, dev, F64, tol=1e-13)
+    # multi-shift PCG (apply-only precisions): 12 shifts over the spectrum's range; M^-1 as in production on this
+    # GPU (cuDSS on NVIDIA GPUs, Jacobi PCG on AMD ones), so that the outer loop's synchronisations are measured
+    mass = device_spd_solver(s.mass_free, dev, F64)
     q = cases[0][2]
     shifts, weights = np.geomspace(1e-2, 1e4, 12), np.ones(12)
     for width in args.widths:

@@ -25,6 +25,7 @@ default route (``compute`` / the KL, posterior and covariance set-ups default to
 """
 
 import argparse
+import gc
 import json
 import os
 import socket
@@ -42,7 +43,9 @@ import torch  # before ngsolve
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import ngsrng  # noqa: E402
 from ngsrng.calibration.common import make_space  # noqa: E402
+from ngsrng.inplace import chunks  # noqa: E402
 from ngsrng.quadrature import QuadratureRule  # noqa: E402
+from ngsrng.seeding import one_draw  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TIE = 1.10  # within 10%: a tie
@@ -129,10 +132,25 @@ def cases(fes, g, args):
                 "dist": dist}
 
     buf = torch.empty((k, space.ndof), device="cuda", dtype=g.dtype)
+
+    def old_fill():
+        """sample_into before the device fix: per chunk, the pre-fix sample() -- the mean and the free-dof indices
+        uploaded from the host on every call, a full-size intermediate -- and a copy; as one draw (as sample_into
+        is), so that both routes draw the same numbers."""
+        with one_draw():
+            for k0, k1 in chunks(k, g._per_sample(), g.work_values, g._min_chunk()):
+                n = k1 - k0
+                eta = torch.randn(g.nrand, n, generator=g.generator, device=g.device, dtype=g._work_dtype)
+                c = g.apply(eta).to(g.dtype)
+                full = torch.from_numpy(g._mean).to(g.device, g.dtype)[:, None].repeat(1, n)
+                full[torch.from_numpy(g.space.free).to(g.device)] += c
+                buf[k0:k1].copy_(full.T)
+        return buf.clone()
+
     out = {
-        "1 in-place fill (direct) vs sample + copy": {
+        "1 in-place fill: direct vs pre-fix fill": {
             "device": seeded(lambda: g.sample_into(buf).clone()),
-            "host": seeded(lambda: buf.copy_(g.sample(k).T).clone()),
+            "host": seeded(old_fill),
         },
         "2 uniform, quadrature points": family("uniform"),
         "2 gamma(2), quadrature points (table)": family("gamma", 2.0, method="table"),
@@ -158,9 +176,11 @@ def cases(fes, g, args):
     }
     kl_family = family("karhunen_loeve", rank=args.rank)
 
-    def kl_covariance(c):  # mode signs depend on the eigensolver: compare the covariances the two fields sample
-        f = kl_family["dist"](c).field
-        return f.scaled_modes @ f.scaled_modes.T
+    probes = np.random.default_rng(0).standard_normal((space.nfree, 8))
+
+    def kl_covariance(c):  # the modes depend on the eigensolver (signs; rotations within degenerate eigenspaces):
+        w = kl_family["dist"](c).field.scaled_modes  # compare the covariance W W^T through probes, O(nfree rank)
+        return w @ (w.T @ probes)
     out["3 KL family sampling (rank %d)" % args.rank] = {
         **kl_family, "compare": (lambda: kl_covariance("auto"), lambda: kl_covariance("host"))}
 
@@ -175,10 +195,11 @@ def cases(fes, g, args):
         "host": lambda: ngsrng.MatheronPosterior(obs(), data=np.ones(args.obs), compute="host").mean,
         "setup": True,
     }
-    eta = once("eta", lambda: torch.randn(g.nrand + args.obs, k, device="cuda", dtype=torch.float64))
+    def eta():  # the same noise for both routes (made with the case, released with it)
+        return once("eta", lambda: torch.randn(g.nrand + args.obs, k, device="cuda", dtype=torch.float64))
     out[f"3 Matheron sampling ({args.obs} points)"] = {
         "device": lambda: matheron("auto").sample(k), "host": lambda: matheron("host").sample(k).to("cuda"),
-        "compare": (lambda: matheron("auto").apply(eta), lambda: matheron("host").apply(eta)),  # same noise
+        "compare": (lambda: matheron("auto").apply(eta()), lambda: matheron("host").apply(eta())),
     }
     for rank in (None, 32):
         label = "exact" if rank is None else f"rank {rank}"
@@ -189,16 +210,19 @@ def cases(fes, g, args):
             return o.singular_values
         out[f"4 posterior factorisation ({label}, {args.obs} points)"] = {
             "device": lambda f=fact: f("auto"), "host": lambda f=fact: f("host"), "setup": True}
-    e = QuadratureRule(space).evaluation
+    e = QuadratureRule(space).evaluation  # values at 2000 of the points: the routes differ in the set-up only
+    e = e[np.sort(np.random.default_rng(1).choice(e.shape[0], min(2000, e.shape[0]), replace=False))]
     for method, opts in (("lowrank", {"rank": 200, "samples": 64}), ("mc", {"samples": 400})):
         def lc(c, method=method, opts=opts):
             g.__dict__.pop("_ngsrng_covariance_cache", None)  # no cached result: time the set-up
             return ngsrng.local_covariance(g, method, compute=c, **opts).values(e)
         out[f"4 pointwise variance ({method})"] = {"device": lambda f=lc: f("auto"), "host": lambda f=lc: f("host"),
                                                    "setup": True}
-    c = once("c", lambda: torch.randn(space.nfree, k, device="cuda", dtype=torch.float64))
-    out["5 apply_precision (power 2)"] = {  # the host route: the block to the CPU, SciPy and NGSolve, back
-        "device": lambda: g.apply_precision(c), "host": lambda: g.apply_precision(c.cpu()).to("cuda")}
+    def block():
+        return once("c", lambda: torch.randn(space.nfree, k, device="cuda", dtype=torch.float64))
+    # the host route: the block to the CPU, SciPy and NGSolve, back
+    out[f"5 apply_precision (power {g.spec.power:g})"] = {
+        "device": lambda: g.apply_precision(block()), "host": lambda: g.apply_precision(block().cpu()).to("cuda")}
     out["5 transformed(np.tanh)"] = family("transformed", np.tanh)
     out["5 transformed(torch.tanh)"] = family("transformed", torch.tanh)
 
@@ -218,6 +242,7 @@ def cases(fes, g, args):
     def stationary_eta(construction):  # the same noise for both routes
         return once(("eta", construction), lambda: torch.randn(stationary(construction, "cpu").nrand, 4,
                                                               dtype=torch.float64))
+    out["_lazy"] = lazy  # the objects the cases made: released after every case (see main)
     return out
 
 
@@ -266,9 +291,15 @@ def main():
                 g = ngsrng.Gaussian(fes, ngsrng.matern_correlation(0.3, nu=1 if dim == 2 else 1.5).bind(fes),
                                     device="cuda", dtype="float64", seed=None)
                 print(f"== {dim}D {kind} P{order}: {fes.ndof} dofs ({g.plan.get('solver')})", flush=True)
-                for name, case in cases(fes, g, args).items():
+                all_cases = cases(fes, g, args)
+                lazy = all_cases.pop("_lazy")
+                for name, case in all_cases.items():
                     if args.only and not any(s in name for s in args.only.split(",")):
                         continue
+                    lazy.clear()  # one case's objects at a time: a GPU holds the set-ups of the largest ones only
+                    g.__dict__.pop("_ngsrng_covariance_cache", None)
+                    gc.collect()
+                    torch.cuda.empty_cache()
                     base = {"dim": dim, "kind": kind, "order": order, "ndof": fes.ndof, "batch": args.batch}
                     try:
                         rec = {**base, **run_case(name, case, args)}
