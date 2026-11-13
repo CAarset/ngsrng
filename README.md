@@ -58,6 +58,9 @@ accurate one for your space and hardware.
 - **Bounded FE functions.** With `representation="bernstein"` the FE function stays inside the distribution's range
   at every point: a uniform field strictly between 0 and 1, a gamma field positive, a Wishart field positive
   definite.
+- **Correlated fields.** `ngsrng.correlated([d1, d2], 0.8)` draws several fields jointly, correlated through
+  their latent Gaussians. Each keeps its own law: its family and parameters, its conditioning, the Bernstein
+  range and `bnd=`.
 - **Large batches, fast.**
   - Thousands of samples refilled in place (`out=`, a NumPy array or a torch tensor), threaded on the CPU.
   - On NVIDIA GPUs the solver is cuDSS; on AMD GPUs, AMG-preconditioned CG.
@@ -115,6 +118,9 @@ f = rng.uniform(representation="bernstein")    # an FE function with 0 < f(x) < 
 g = rng.sample("gamma", 2.0, size=10)          # numpy, scipy and torch.distributions names
 rng.info("beta", 2, 5)                         # the law and the algorithms chosen
 
+pair = ngsrng.correlated([rng.distribution("uniform"), rng.distribution("lognormal", 0, 0.5)], 0.8)
+a, b = pair.sample()                           # two fields, each with its own law, correlated
+
 buf = np.empty((5000, X.ndof), np.float32)     # or a torch tensor, also on the GPU
 rng.normal(out=buf)                            # large batches, refilled in place
 
@@ -130,7 +136,7 @@ samples = post.sample(100)                     # (ndof, 100); about one prior sa
 
 | Notebook | What it covers |
 |---|---|
-| [**demo.ipynb**](examples/demo.ipynb)<br>*start here* | Gaussian fields; constant variance up to the boundary; the distributions and their representations; a PDE with a random coefficient; a first inverse problem; low-rank models; covariances given as operators; 1D, curved, DG and 3D settings |
+| [**demo.ipynb**](examples/demo.ipynb)<br>*start here* | Gaussian fields; constant variance up to the boundary; the distributions and their representations; correlated fields; a PDE with a random coefficient; a first inverse problem; low-rank models; covariances given as operators; 1D, curved, DG and 3D settings |
 | [**stokes_inverse.ipynb**](examples/stokes_inverse.ipynb) | A 2D linear Bayesian inverse problem: buoyancy inferred from noisy surface velocities of a Stokes flow. Covers a Robin-tuned prior, an adjoint observation operator, exact posterior variance, calibration and predictive checks, and a comparison of designs |
 | [**hydraulic_tomography_3d.ipynb**](examples/hydraulic_tomography_3d.ipynb) | A nonlinear 3D inverse problem with heavy-tailed noise: aquifer conductivity from pumping tests. Covers a Gauss–Newton MAP point with re-weighting, the Laplace approximation, and pCN, gpCN and Gibbs MCMC. Runs in about 4 minutes |
 
@@ -159,6 +165,7 @@ use [ngsplot](https://github.com/CAarset/ngsplot), which draws the same pictures
 | Poisson, binomial, Bernoulli, geometric, Zipf, ... | exact lookup table | exact | 1.2–2.7× |
 | chi-square, Student-t, Wishart, matrix log-normal, Dirichlet, NIG | sums, scale mixtures, Bartlett and process constructions | exact at every stored point | 1.4–14× |
 | non-Gaussian Karhunen–Loève fields | KL modes with uniform, Rademacher, Laplace or any scipy coefficients | covariance exact | one product |
+| correlated components (`ngsrng.correlated`): pointwise families and Gaussian fields drawn jointly | the components' latent Gaussians mixed by the cross-correlation's Cholesky factor | each component's law exact; latent cross-correlation exact | the components' own draws |
 
 Costs are relative to one Gaussian sample and come from a CPU smoke run, so treat them as indicative. Every
 generator reports its choices: `rng.info(...)` and `Gaussian(...).plan`.

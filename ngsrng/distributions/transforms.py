@@ -191,8 +191,28 @@ class MarginalField(PointwiseField):
         return {**out, **self._common_info()}
 
     def _values(self, n):
+        return self._from_latent(self._latent(n))
+
+    # A draw in two halves, the Gaussian part and the pointwise map (ngsrng.correlated mixes between them)
+    def _latent(self, n):
+        """n draws of the latent point values (npoints, n): standardised, or raw if ``standardize=False``."""
         dev = self.on_device
-        z = self.points.standardized(n, dev) if self.standardize else self.points.draw(n, dev)
+        return self.points.standardized(n, dev) if self.standardize else self.points.draw(n, dev)
+
+    def _latent_mean(self) -> np.ndarray:
+        """The mean of the latent point values (npoints,): (m - m_ref) / std_ref, or the raw mean."""
+        p = self.points
+        if not self.standardize:
+            return p.mean.copy()
+        return (p.mean - p.center) / p.std  # pinned points (std = inf): 0
+
+    def _latent_scale(self) -> np.ndarray:
+        """1 / std_ref per point (ones for raw values): the latent's standardisation."""
+        return 1.0 / self.points.std if self.standardize else np.ones(self.points.npoints)
+
+    def _from_latent(self, z):
+        """The marginal transform of latent point values (npoints, n)."""
+        dev = self.on_device
         # closed forms run in torch also on the CPU: the same float64 formulas, multithreaded (NumPy's elementwise
         # functions are single-threaded); quantile inversions stay in NumPy/SciPy on the CPU
         cpu_torch = not dev and isinstance(self.transform, ClosedForm) and isinstance(z, np.ndarray)

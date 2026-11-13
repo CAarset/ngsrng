@@ -250,6 +250,22 @@ class _NormalField(InPlace, Rebuildable):  # pickles; the NGSolve evaluation mat
         g = self.gauss
         return g._ngs_rows(n, np.empty((n, g.space.ndof)), add_mean=False, transform=self._affine)
 
+    # A draw in two halves, the Gaussian part and the affine map (ngsrng.correlated mixes between them)
+    def _latent(self, n):
+        """n draws of the Gaussian's coefficients (ndof, n) in float64, mean included."""
+        g, n = self.gauss, int(n)
+        if getattr(g, "engine", None) == "ngsolve" and hasattr(g, "_ngs_rows"):
+            return g._ngs_rows(n, np.empty((n, g.space.ndof)), add_mean=True).T
+        return g.sample(n).detach().double().cpu().numpy()
+
+    def _latent_mean(self) -> np.ndarray:
+        return np.asarray(self.gauss.mean, dtype=np.float64)
+
+    def _from_latent(self, z):
+        if self.trivial:
+            return z
+        return self.loc[:, None] + self.scale * (z - self.gauss.mean[:, None])
+
 
 class FieldDistribution:
     """A frozen random-field distribution: ``sample(size=None)`` (alias ``rvs``) and ``info``."""
@@ -634,16 +650,19 @@ class Generator:
             self._apply_bnd(field, flat)
         return out
 
+    @staticmethod
+    def _output_kind(field, name):
+        """(discrete, keep64) of a field's output. FE coefficients (projection, bernstein) are not values: no integer
+        cast; bernstein stays in float64, since its range guarantee is about these exact coefficients."""
+        rep = getattr(field, "representation", None)
+        coefficients = rep in ("projection", "bernstein")
+        return (name in DISCRETE or field.info.get("discrete", False)) and not coefficients, rep == "bernstein"
+
     @draw
     def _draw(self, field, size, output, name, out=None):
         if out is not None:
             return self._draw_into(field, size, name, out)
-        rep = getattr(field, "representation", None)
-        # FE coefficients (projection, bernstein) are not values: no integer cast; bernstein stays in float64, since
-        # its range guarantee is about these exact coefficients
-        coefficients = rep in ("projection", "bernstein")
-        discrete = (name in DISCRETE or field.info.get("discrete", False)) and not coefficients
-        keep64 = rep == "bernstein"
+        discrete, keep64 = self._output_kind(field, name)
         if size is None:
             out = field.sample(None)
             if isinstance(out, ngs.GridFunction):

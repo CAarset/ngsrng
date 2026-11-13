@@ -19,6 +19,7 @@ from .covariance import (
     sample_covariance,
     xnystrace,
 )
+from .correlated import CorrelatedFields, correlated
 from .gaussian import Gaussian
 from .generator import FieldDistribution, Generator, default_rng
 from .lowrank import LowRankGaussian, karhunen_loeve, operator_kl
@@ -34,6 +35,8 @@ __all__ = [
     "default_rng",
     "Generator",
     "FieldDistribution",
+    "correlated",
+    "CorrelatedFields",
     "Gaussian",
     "LowRankGaussian",
     "karhunen_loeve",

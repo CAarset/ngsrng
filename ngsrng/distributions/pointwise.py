@@ -364,7 +364,10 @@ class PointwiseField(InPlace):
         """``n=None``: one sample (quadrature: a GridFunction on the IntegrationRuleSpace; projection: on the FE
         space; points: an array). Otherwise an array: (npoints, ..., n) point values, or (ndof, ..., n)
         coefficients."""
-        vals = self._chunked(1 if n is None else n)
+        return self._represent(self._chunked(1 if n is None else n), n)
+
+    def _represent(self, vals, n):
+        """Point values (npoints, ..., n) in the field's representation, as ``sample(n)`` returns them."""
         if self.representation == "projection":
             vals = self.project(vals)
         elif self.representation == "bernstein":
