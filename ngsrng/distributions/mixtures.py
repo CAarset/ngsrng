@@ -12,6 +12,7 @@ import ngsolve as ngs
 import numpy as np
 import torch
 
+from ..backend import device_copy, mean_array
 from ..inplace import InPlace
 from ..noise import DiagonalNoise
 from ..seeding import as_source
@@ -36,13 +37,20 @@ class _FEField(InPlace):
         if rows[0].numel() != self.space.ndof:
             raise ValueError(f"out holds {rows[0].numel()} values per sample, the field gives {self.space.ndof}")
         rows = rows.view(rows.shape[0], self.space.ndof)
-        rows.copy_(torch.from_numpy(self.gauss.mean).to(rows.device, rows.dtype).expand(rows.shape[0], -1))
-        rows[:, torch.from_numpy(self.space.free).to(rows.device)] += c.T.to(rows.device, rows.dtype)
+        mean, free = self._mean_free(rows.device, rows.dtype)
+        rows.copy_(mean.expand(rows.shape[0], -1))
+        rows[:, free] += c.T.to(rows.device, rows.dtype)
+
+    def _mean_free(self, device, dtype):
+        """The Gaussian's mean and the free dofs' indices on ``device`` (copied once, not per draw)."""
+        g = self.gauss
+        return device_copy(self, mean_array(g), device, dtype), device_copy(self, g.space.free, device)
 
     def _finish(self, c_free: torch.Tensor, n):
         g = self.gauss
-        out = torch.from_numpy(g.mean).to(c_free.device, c_free.dtype)[:, None].repeat(1, c_free.shape[1])
-        out[torch.from_numpy(g.space.free).to(c_free.device)] += c_free
+        mean, free = self._mean_free(c_free.device, c_free.dtype)
+        out = mean[:, None].repeat(1, c_free.shape[1])
+        out[free] += c_free
         if n is not None:
             return out
         gf = ngs.GridFunction(g.space.fes)
@@ -104,7 +112,8 @@ class StudentTField(_FEField):
     def _coefficients(self, ns):
         g = self.gauss
         c = g.sample(ns)
-        c = c[torch.from_numpy(g.space.free).to(c.device)] - torch.from_numpy(g.mean[g.space.free]).to(c)[:, None]
+        mean, free = self._mean_free(c.device, c.dtype)
+        c = c[free] - mean[free][:, None]
         scale = torch.from_numpy(np.sqrt(self.nu / self.source.streams().numpy().chisquare(self.nu, ns))).to(c)
         return c * scale[None, :]
 

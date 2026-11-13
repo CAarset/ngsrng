@@ -16,11 +16,13 @@ from .backend import (
     Rebuildable,
     Scratch,
     available_threads,
+    device_copy,
     ngs_sparse,
     numpy_blas_threads,
     parallel_ranges,
     resolve_device,
     resolve_dtype,
+    same_device,
     sparse_to_torch,
 )
 from .inplace import InPlace, as_tensor, chunks, default_work_values, write
@@ -342,8 +344,7 @@ class Gaussian(InPlace, Rebuildable):
         return (ngs.la.BaseVector(self.nrand), *(ngs.la.BaseVector(self.space.ndof) for _ in range(4)))
 
     # pickling (ngsrng.backend.Rebuildable): the NGSolve mass matrix is made again; the solvers and noise samplers
-    # rebuild their own NGSolve objects; the device copy of the mean is made on first use
-    _transient = ("_mean_t",)
+    # rebuild their own NGSolve objects; the device copies of the mean (ngsrng.backend.device_copy) on first use
 
     def _restore(self):
         if self.engine != "torch":
@@ -705,7 +706,6 @@ class Gaussian(InPlace, Rebuildable):
         noise scaling)`` or ``("downdate", B_free, K)``."""
         new = copy.copy(self)
         new._conditioning = getattr(self, "_conditioning", []) + [exact if exact is not None else ("unknown", label)]
-        new.__dict__.pop("_mean_t", None)  # device copy of the parent's mean (see _torch_rows)
         new._maps = self._maps + ([eta_map] if eta_map is not None else [])
         new._post_maps = self._post_maps + ([post_map] if post_map is not None else [])
         new._mean = self._mean.copy() if mean is None else mean
@@ -721,7 +721,6 @@ class Gaussian(InPlace, Rebuildable):
         """A Gaussian sharing this one's pipeline (factorisations, noise sampler: deterministic set-up) with other
         randomness (``seed``, see :mod:`ngsrng.seeding`)."""
         new = copy.copy(self)
-        new.__dict__.pop("_mean_t", None)
         new.source = as_source(seed)
         new.plan = {**self.plan, "randomness": new.source.describe()}
         if self.engine != "torch":
@@ -789,7 +788,7 @@ class Gaussian(InPlace, Rebuildable):
             self._ngs_rows(rows.shape[0], rows.numpy())
             return rows
         for k0, k1 in chunks(rows.shape[0], self._per_sample(), self.work_values, self._min_chunk()):
-            if self.engine == "torch" and rows.device == self.device and rows.dtype == self.dtype:
+            if self.engine == "torch" and same_device(rows.device, self.device) and rows.dtype == self.dtype:
                 self._torch_rows(rows[k0:k1])
             else:
                 write(rows[k0:k1], self.sample(k1 - k0))
@@ -803,21 +802,30 @@ class Gaussian(InPlace, Rebuildable):
         eta = torch.randn(self.nrand, k, generator=self.generator, device=self.device, dtype=self._work_dtype)
         c = self.apply(eta)
         c = (c if scale == 1.0 else c.mul_(scale)).to(self.dtype)
-        # device copy of the mean, keyed by the mean array itself (posteriors replace it: posterior(mean=...))
-        cache = getattr(self, "_mean_t", None)
-        if cache is None or cache[0] is not self._mean or cache[1].dtype != self.dtype:
-            self._mean_t = cache = (self._mean, torch.from_numpy(self._mean).to(self.device, self.dtype),
-                                    torch.from_numpy(self.space.free).to(self.device))
-        _, mean_t, free_t = cache
+        mean_t, free_t = self._device_mean(self.dtype)
         rows.copy_((mean_t if loc is None else loc).expand(k, -1))
-        rows[:, free_t] += c.T
+        if free_t is None:
+            rows += c.T
+        else:
+            rows[:, free_t] += c.T
         return rows
+
+    def _device_mean(self, dtype):
+        """Torch engine: the mean on the device in ``dtype``, and the free dofs' indices there (None when every dof is
+        free), copied once (posteriors replace the mean array: posterior(mean=...); a new array is copied again)."""
+        mean_t = device_copy(self, self._mean, self.device, dtype)
+        free_t = None if self.space.nfree == self.space.ndof else device_copy(self, self.space.free, self.device)
+        return mean_t, free_t
 
     def _sample_torch(self, n, ns, out):
         eta = torch.randn(self.nrand, ns, generator=self.generator, device=self.device, dtype=self._work_dtype)
         c = self.apply(eta).to(self.dtype)
-        full = torch.from_numpy(self._mean).to(self.device, self.dtype)[:, None].repeat(1, ns)
-        full[torch.from_numpy(self.space.free).to(self.device)] += c
+        mean_t, free_t = self._device_mean(self.dtype)
+        full = mean_t[:, None].repeat(1, ns)
+        if free_t is None:
+            full += c
+        else:
+            full[free_t] += c
         if n is None:
             gf = ngs.GridFunction(self.space.fes)
             gf.vec.FV().NumPy()[:] = full[:, 0].cpu().double().numpy()

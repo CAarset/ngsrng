@@ -26,7 +26,18 @@ import numpy as np
 import scipy.sparse as sp
 import torch
 
-from .backend import Rebuildable, available_memory, ngs_sparse, resolve_dtype, sparse_to_torch
+from .backend import (
+    Rebuildable,
+    available_memory,
+    device_copy,
+    mean_array,
+    ngs_sparse,
+    resolve_device,
+    resolve_dtype,
+    same_device,
+    sparse_to_torch,
+    torch_device_of,
+)
 from .inplace import InPlace, as_tensor, chunks, write
 from .observations import CHUNK, dense_if_full, observation_operator
 from .seeding import as_source
@@ -72,7 +83,7 @@ class ObservedGaussian(InPlace, Rebuildable):
         self.evaluation = self.G  # (bnd= does not apply: these are observations, not FE coefficients)
         self.m = self.G.shape[0]
         self.scale, self.rtol = float(scale), float(rtol)
-        self.device = torch.device(device) if device is not None else getattr(field, "device", torch.device("cpu"))
+        self.device = resolve_device(device if device is not None else getattr(field, "device", "cpu"))
         self.dtype = resolve_dtype(dtype) if dtype is not None else getattr(field, "dtype", torch.float64)
         self.source = as_source(seed)
         self._torch_cache = {}
@@ -183,8 +194,7 @@ class ObservedGaussian(InPlace, Rebuildable):
             return torch.from_numpy(b.toarray() if sp.issparse(b) else np.ascontiguousarray(b))
 
         if hasattr(f, "apply_t") and hasattr(f, "nrand"):
-            dev = getattr(f, "device", torch.device("cpu")) if getattr(f, "engine", "torch") == "torch" \
-                else torch.device("cpu")
+            dev = torch_device_of(f) or torch.device("cpu")
             if 8.0 * f.nrand * self.m < 0.25 * _free_memory(dev):  # Y = L^T G^T, then Y^T Y
                 y = torch.empty((f.nrand, self.m), dtype=torch.float64, device=dev)
                 for i in range(0, self.m, CHUNK):
@@ -232,7 +242,7 @@ class ObservedGaussian(InPlace, Rebuildable):
         if rows[0].numel() != self.m:
             raise ValueError(f"out holds {rows[0].numel()} values per sample, there are {self.m} observations")
         view = rows if rows.ndim == 2 else rows.view(rows.shape[0], self.m)
-        direct = view.device == self.device and view.dtype == self.dtype and view.is_contiguous()
+        direct = same_device(view.device, self.device) and view.dtype == self.dtype and view.is_contiguous()
         for k0, k1 in chunks(view.shape[0], self._per_sample(), self.work_values, self._min_chunk()):
             if direct:
                 self._rows(view[k0:k1])
@@ -293,7 +303,12 @@ class ObservedGaussian(InPlace, Rebuildable):
             eta = torch.randn((f.nrand, k), generator=f.generator, device=f.device, dtype=f._work_dtype)
             c = f.apply(eta).to(torch.float64)
             return (self.scale * (self._operator_torch(c.device, torch.float64, free=True) @ c)).T.to(self.device)
-        x = torch.as_tensor(f.sample(k)).to("cpu", torch.float64).numpy()  # any other sampler (ndof x k)
+        x = torch.as_tensor(f.sample(k))  # any other sampler (ndof x k)
+        dev = torch_device_of(f)
+        if dev is not None and x.device.type != "cpu":  # a low-rank model or Matheron posterior on a GPU: G there
+            x = x.to(torch.float64) - device_copy(self, mean_array(f), x.device, torch.float64)[:, None]
+            return (self.scale * (self._operator_torch(x.device, torch.float64) @ x)).T.to(self.device)
+        x = x.to("cpu", torch.float64).numpy()
         y = np.asarray(self.G @ (x - np.asarray(f.mean)[:, None]))
         return torch.from_numpy(self.scale * y.T).to(self.device, torch.float64)
 

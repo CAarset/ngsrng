@@ -19,6 +19,13 @@ Student-t process, type-G fields, white noise), and the number of quadrature poi
 the default "quadrature" representation (``representation="projection"`` gives FE coefficients of the L2
 projection instead). Arrays are NumPy on the CPU and torch tensors on a GPU device (``output=`` overrides).
 
+On a GPU the draws never leave it: point evaluation, the transforms, the projection and Bernstein representations,
+``bnd=``, KL expansions, posteriors and their set-ups all run there. ``compute=`` (per call) chooses where a pointwise
+family or a KL expansion does this work: "auto" (the GPU, if the Gaussian has one and the family a torch path),
+"host" (NumPy and NGSolve on the CPU, the samples copied there) or "device" (the Gaussian's torch device, required).
+Families without a torch path (user functions in ``transformed``, scipy quantiles for shape parameters that vary in
+space or ``method="ppf"``) always compute on the host.
+
 Algorithms are chosen automatically for every family (and never change its law); ``info(name, ...)`` or
 ``distribution(name, ...).info`` report the choice.
 """
@@ -33,7 +40,18 @@ import numpy as np
 import scipy.stats as st
 import torch
 
-from .backend import Rebuildable, ngs_sparse, resolve_device, resolve_dtype, sparse_to_torch
+from .backend import (
+    COMPUTE,
+    Rebuildable,
+    compute_device,
+    device_copy,
+    mean_array,
+    ngs_sparse,
+    resolve_device,
+    resolve_dtype,
+    same_device,
+    sparse_to_torch,
+)
 from .boundary import attach_boundary  # [bnd] boundary (trace) sampling: ngsrng/boundary.py
 from .correlation import MaternCorrelation, matern
 from .distributions.bernstein import BernsteinForm, default_ok
@@ -86,7 +104,7 @@ ALIASES = {
 
 CORRELATION_KEYS = ("correlation", "precision", "covariance")
 FIELD_KEYS = ("representation", "method", "tol", "std", "order", "construction", "points", "standardize_by",
-              "bnd", "bnd_values")  # [bnd] boundary (trace) sampling: see ngsrng/boundary.py
+              "bnd", "bnd_values", "compute")  # [bnd] boundary (trace) sampling: see ngsrng/boundary.py
 
 
 def _canonical(name: str) -> str:
@@ -123,7 +141,7 @@ def _rekey_gaussian(key, value):
     if key[0] == "id":
         return ("id", id(value[0]))
     if key[0] == "kl":
-        return ("kl", id(value[0]), key[2])
+        return ("kl", id(value[0]), *key[2:])
     return key
 
 
@@ -211,8 +229,9 @@ class _NormalField(InPlace, Rebuildable):  # pickles; the NGSolve evaluation mat
             g._ngs_rows(rows.shape[0], rows.numpy(), evaluate=self._ngs_evaluation(), add_mean=self.trivial,
                         transform=None if self.trivial else self._affine)
             return rows
-        if engine == "torch" and self.evaluation is None and rows.device == g.device and rows.dtype == g.dtype:
-            loc = None if self.trivial else torch.from_numpy(self.loc).to(rows.device, rows.dtype)
+        if engine == "torch" and self.evaluation is None and same_device(rows.device, g.device) \
+                and rows.dtype == g.dtype:
+            loc = None if self.trivial else device_copy(self, self.loc, rows.device, rows.dtype)
             for k0, k1 in chunks(rows.shape[0], self._per_sample(), self.work_values):
                 g._torch_rows(rows[k0:k1], loc=loc, scale=self.scale)
             return rows
@@ -243,19 +262,27 @@ class _NormalField(InPlace, Rebuildable):  # pickles; the NGSolve evaluation mat
         c = g.sample(int(n))
         if self.trivial:
             return c
-        mean = torch.from_numpy(g.mean).to(c.device, c.dtype)[:, None]
-        return torch.from_numpy(self.loc).to(c.device, c.dtype)[:, None] + self.scale * (c - mean)
+        mean = device_copy(self, mean_array(g), c.device, c.dtype)[:, None]
+        return device_copy(self, self.loc, c.device, c.dtype)[:, None] + self.scale * (c - mean)
 
     def _rows64(self, n):
         g = self.gauss
         return g._ngs_rows(n, np.empty((n, g.space.ndof)), add_mean=False, transform=self._affine)
 
     # A draw in two halves, the Gaussian part and the affine map (ngsrng.correlated mixes between them)
+    @property
+    def latent_device(self):
+        """Where :meth:`_latent` delivers its draws: the Gaussian's GPU (torch tensors), or None (NumPy)."""
+        return compute_device("auto", self.gauss)
+
     def _latent(self, n):
-        """n draws of the Gaussian's coefficients (ndof, n) in float64, mean included."""
+        """n draws of the Gaussian's coefficients (ndof, n) in float64, mean included: on the Gaussian's GPU, if it
+        has one (a torch tensor), else NumPy."""
         g, n = self.gauss, int(n)
         if getattr(g, "engine", None) == "ngsolve" and hasattr(g, "_ngs_rows"):
             return g._ngs_rows(n, np.empty((n, g.space.ndof)), add_mean=True).T
+        if self.latent_device is not None:
+            return g.sample(n).to(torch.float64)
         return g.sample(n).detach().double().cpu().numpy()
 
     def _latent_mean(self) -> np.ndarray:
@@ -264,7 +291,11 @@ class _NormalField(InPlace, Rebuildable):  # pickles; the NGSolve evaluation mat
     def _from_latent(self, z):
         if self.trivial:
             return z
+        if isinstance(z, torch.Tensor):
+            loc = device_copy(self, self.loc, z.device, z.dtype)[:, None]
+            return loc + self.scale * (z - device_copy(self, mean_array(self.gauss), z.device, z.dtype)[:, None])
         return self.loc[:, None] + self.scale * (z - self.gauss.mean[:, None])
+
 
 
 class FieldDistribution:
@@ -405,7 +436,7 @@ class Generator:
             self._gaussians[key] = (spec, own[id(g)])
         for key, (g, kl) in parent._gaussians.items():
             if key[0] == "kl" and id(g) in own:
-                self._gaussians[("kl", id(own[id(g)]), key[2])] = (own[id(g)], kl)  # modes: deterministic
+                self._gaussians[("kl", id(own[id(g)]), *key[2:])] = (own[id(g)], kl)  # modes: deterministic
         for key, (g, std, pts) in parent._points.items():
             if id(g) in own:
                 child = copy.copy(pts)
@@ -439,7 +470,9 @@ class Generator:
         key = (("matern", spec.length, spec.nu, spec.rtol, spec.boundary, spec.beta, repr(sorted(spec.options.items())))
                if isinstance(spec, MaternCorrelation) else ("id", id(spec)))
         if key not in self._gaussians:
-            if isinstance(spec, OperatorCovariance) or (isinstance(spec, MaternCorrelation) and spec.stationary):
+            if isinstance(spec, OperatorCovariance):  # a KL expansion (computed with NumPy), sampling on the device
+                gauss = spec.bind(self.fes, seed=self._seed(), device=self.device)
+            elif isinstance(spec, MaternCorrelation) and spec.stationary:
                 gauss = spec.bind(self.fes, seed=self._seed())  # a sampler of its own (StationaryMatern: CPU, float64)
             else:
                 bound = spec.bind(self.fes) if hasattr(spec, "bind") else spec
@@ -501,6 +534,7 @@ class Generator:
         key = _field_key(name, args, kwargs, corr, opts)
         if key not in self._fields:  # values are kept alive with the entry, so identity keys stay valid
             field = self._build(name, args, dict(kwargs), corr, dict(opts))
+            _set_compute(field, name, opts.get("compute", "auto"))
             field.out_dtype = torch.empty(0, dtype=self.dtype).numpy().dtype  # bounded families clamp in it
             if opts.get("bnd") is not None:  # [bnd] boundary (trace) sampling: ngsrng/boundary.py
                 attach_boundary(field, opts["bnd"], opts.get("bnd_values"), cache=self._boundary)
@@ -515,7 +549,7 @@ class Generator:
             # whose samples are finite element coefficients; Bernstein keeps the boundary values in the family's range
             rep = "bernstein" if default_ok(SpaceInfo(self.fes)) else "projection"
         method, tol = opts.pop("method", "auto"), opts.pop("tol", 1e-10)
-        construction = opts.pop("construction", None)
+        construction, compute = opts.pop("construction", None), opts.pop("compute", "auto")
         std, order = opts.pop("std", None), opts.pop("order", None)
         points, standardize_by = opts.pop("points", None), opts.pop("standardize_by", None)
         if points is not None:
@@ -591,9 +625,9 @@ class Generator:
         if name == "karhunen_loeve":
             p = params({"coefficients": "normal", "rank": None})
             gauss = self.gaussian(**corr)
-            key = ("kl", id(gauss), p["rank"])
+            key = ("kl", id(gauss), p["rank"], compute)
             if key not in self._gaussians:
-                self._gaussians[key] = (gauss, karhunen_loeve(gauss, p["rank"], seed=self._seed()))
+                self._gaussians[key] = (gauss, karhunen_loeve(gauss, p["rank"], seed=self._seed(), compute=compute))
             return KLField(gauss, self._gaussians[key][1], p["coefficients"], seed=self._seed(),
                            truncated=not (isinstance(gauss, LowRankGaussian) and p["rank"] is None))
         if name == "dirichlet":
@@ -891,6 +925,21 @@ class Generator:
 
     def __repr__(self):
         return f"Generator({self.fes.type}, ndof={self.fes.ndof}, device={self.device}, dtype={self.dtype})"
+
+
+def _set_compute(field, name, compute):
+    """Where a pointwise family processes its draws (``compute=``, see PointwiseField); KL expansions take it at
+    construction (where the modes are computed and the expansion samples); other families follow their Gaussian."""
+    from .distributions.pointwise import PointwiseField
+
+    if compute not in COMPUTE:
+        raise ValueError(f"compute must be one of {', '.join(COMPUTE)}, not {compute!r}")
+    if isinstance(field, PointwiseField):
+        field.compute = compute
+        field.check_compute(name)
+    elif compute != "auto" and not isinstance(field, KLField):
+        raise ValueError(f"compute= applies to pointwise families and karhunen_loeve; {name} computes where its "
+                         "Gaussian does")
 
 
 def _make_method(name):

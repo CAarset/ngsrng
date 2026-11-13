@@ -307,6 +307,16 @@ class TorchPCG(Solver):
         return {**super().info(), "tol": self.tol, "mean_iterations": float(np.mean(its)) if its else None}
 
 
+def device_spd_solver(a: sp.spmatrix, device, dtype=torch.float64, tol=1e-13):
+    """A solver for an SPD matrix on a torch device, for mass-type matrices (well conditioned after Jacobi scaling):
+    cuDSS (exact, as the CPU's sparse Cholesky) on NVIDIA GPUs with nvmath-python, else Jacobi-preconditioned CG
+    to the relative residual ``tol`` (AMD GPUs, the CPU)."""
+    device = torch.device(device)
+    if device.type == "cuda" and cudss_available():
+        return CudssDirect(a, device, dtype)
+    return TorchPCG(sp.csr_matrix(a), device, dtype, tol=tol if dtype == torch.float64 else max(tol, 1e-6))
+
+
 def pyamg_available() -> bool:
     try:
         import pyamg  # noqa: F401

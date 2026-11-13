@@ -12,9 +12,96 @@ import torch
 
 
 def resolve_device(device) -> torch.device:
+    """A torch device, with the index of a GPU made explicit (``"cuda"`` -> ``cuda:<current>``): tensors report their
+    device with an index, and ``torch.device("cuda") != torch.device("cuda:0")``."""
     if device in (None, "auto"):
-        return torch.device("cuda" if cuda_usable() else "cpu")
-    return torch.device(device)
+        device = "cuda" if cuda_usable() else "cpu"
+    return _indexed(torch.device(device))
+
+
+def _indexed(dev: torch.device) -> torch.device:
+    if dev.type == "cuda" and dev.index is None:
+        try:
+            return torch.device("cuda", torch.cuda.current_device())
+        except (RuntimeError, AssertionError):  # no usable CUDA: leave it to the first use to fail
+            return dev
+    return dev
+
+
+def same_device(a, b) -> bool:
+    """Whether two devices are the same, ``"cuda"`` and ``"cuda:<current>"`` included."""
+    return _indexed(torch.device(a)) == _indexed(torch.device(b))
+
+
+# ------------------------------------------------------------------ device-side caches and where work runs
+
+COMPUTE = ("auto", "device", "host")
+
+
+def torch_device_of(sampler):
+    """The torch device a sampler computes on (the torch engine, a low-rank model or Matheron posterior on a torch
+    device), or None (the NGSolve engine, NumPy samplers)."""
+    dev = getattr(sampler, "torch_device", None)
+    if dev is not None:
+        return dev
+    if getattr(sampler, "engine", None) == "torch":
+        return sampler.device
+    return None
+
+
+def compute_device(compute, sampler, what="this"):
+    """Where the work after (or around) a sampler's draws runs: its torch device, or the host (None: NumPy, NGSolve).
+
+    ``compute``: "auto" (the sampler's device if it is a GPU, so its samples never leave it; the host otherwise),
+    "device" (the sampler's torch device, also a CPU one: the torch code path; ValueError if it has none) or "host"
+    (NumPy and NGSolve on the CPU, the samples copied there)."""
+    if compute not in COMPUTE:
+        raise ValueError(f"compute must be one of {', '.join(COMPUTE)}, not {compute!r}")
+    dev = torch_device_of(sampler)
+    if compute == "host":
+        return None
+    if compute == "device":
+        if dev is None:
+            raise ValueError(f"compute='device': {what} needs a sampler on a torch device (the torch engine, or a "
+                             f"low-rank model on one); {type(sampler).__name__} computes with NumPy/NGSolve")
+        return dev
+    return dev if dev is not None and dev.type != "cpu" else None
+
+
+class DeviceCache(dict):
+    """Objects made on first use for a device (tensors, GPU factorisations), keyed as the owner likes. It pickles
+    empty: they are made again where the owner is unpickled, which may have another GPU or none."""
+
+    def __reduce__(self):
+        return (DeviceCache, ())
+
+
+_MAX_COPIES = 16
+
+
+def mean_array(sampler) -> np.ndarray:
+    """A sampler's mean array itself, for :func:`device_copy` (``mean`` returns a fresh copy on every call)."""
+    mean = getattr(sampler, "_mean", None)
+    return mean if isinstance(mean, np.ndarray) else np.asarray(sampler.mean, dtype=np.float64)
+
+
+def device_copy(owner, array, device, dtype=None) -> torch.Tensor:
+    """The device copy of a host array that ``owner`` keeps using (a mean, a parameter, an index list), made once per
+    array, device and dtype, instead of once per call. Kept on the owner, per owner (a shallow copy, e.g. a derived
+    posterior, starts its own: no copies of other samplers' means accumulate), for at most ``_MAX_COPIES`` arrays;
+    arrays are recognised by identity, so a replaced array gets a new copy (arrays must not change in place)."""
+    store = owner.__dict__.get("_device_copies")
+    if store is None or store.get("owner") != id(owner):
+        store = owner.__dict__["_device_copies"] = DeviceCache(owner=id(owner))
+    key = (id(array), str(device), dtype)
+    hit = store.get(key)
+    if hit is None or hit[0] is not array:
+        t = array if isinstance(array, torch.Tensor) else torch.as_tensor(np.asarray(array))
+        t = t.to(device=device, dtype=dtype) if dtype is not None else t.to(device=device)
+        if len(store) > _MAX_COPIES:
+            del store[next(k for k in store if k != "owner")]
+        hit = store[key] = (array, t)
+    return hit[1]
 
 
 class ImportOrderWarning(UserWarning):

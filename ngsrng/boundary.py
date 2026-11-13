@@ -332,9 +332,10 @@ class BoundarySampler(Rebuildable):
         self._factor_bb()
         if self._cols is not None:
             return "dense", _torch.from_numpy(np.ascontiguousarray(self._dense_lifting()[self._int_pos])).to(dev), None
-        g = self.source
-        if getattr(g, "engine", None) == "torch" and getattr(g, "device", _torch.device("cpu")).type == dev.type \
-                and hasattr(g, "apply_t"):
+        from .backend import same_device, torch_device_of
+
+        g = self.source  # a sampler computing on this device (torch engine, low-rank model, Matheron posterior)
+        if torch_device_of(g) is not None and same_device(torch_device_of(g), dev) and hasattr(g, "apply_t"):
             return "sigma", _torch.linalg.cholesky(_torch.from_numpy(self.sigma_bb).to(dev)), g
         return None
 

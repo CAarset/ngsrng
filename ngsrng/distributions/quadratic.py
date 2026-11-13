@@ -20,6 +20,7 @@ explicit formulas (p <= 3) and broadcasting, so everything runs in NumPy and on 
 
 import numpy as np
 import scipy.stats as st
+import torch
 
 from ..seeding import as_source
 from .inversion import Inversion
@@ -28,8 +29,12 @@ from .pointwise import XP, GaussianAtPoints, PointwiseField, is_conditioned, war
 
 def _spd_inside(values, margin):
     """Add margin * I to symmetric matrices (npoints, p, p, n): all eigenvalues rise by the margin."""
-    out = np.array(values, dtype=float, copy=True)
-    idx = np.arange(out.shape[1])
+    if isinstance(values, torch.Tensor):
+        out = values.to(torch.float64, copy=True)
+        idx = torch.arange(out.shape[1], device=out.device)
+    else:
+        out = np.array(values, dtype=float, copy=True)
+        idx = np.arange(out.shape[1])
     out[:, idx, idx, :] += margin
     return out
 
@@ -53,10 +58,10 @@ class _Copies(PointwiseField):
     def _standard(self, n, center=True):
         p, dev = self.points, self.on_device
         if center:
-            z = p.standardized(n * self.copies, dev)
+            z = self._latent_draw(n * self.copies)
         else:  # keep the mean: z = g / std
-            g = p.draw(n * self.copies, dev)
-            std = p._torch_ops()[2] if dev else p.std
+            g = self._latent_draw(n * self.copies, standardize=False)
+            std = p._torch_ops(g.dtype)[2] if dev else p.std
             z = g / std[:, None]
         # draw j = sample * copies + copy: a sample's copies are consecutive draws, so its values do not depend on
         # how a batch is split into chunks (in-place fills)
@@ -80,7 +85,7 @@ class ChiSquareField(_Copies):
         return (z**2).sum(1)
 
     def _pull_inside(self, values, margin):
-        return np.maximum(values, margin)
+        return torch.maximum(values, margin) if isinstance(values, torch.Tensor) else np.maximum(values, margin)
 
 
 def haar_rotations(p, n, rng) -> np.ndarray:
@@ -154,8 +159,11 @@ class WishartField(_Copies):
         self.source = as_source(seed)  # the Haar rotations of the Bartlett construction (ngsrng.seeding)
         if construction == "bartlett":
             self.chi = [Inversion(st.chi2(df - i), method=method, tol=tol) for i in range(p)]
-            self.torch_capable = all(c.torch_capable for c in self.chi)
         self.law = {"law": ("inverse-" if inverse else "") + f"Wishart {construction} (p={p}, df={df})"}
+
+    @property
+    def torch_capable(self) -> bool:
+        return self.construction != "bartlett" or all(c.torch_capable for c in self.chi)
 
     @property
     def info(self) -> dict:

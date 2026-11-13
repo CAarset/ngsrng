@@ -188,6 +188,9 @@ generator reports its choices: `rng.info(...)` and `Gaussian(...).plan`.
 - **Point values need some smoothness.** Matérn ν must be positive for the point-value families.
 - **Precision.** Results are float32 by default, but every computation runs in float64. Pass `dtype="float64"` for
   double-precision output.
+- **On a GPU, samples stay on the GPU**, through every family, FE representation, KL expansion and posterior
+  (stationary Matérn fields excepted, below). Two cases copy them to the CPU for one step: families that need scipy
+  (shape parameters that vary in space, `method="ppf"`) and your own NumPy function (`transformed`).
 - **Covariances given only as operators** are sampled by truncated expansions, so their samples are slightly
   smoother than the true field.
 - **A `BilinearForm` is a precision, not a covariance.** ngsrng warns if you pass one as a covariance.

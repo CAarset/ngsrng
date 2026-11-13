@@ -26,8 +26,9 @@ import math
 import ngsolve as ngs
 import numpy as np
 import scipy.sparse as sp
+import torch
 
-from ..backend import Rebuildable, Scratch, ngs_sparse, parallel_ranges
+from ..backend import DeviceCache, Rebuildable, Scratch, ngs_sparse, parallel_ranges, sparse_to_torch
 from ..quadrature import QuadratureRule
 from ..space import SpaceInfo
 
@@ -111,6 +112,7 @@ class BernsteinForm:
         bm = self.rule.b
         self._mass = SymmetricFactor(bm @ sp.diags(1.0 / self.rule.weights) @ bm.T)  # same-rule mass, all dofs
         self._mapped = None
+        self._device = DeviceCache()  # the conversion's operators on torch devices (to_coefficients of tensors)
 
     # ---------------------------------------------------------------- reference element
 
@@ -189,14 +191,43 @@ class BernsteinForm:
             self._mapped = self.space.mesh.MapToAllElements(ir, ngs.VOL)
         return np.asarray(cf(self._mapped), dtype=float).reshape(-1)[self.first]
 
-    def to_coefficients(self, b: np.ndarray):
+    def to_coefficients(self, b):
         """Bernstein coefficients (npoints, k) -> NGSolve coefficients (ndof, k) of sum_j b_j B_j, and the largest
-        deviation at the rule points (a measure of the rounding error of the conversion)."""
+        deviation at the rule points (a measure of the rounding error of the conversion). A torch tensor is converted
+        on its device in float64 (cuDSS on NVIDIA GPUs, Jacobi PCG elsewhere), giving torch tensors."""
+        if isinstance(b, torch.Tensor):
+            return self._to_coefficients_torch(b)
         b = np.asarray(b, dtype=float)
         vals = b[self.local_to_global]  # (ne, nloc, k)
         uq = np.einsum("enk,nq->eqk", vals, self.bq).reshape(-1, b.shape[1])
         c = self._mass.solve(np.asarray(self.rule.b @ uq))
         resid = np.abs(self.rule.evaluation_full @ c - uq).max(axis=0)
+        return c, resid
+
+    def _device_ops(self, device):
+        key = str(device)
+        if key not in self._device:
+            from ..solvers import device_spd_solver
+
+            f64 = torch.float64
+            self._device[key] = (
+                torch.from_numpy(self.local_to_global).to(device),
+                torch.from_numpy(np.ascontiguousarray(self.bq)).to(device, f64),
+                sparse_to_torch(self.rule.b.tocsr(), device, f64),
+                sparse_to_torch(self.rule.evaluation_full, device, f64),
+                device_spd_solver(self._mass.a, device),
+            )
+        return self._device[key]
+
+    def _to_coefficients_torch(self, b):
+        l2g, bq, rule_b, evaluation, mass = self._device_ops(b.device)
+        b = b.to(torch.float64)
+        k, (nloc, nq) = b.shape[1], bq.shape
+        vals = b[l2g]  # (ne, nloc, k)
+        # values at the rule points, uq[e, q, k] = sum_n vals[e, n, k] bq[n, q]: one 2D GEMM (no batched product)
+        uq = (vals.permute(0, 2, 1).reshape(-1, nloc) @ bq).reshape(self.ne, k, nq).permute(0, 2, 1).reshape(-1, k)
+        c = mass.apply(rule_b @ uq)
+        resid = (evaluation @ c - uq).abs().amax(dim=0)
         return c, resid
 
 

@@ -31,7 +31,15 @@ import scipy.linalg as sla
 import scipy.sparse as sp
 import torch
 
-from .backend import Scratch, available_memory, numpy_blas_threads
+from .backend import (
+    DeviceCache,
+    Scratch,
+    available_memory,
+    compute_device,
+    numpy_blas_threads,
+    same_device,
+    sparse_to_torch,
+)
 from .inplace import InPlace
 from .observations import CHUNK, dense_if_full, observation_operator, whiten, whitener
 from .randomized import randomized_qr
@@ -58,19 +66,55 @@ def check_memory(prior, columns, rows_per_column, what, hint):
                               f"free. {hint}")
 
 
-class NoiseSpaceMap:
-    """Symmetric map eta -> eta + Q A Q^T eta on the prior's white-noise space."""
+def _host(x) -> np.ndarray:
+    return x.detach().double().cpu().numpy() if isinstance(x, torch.Tensor) else np.ascontiguousarray(x, np.float64)
 
-    def __init__(self, q: np.ndarray, a: np.ndarray, shared=None):
-        self.q = np.ascontiguousarray(q, dtype=np.float64)
+
+class _DeviceFactor:
+    """A dense factor (Q or L Q) held as a NumPy array, or as a torch tensor where it was computed (a GPU set-up):
+    then the host copy is made only if a host path or pickling needs it, and torch applications on that device use
+    the tensor itself."""
+
+    def _init_factor(self, x):
+        self._dev = x if isinstance(x, torch.Tensor) else None
+        self._host_copy = None if self._dev is not None else _host(x)
+
+    def _factor_host(self) -> np.ndarray:
+        if self._host_copy is None:
+            self._host_copy = _host(self._dev)
+        return self._host_copy
+
+    def _factor_on(self, device, dtype) -> torch.Tensor:
+        if self._dev is not None and same_device(self._dev.device, device):
+            return self._dev.to(dtype)
+        return torch.from_numpy(self._factor_host()).to(device, dtype)
+
+    @property
+    def rank(self) -> int:
+        return (self._dev if self._dev is not None else self._host_copy).shape[1]
+
+    def __getstate__(self):
+        """Host arrays only: the device factor and the torch / NGSolve copies are made again on first use."""
+        self._factor_host()
+        state = dict(self.__dict__, _dev=None, _torch={}, _shared={})
+        for k in ("_mv", "_ngs"):
+            state.pop(k, None)
+        return state
+
+
+class NoiseSpaceMap(_DeviceFactor):
+    """Symmetric map eta -> eta + Q A Q^T eta on the prior's white-noise space (Q: NumPy, or a device tensor)."""
+
+    def __init__(self, q, a: np.ndarray, shared=None):
+        self._init_factor(q)
         self.a = np.ascontiguousarray(a, dtype=np.float64)
         self._torch = {}
         # NGSolve / torch copies of Q, reusable by every map with the same Q (re-weighted posteriors)
         self._shared = {} if shared is None else shared
 
     @property
-    def rank(self) -> int:
-        return self.q.shape[1]
+    def q(self) -> np.ndarray:
+        return self._factor_host()
 
     def apply_numpy(self, e: np.ndarray):
         e += self.q @ (self.a @ (self.q.T @ e))
@@ -94,10 +138,14 @@ class NoiseSpaceMap:
         key = (x.device, x.dtype)
         if key not in self._torch:
             if key not in self._shared:
-                self._shared[key] = torch.from_numpy(self.q).to(*key)
+                self._shared[key] = self._factor_on(*key)
             self._torch[key] = (self._shared[key], torch.from_numpy(self.a).to(*key))
         q, a = self._torch[key]
         return x + q @ (a @ (q.T @ x))
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._mv = None
 
 
 def _qr(ft: torch.Tensor):
@@ -112,16 +160,18 @@ def _qr(ft: torch.Tensor):
     return q.detach().cpu().double().numpy(), r.detach().cpu().double().numpy()
 
 
-def _rotate_in_place(q: np.ndarray, u: np.ndarray, rows: int = 4096) -> np.ndarray:
+def _rotate_in_place(q, u, rows: int | None = None):
     """Q U (n x k, k <= columns of Q) written into Q's first k columns, ``rows`` rows at a time: no second n x k
-    array. Returns that view."""
+    array. Returns that view. NumPy, or torch tensors on one device (larger row blocks on a GPU)."""
     k = u.shape[1]
+    if rows is None:
+        rows = 2**16 if isinstance(q, torch.Tensor) and q.device.type != "cpu" else 4096
     for i in range(0, q.shape[0], rows):
         q[i : i + rows, :k] = q[i : i + rows] @ u
     return q[:, :k]
 
 
-class FESpaceUpdate:
+class FESpaceUpdate(_DeviceFactor):
     """c -> c + P S (G c) applied to the output of the prior pipeline (free-dof coefficient vectors).
 
     P: (nfree x r) dense, S: (r x m) small dense, G: (m x nfree) observation rows, sparse or dense. For the
@@ -130,8 +180,8 @@ class FESpaceUpdate:
     (nfree x r) instead of two passes over Q (nrand x r). A s^-1 stays bounded as s -> 0, so this is stable.
     """
 
-    def __init__(self, p: np.ndarray, smat: np.ndarray, g: sp.csr_matrix, free: np.ndarray, ndof: int, shared=None):
-        self.p = np.ascontiguousarray(p, dtype=np.float64)
+    def __init__(self, p, smat: np.ndarray, g: sp.csr_matrix, free: np.ndarray, ndof: int, shared=None):
+        self._init_factor(p)  # NumPy, or the device tensor of a GPU set-up
         self.s = np.ascontiguousarray(smat, dtype=np.float64)
         self.g = g.tocsr() if sp.issparse(g) else np.ascontiguousarray(g, dtype=np.float64)
         self.free, self.ndof = free, ndof
@@ -142,8 +192,12 @@ class FESpaceUpdate:
         self._shared = {} if shared is None else shared
 
     @property
-    def rank(self) -> int:
-        return self.p.shape[1]
+    def p(self) -> np.ndarray:
+        return self._factor_host()
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._ngs = None
 
     def _tensors(self, device, dtype):
         key = (device, dtype)
@@ -156,7 +210,7 @@ class FESpaceUpdate:
                 else:
                     g = torch.from_numpy(self.g).to(device, dtype)
                     gt = g.T
-                self._shared[key] = (torch.from_numpy(self.p).to(device, dtype), g, gt)
+                self._shared[key] = (self._factor_on(device, dtype), g, gt)
             p, g, gt = self._shared[key]
             self._torch[key] = (p, torch.from_numpy(self.s).to(device, dtype), g, gt)
         return self._torch[key]
@@ -196,6 +250,13 @@ class FESpaceUpdate:
         vec.data += pmv * ngs.Vector(list(coeff))
 
 
+def _dense_or_sparse(a, device):
+    """A SciPy sparse or NumPy matrix as a float64 torch matrix on ``device``."""
+    if sp.issparse(a):
+        return sparse_to_torch(sp.csr_matrix(a), device, torch.float64)
+    return torch.from_numpy(np.ascontiguousarray(a, dtype=np.float64)).to(device)
+
+
 # ------------------------------------------------------------------ (1) observations of a prior
 
 
@@ -214,6 +275,10 @@ class LinearObservations:
         approximate, but only (2q + 2)(k + oversampling) applications of L or L^T. ``low_rank_method="power"`` uses
         plain power iteration instead (for comparison).
     factorize : False builds only the observation operator (for :class:`MatheronPosterior`).
+    compute : where the factorisation's dense algebra runs and its blocks live: "auto" (on the prior's GPU if it has
+        one: F^T, its QR, the rotation and L Q never leave the device, and the posteriors' updates use them there),
+        "device" (the prior's torch device, also a CPU one), "host" (NumPy on the CPU: the blocks are copied there).
+        The public NumPy attributes (``lq()``, ``q``) are made from the device blocks on first access.
 
     The factorisation (public, also for code built on it, e.g. optimal experimental design): with the whitened,
     prior-preconditioned forward map F = Gamma^-1/2 G L (L: the prior's factor, C0 = L L^T on the free dofs),
@@ -242,9 +307,11 @@ class LinearObservations:
         seed=0,
         factorize=True,
         low_rank_method="subspace",
+        compute="auto",
     ):
         self.prior = prior
         s = prior.space
+        self.setup_device = compute_device(compute, prior, "LinearObservations")  # None: NumPy on the host
         # G (m x ndof): sparse, or dense when its rows are full (a dense matrix, e.g. observations of a PDE solution)
         self.G = dense_if_full(observation_operator(s.fes, operator, functionals, points, averages, adjoint, m))
         self.m = self.G.shape[0]
@@ -257,9 +324,10 @@ class LinearObservations:
             gh = sp.diags(self.wdata) @ self.gf if sp.issparse(self.gf) else self.wdata[:, None] * self.gf
         else:
             gh = self.wdata @ self.gf
-        self._lq = None
+        self._lq, self._lq_host, self._q_host = None, None, None
         if not factorize:  # observation operator only (e.g. for MatheronPosterior)
             return
+        dev = self.setup_device
         # dense blocks of the set-up (columns: observations, or the sketch width): F^T and its Q factor (nrand; Q
         # overwrites F^T when memory is short, see _qr; Q U overwrites Q; the randomised sketch keeps three such
         # blocks), L Q and its NGSolve/torch copy for the FE-space form (nfree each)
@@ -272,9 +340,22 @@ class LinearObservations:
         if rank is None:
             ft = self._lt(gh.T)  # F^T = L^T G^T Gamma^-T/2 (nrand x m), column-major
             del gh
-            q, r = _qr(ft)
+            if dev is not None:  # QR where F^T is; Q stays there
+                q, r = torch.linalg.qr(ft.to(dev))
+            else:
+                q, r = _qr(ft)
             del ft
             self.exact = True
+        elif dev is not None:  # the sketch, its orthonormalisations and the SVD on the device
+            ghd = _dense_or_sparse(gh, dev)
+            ghtd = _dense_or_sparse(gh.T, dev)
+            q, r = randomized_qr(
+                lambda x: self._lt(ghtd @ x),  # F^T: whitened observations -> noise
+                lambda y: ghd @ self._l(y),  # F: noise -> whitened observations
+                self.m, int(rank), power_iterations=power_iterations, oversampling=oversampling, seed=seed,
+                method=low_rank_method, device=dev,
+            )
+            self.exact = False
         else:
             blas = getattr(prior, "_cpu_blas_threads", 1) if getattr(prior, "engine", "") != "torch" else None
             with numpy_blas_threads(blas):  # see ngsrng.lowrank.karhunen_loeve
@@ -284,27 +365,42 @@ class LinearObservations:
                     self.m, int(rank), power_iterations=power_iterations, oversampling=oversampling, seed=seed,
                     method=low_rank_method,
                 )
-            q, r = torch.from_numpy(q), torch.from_numpy(r)
             self.exact = False
-        if isinstance(q, torch.Tensor):
-            q, r = q.detach().cpu().double().numpy(), r.detach().cpu().double().numpy()
         # Rotate to the SVD basis of R (F^T = Q R = (Q U) s V^T) and drop exactly degenerate directions: then
-        # q = Q U has orthonormal columns, r = s V^T, and the FE-space form needs s^-1 only where s > 0.
+        # q = Q U has orthonormal columns, r = s V^T, and the FE-space form needs s^-1 only where s > 0. R is small
+        # (rank x m): its SVD runs on the host either way; the rotation of Q runs where Q is.
+        r = _host(r)
         u, sv, vt = np.linalg.svd(r, full_matrices=False)
         keep = sv > (np.finfo(float).eps * max(r.shape) * (sv.max() if sv.size else 0.0))
-        self.q, self.sv, self.vt = _rotate_in_place(q, u[:, keep]), sv[keep], vt[keep]
+        u = np.ascontiguousarray(u[:, keep])
+        if isinstance(q, torch.Tensor) and dev is not None:
+            self._q = _rotate_in_place(q.to(torch.float64), torch.from_numpy(u).to(q.device))
+        else:  # in place in Q's own memory (Q may be most of the host memory the set-up uses)
+            self._q = _rotate_in_place(q if isinstance(q, np.ndarray) else _host(q), u)
+        self.sv, self.vt = sv[keep], vt[keep]
         self.r = self.sv[:, None] * self.vt
 
+    @property
+    def q(self) -> np.ndarray:
+        """Q (nrand x rank): the orthonormal noise-space basis of F^T = Q R (NumPy; from the device on first access
+        after a GPU set-up)."""
+        if self._q_host is None:
+            self._q_host = _host(self._q)
+        return self._q_host
+
     def _get_lq(self):
-        """L Q (nfree x rank): needed for the FE-space form and the posterior mean."""
+        """L Q (nfree x rank): needed for the FE-space form and the posterior mean; a device tensor after a GPU
+        set-up (computed there from Q), else NumPy."""
         if self._lq is None:
-            self._lq = self._l(self.q)
+            self._lq = self._l(self._q)
         return self._lq
 
     def lq(self) -> np.ndarray:
         """L Q (nfree x rank): the factorisation's noise-space basis Q mapped to free-dof coefficients (computed once,
-        rank applications of L). See the class docstring."""
-        return self._get_lq()
+        rank applications of L; NumPy). See the class docstring."""
+        if self._lq_host is None:
+            self._lq_host = _host(self._get_lq())
+        return self._lq_host
 
     @property
     def R(self) -> np.ndarray:  # noqa: N802 - the matrix of F^T = Q R
@@ -352,7 +448,7 @@ class LinearObservations:
 
     @property
     def rank(self) -> int:
-        return self.q.shape[1]
+        return self._q.shape[1]
 
     def predictive(self, source=None, noise=True, **options):
         """The law of the data y = G f + e as an :class:`ngsrng.ObservedGaussian`: f from ``source`` (default the
@@ -366,7 +462,9 @@ class LinearObservations:
 
     def _lt(self, x) -> torch.Tensor:
         """L^T x (float64), CHUNK columns at a time into one preallocated result; x dense or sparse (densified one
-        chunk at a time)."""
+        chunk at a time), or a torch tensor (on the prior's device: applied there)."""
+        if isinstance(x, torch.Tensor):
+            return self._apply_chunks(self.prior.apply_t, x)
         x = x.tocsc() if sp.issparse(x) else x
         out = None
         for i in range(0, x.shape[1], CHUNK):
@@ -378,7 +476,20 @@ class LinearObservations:
             out[:, i : i + col.shape[1]] = col
         return out
 
-    def _l(self, eta: np.ndarray) -> np.ndarray:
+    def _apply_chunks(self, op, x):
+        """op (the prior's L or L^T) on a torch block, CHUNK columns at a time, into one float64 result there."""
+        out = None
+        for i in range(0, x.shape[1], CHUNK):
+            col = op(x[:, i : i + CHUNK].contiguous())
+            if out is None:
+                out = torch.empty((col.shape[0], x.shape[1]), dtype=torch.float64, device=col.device)
+            out[:, i : i + col.shape[1]] = col
+        return out
+
+    def _l(self, eta):
+        """L eta (float64): NumPy for NumPy blocks, a tensor on the prior's device for torch blocks."""
+        if isinstance(eta, torch.Tensor):
+            return self._apply_chunks(self.prior.apply, eta)
         cols = [
             self.prior.apply(torch.from_numpy(np.ascontiguousarray(eta[:, i : i + CHUNK]))).double().cpu().numpy()
             for i in range(0, eta.shape[1], CHUNK)
@@ -427,7 +538,9 @@ class LinearObservations:
             if data is not None:
                 resid = np.asarray(data, dtype=float) - self.G @ mean
                 coeff = np.linalg.solve(middle, self.r @ (sc * whiten(self.wkind, self.wdata, resid)))
-                mean[prior.space.free] += self._get_lq() @ coeff
+                lq = self._get_lq()
+                mean[prior.space.free] += _host(lq @ torch.from_numpy(coeff).to(lq)) if isinstance(lq, torch.Tensor) \
+                    else lq @ coeff
             if form == "fe":
                 smat = (a / self.sv[None, :]) @ self.vt
                 # times Gamma^-1/2: a column scaling for uncorrelated noise (no m x m diagonal matrix)
@@ -436,7 +549,7 @@ class LinearObservations:
         shared = self.__dict__.setdefault("_shared_maps", {"noise": {}, "fe": {}})
         if form == "noise":
             label = f"{self.m} linear observations ({kind}, noise-space update, rank {self.rank})"
-            return self.prior._derive(label, mean, eta_map=NoiseSpaceMap(self.q, a, shared["noise"]), seed=seed,
+            return self.prior._derive(label, mean, eta_map=NoiseSpaceMap(self._q, a, shared["noise"]), seed=seed,
                                       exact=self._exact_record(scaling))
         if form != "fe":
             raise ValueError(f"unknown form {form!r}")
@@ -532,28 +645,83 @@ class MatheronPosterior(InPlace):
         B = Sigma0 G^T,  K_d = Gamma + G Sigma0 G^T.
 
     Setup: m applications of L^T and of L. Per sample: one prior sample plus O(nfree m).
+
+    ``compute``: "auto" (on the prior's GPU if it has one: B, the Cholesky factor of K_d and G are kept there, the
+    noise is drawn there, and the samples never leave it), "device" (the prior's torch device, also a CPU one) or
+    "host" (NumPy on the CPU: dense algebra and noise there, the prior's samples copied over). ``bmat`` and
+    ``kd_chol`` are NumPy either way (made from the device on first access).
     """
 
-    def __init__(self, obs: LinearObservations, data=None, seed=None):
+    def __init__(self, obs: LinearObservations, data=None, seed=None, compute="auto"):
         prior, s = obs.prior, obs.prior.space
         check_memory(prior, obs.m, prior.nrand + 2 * s.nfree, "Matheron conditioning",
                      "Use LinearObservations(..., rank=k).posterior() for many observations.")
+        dev = compute_device(compute, prior, "MatheronPosterior")
         g = obs.gf  # (m x nfree), sparse or dense
         gamma = np.diag(1.0 / obs.wdata**2) if obs.wkind == "diag" else np.asarray(obs.noise, dtype=float)
-        lt = obs._lt(g.T)
-        self.bmat = obs._l(lt.cpu().numpy())  # Sigma0 G^T (nfree x m_a)
-        kd = gamma + np.asarray(g @ self.bmat)
-        self.kd_chol = sla.cho_factor(kd)
-        self.gamma_half = np.linalg.cholesky(gamma)
         self.g, self.prior, self.ma = g, prior, obs.m
+        self.gamma_half = np.linalg.cholesky(gamma)
+        self._dev, self._device, self._bmat = dev, DeviceCache(), None
+        lt = obs._lt(g.T)
+        if dev is not None:  # B = Sigma0 G^T and G B on the device; only K_d (m x m) comes to the host
+            bmat = obs._l(lt.to(dev))
+            self._device["bmat"] = bmat
+            kd = gamma + _host(self._g_on(dev) @ bmat)
+        else:
+            self._bmat = obs._l(lt.cpu().numpy())  # Sigma0 G^T (nfree x m_a)
+            kd = gamma + np.asarray(g @ self._bmat)
+        del lt
+        self.kd = kd  # K_d = Gamma + G Sigma0 G^T (m x m)
+        self.kd_chol = sla.cho_factor(kd)
         self._prior = prior if getattr(prior, "_prior", None) is None else prior._prior
         self._mean = prior.mean
         if data is not None:
-            resid = np.asarray(data, dtype=float) - obs.G @ self._mean
-            self._mean[s.free] += self.bmat @ sla.cho_solve(self.kd_chol, resid)
+            w = sla.cho_solve(self.kd_chol, np.asarray(data, dtype=float) - obs.G @ self._mean)
+            if dev is not None:
+                self._mean[s.free] += _host(self._device["bmat"] @ torch.from_numpy(w).to(dev))
+            else:
+                self._mean[s.free] += self._bmat @ w
         self.source = inherit(seed, prior)  # seed=None: a child of the prior's randomness (ngsrng.seeding)
-        self.space, self.device = s, torch.device("cpu")
+        self.space = s
+        self.device = dev if dev is not None else torch.device("cpu")
         self.plan = {**prior.plan, "conditioning": [f"Matheron, {self.ma} observations"]}
+        if dev is not None:
+            self.plan["matheron_device"] = str(dev)
+
+    @property
+    def torch_device(self):
+        """The torch device this sampler computes on, or None (NumPy on the CPU)."""
+        return self._dev
+
+    @property
+    def bmat(self) -> np.ndarray:
+        """B = Sigma0 G^T (nfree x m), NumPy."""
+        if self._bmat is None:
+            self._bmat = _host(self._device["bmat"])
+        return self._bmat
+
+    def __getstate__(self):  # host arrays only: the device copies are made again on first use
+        self.bmat
+        return dict(self.__dict__)
+
+    def _g_on(self, dev, transpose=False):
+        """G (or G^T, for apply_t only) on the device, made on first use."""
+        key = ("gt" if transpose else "g", str(dev))
+        if key not in self._device:
+            self._device[key] = _dense_or_sparse(self.g.T if transpose else self.g, dev)
+        return self._device[key]
+
+    def _ops(self):
+        """(B, chol(K_d), Gamma^1/2, G, mean, free indices) on the device, float64, made once."""
+        dev = self._dev
+        if "ops" not in self._device:
+            if "bmat" not in self._device:
+                self._device["bmat"] = torch.from_numpy(self._bmat).to(dev)
+            chol = torch.linalg.cholesky(torch.from_numpy(self.kd).to(dev))
+            free = None if self.space.nfree == self.space.ndof else torch.from_numpy(self.space.free).to(dev)
+            self._device["ops"] = (self._device["bmat"], chol, torch.from_numpy(self.gamma_half).to(dev),
+                                   self._g_on(dev), torch.from_numpy(self._mean).to(dev), free)
+        return self._device["ops"]
 
     @property
     def nrand(self) -> int:
@@ -564,6 +732,13 @@ class MatheronPosterior(InPlace):
         return self._mean.copy()
 
     def apply(self, eta: torch.Tensor) -> torch.Tensor:
+        if self._dev is not None:
+            bmat, chol, gh, g, _, _ = self._ops()
+            e = eta.detach().to(self._dev, torch.float64)
+            e = e[:, None] if e.ndim == 1 else e
+            f0 = self.prior.apply(e[: self.prior.nrand]).to(torch.float64)
+            out = f0 + bmat @ torch.cholesky_solve(gh @ e[self.prior.nrand :] - g @ f0, chol)
+            return out[:, 0] if eta.ndim == 1 else out
         e = eta.detach().cpu().double()
         e = e[:, None] if e.ndim == 1 else e
         f0 = self.prior.apply(e[: self.prior.nrand]).double().cpu().numpy()
@@ -574,6 +749,14 @@ class MatheronPosterior(InPlace):
 
     def apply_t(self, y: torch.Tensor) -> torch.Tensor:
         """Adjoint of ``apply``: y -> [L0^T (y - G^T K_d^-1 B^T y); Gamma^T/2 K_d^-1 B^T y]."""
+        if self._dev is not None:
+            bmat, chol, gh, *_ = self._ops()
+            v = y.detach().to(self._dev, torch.float64)
+            v = v[:, None] if v.ndim == 1 else v
+            w = torch.cholesky_solve(bmat.T @ v, chol)
+            top = self.prior.apply_t(v - self._g_on(self._dev, transpose=True) @ w).to(torch.float64)
+            out = torch.cat([top, gh.T @ w], dim=0)
+            return out[:, 0] if y.ndim == 1 else out
         v = y.detach().cpu().double()
         v = v[:, None] if v.ndim == 1 else v
         w = sla.cho_solve(self.kd_chol, self.bmat.T @ v.numpy())
@@ -584,10 +767,25 @@ class MatheronPosterior(InPlace):
 
     def sample(self, n=None, out=None):
         """One sample (GridFunction) or n samples (ndof x n). ``out``: an ndof x n buffer filled in place and returned
-        (:mod:`ngsrng.inplace`)."""
+        (:mod:`ngsrng.inplace`). On a device, the noise is drawn there (torch's generator of the draw's stream, so the
+        samples depend on the chunking, as on the torch engine); on the host, sample by sample from NumPy."""
         if out is not None:
             return self._sample_out(n, out)
         ns = 1 if n is None else int(n)
+        if self._dev is not None:
+            *_, mean, free = self._ops()
+            eta = torch.randn((self.nrand, ns), generator=self.source.streams().torch(self._dev), device=self._dev,
+                              dtype=torch.float64)
+            x = mean[:, None].repeat(1, ns)
+            if free is None:
+                x += self.apply(eta)
+            else:
+                x[free] += self.apply(eta)
+            if n is None:
+                gf = ngs.GridFunction(self.space.fes)
+                gf.vec.FV().NumPy()[:] = x[:, 0].cpu().numpy()
+                return gf
+            return x
         eta = torch.from_numpy(self.source.streams().numpy().standard_normal((ns, self.nrand)).T)  # sample by sample
         x = np.repeat(self._mean[:, None], ns, axis=1)
         x[self.space.free] += self.apply(eta).numpy()

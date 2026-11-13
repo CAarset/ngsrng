@@ -12,6 +12,7 @@ import numpy as np
 import scipy.stats as st
 import torch
 
+from ..backend import DeviceCache, device_copy
 from .inversion import Inversion
 from .pointwise import XP, GaussianAtPoints, PointwiseField, is_conditioned, warn_copies_of_posterior
 
@@ -170,7 +171,13 @@ class ClosedForm:
         self.support, self.closed_range = support, closed_range
 
     def __call__(self, z, xp):
-        return self.func(z, xp, **{k: xp.const(v, z) for k, v in self.params.items()})
+        return self.func(z, xp, **{k: self._param(v, z, xp) for k, v in self.params.items()})
+
+    def _param(self, v, z, xp):
+        """A parameter in z's array type: point values (arrays) are copied to z's device once, not per draw."""
+        if xp.torch and isinstance(v, np.ndarray):
+            return device_copy(self, v, z.device, z.dtype)
+        return v
 
 
 class MarginalField(PointwiseField):
@@ -180,7 +187,10 @@ class MarginalField(PointwiseField):
                  label="marginal"):
         super().__init__(points, representation)
         self.transform, self.standardize, self.label = transform, standardize, label
-        self.torch_capable = getattr(transform, "torch_capable", False)
+
+    @property
+    def torch_capable(self) -> bool:
+        return getattr(self.transform, "torch_capable", False)  # an inversion loses it if its table cannot be built
 
     @property
     def info(self) -> dict:
@@ -196,8 +206,7 @@ class MarginalField(PointwiseField):
     # A draw in two halves, the Gaussian part and the pointwise map (ngsrng.correlated mixes between them)
     def _latent(self, n):
         """n draws of the latent point values (npoints, n): standardised, or raw if ``standardize=False``."""
-        dev = self.on_device
-        return self.points.standardized(n, dev) if self.standardize else self.points.draw(n, dev)
+        return self._latent_draw(n, self.standardize)
 
     def _latent_mean(self) -> np.ndarray:
         """The mean of the latent point values (npoints,): (m - m_ref) / std_ref, or the raw mean."""
@@ -227,6 +236,17 @@ class MarginalField(PointwiseField):
         if support is None:  # e.g. transformed(func): range unknown, no guarantee
             return values
         lo, hi = (np.asarray(b, dtype=float) for b in support)
+        if isinstance(values, torch.Tensor):  # bounds may vary per point (npoints x 1): infinite ones stay put
+            key = ("pull", str(values.device), values.dtype)
+            cache = self.__dict__.setdefault("_bounds", DeviceCache())
+            if key not in cache:
+                cache[key] = [(torch.as_tensor(np.where(np.isfinite(b), b, -sign * np.inf), dtype=values.dtype,
+                                               device=values.device), sign)
+                              for b, sign in ((lo, 1.0), (hi, -1.0)) if np.isfinite(b).any()]
+            out = values
+            for bt, sign in cache[key]:
+                out = torch.maximum(out, bt + margin) if sign > 0 else torch.minimum(out, bt - margin)
+            return out
         out = np.where(np.isfinite(lo), np.maximum(values, lo + margin), values)  # bounds may vary per point
         return np.where(np.isfinite(hi), np.minimum(out, hi - margin), out)
 
@@ -301,8 +321,11 @@ class DirichletField(PointwiseField):
             warn_copies_of_posterior()
         cache = {}
         self.inv = [cache.setdefault(a, Inversion(st.gamma(a), method=method, tol=tol)) for a in self.alpha]
-        self.torch_capable = all(i.torch_capable for i in self.inv)
         self.copies = len(self.alpha)  # Gaussian fields per sample
+
+    @property
+    def torch_capable(self) -> bool:
+        return all(i.torch_capable for i in self.inv)
 
     @property
     def info(self) -> dict:
@@ -310,13 +333,13 @@ class DirichletField(PointwiseField):
 
     def _pull_inside(self, values, margin):
         k = len(self.alpha)
-        m = np.minimum(margin, 0.5 / k)
+        m = margin.clamp(max=0.5 / k) if isinstance(margin, torch.Tensor) else np.minimum(margin, 0.5 / k)
         return (1 - k * m) * values + m  # every component >= m, components still sum to one
 
     def _values(self, n):
         dev = self.on_device
         k = len(self.alpha)
-        z = self.points.standardized(n * k, dev).reshape(self.points.npoints, n, k)  # a sample's k draws in a row
+        z = self._latent_draw(n * k).reshape(self.points.npoints, n, k)  # a sample's k draws in a row
         xp = XP(dev)
         g = xp.m.stack([self.inv[j](z[:, :, j], xp) for j in range(k)], 1)
         return g / g.sum(1, keepdims=True) if not xp.torch else g / g.sum(1, keepdim=True)

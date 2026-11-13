@@ -46,6 +46,7 @@ import numpy as np
 import scipy.linalg as sla
 import torch
 
+from .backend import device_copy
 from .inplace import InPlace, as_tensor, write
 
 __all__ = ["correlated", "CorrelatedFields"]
@@ -182,7 +183,7 @@ class CorrelatedFields(InPlace):
         if torch_mode:
             dev = next(x.device for x in z if isinstance(x, torch.Tensor))
             z = [torch.as_tensor(x, dtype=torch.float64).to(dev) for x in z]
-            means = [torch.as_tensor(p.mean, dtype=torch.float64, device=dev)[:, None] for p in self._parts]
+            means = [device_copy(self, p.mean, dev, torch.float64)[:, None] for p in self._parts]
         else:
             z = [np.asarray(x, dtype=np.float64) for x in z]
             means = [p.mean[:, None] for p in self._parts]
@@ -249,7 +250,10 @@ class _Part:
             self.gen._apply_bnd(self.field, rows)
 
     def buffer(self, n):
-        dev = self.gauss.device if self.kind == "points" and self.field.on_device else None
+        if self.kind == "points":
+            dev = self.gauss.device if self.field.on_device else None
+        else:
+            dev = self.field.latent_device
         if dev is not None:
             return torch.empty((n, self.nvalues), dtype=torch.float64, device=dev)
         return np.empty((n, self.nvalues))

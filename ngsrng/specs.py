@@ -200,10 +200,11 @@ class OperatorCovariance:
         if form:
             warnings.warn(LOCAL_FORM_WARNING, stacklevel=3)
 
-    def bind(self, fes, seed=None, mean=None):
+    def bind(self, fes, seed=None, mean=None, device="cpu"):
+        """The sampler: an adaptive KL expansion (:func:`ngsrng.operator_kl`), sampling on ``device``."""
         from .lowrank import operator_kl
 
-        return operator_kl(fes, self, mean=mean, seed=seed)
+        return operator_kl(fes, self, mean=mean, seed=seed, device=device)
 
     def sigma(self, space) -> Callable:
         """Sigma (dual -> primal) on free-dof coefficient blocks: NumPy (nfree x k) -> NumPy (nfree x k)."""

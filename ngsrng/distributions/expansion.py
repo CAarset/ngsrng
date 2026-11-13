@@ -14,6 +14,7 @@ rotation invariant), which is why the KL basis is used. The sample is an FE func
 import numpy as np
 import torch
 
+from ..backend import DeviceCache
 from ..seeding import as_source
 from .mixtures import _FEField
 
@@ -68,7 +69,8 @@ def coefficient_law(coefficients):
 
 class KLField(_FEField):
     """f = m + sum_k sqrt(lambda_k) xi_k phi_k with iid standardised xi_k, from a KL expansion (``kl``: a
-    LowRankGaussian with ``eigenvalues`` and ``modes``, see :func:`ngsrng.karhunen_loeve`)."""
+    LowRankGaussian with ``eigenvalues`` and ``modes``, see :func:`ngsrng.karhunen_loeve`). The sum is computed
+    where ``kl`` computes (its GPU, or NumPy); the coefficients come from NumPy either way."""
 
     def __init__(self, gauss, kl, coefficients="normal", seed=None, truncated=True):
         self.gauss = gauss  # mean and space of the output
@@ -77,6 +79,8 @@ class KLField(_FEField):
         self.source = as_source(seed)  # ngsrng.seeding
         self.scaled_modes = kl.modes[self.space.free] * np.sqrt(kl.eigenvalues)[None, :]
         self.rank = len(kl.eigenvalues)
+        self.torch_device = getattr(kl, "torch_device", None)
+        self._device = DeviceCache()
         cov = f"the rank-{self.rank} truncation of the Gaussian's" if truncated else "the Gaussian's"
         self.info = {"law": f"Karhunen-Loeve expansion, rank {self.rank}, iid {name} coefficients "
                             f"(covariance exactly {cov})",
@@ -84,5 +88,10 @@ class KLField(_FEField):
 
     def _coefficients(self, ns):
         xi = np.asarray(self.law(self.source.streams().numpy(), (ns, self.rank)), dtype=float).T  # sample by sample
+        dev = self.torch_device
+        if dev is not None:
+            if "modes" not in self._device:
+                self._device["modes"] = torch.from_numpy(np.ascontiguousarray(self.scaled_modes)).to(dev)
+            return self._device["modes"] @ torch.from_numpy(np.ascontiguousarray(xi)).to(dev)
         return torch.from_numpy(self.scaled_modes @ xi)
 

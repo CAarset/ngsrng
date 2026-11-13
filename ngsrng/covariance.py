@@ -34,7 +34,7 @@ import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 import torch
 
-from .backend import numpy_blas_threads
+from .backend import compute_device, numpy_blas_threads, sparse_to_torch
 from .randomized import gram_orth, randomized_svd
 from .space import SpaceInfo, coefficient_vector
 
@@ -61,6 +61,11 @@ def _t(x: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(np.ascontiguousarray(x))
 
 
+def _up(x: np.ndarray, device) -> torch.Tensor:
+    """A NumPy block on a torch device (float64)."""
+    return torch.from_numpy(np.ascontiguousarray(x, dtype=np.float64)).to(device)
+
+
 # ------------------------------------------------------------------ sources
 
 
@@ -70,13 +75,18 @@ class CovarianceSource:
     ``sigma``: y -> Sigma y. Optional structure: a factor Sigma = L L^T (``l``: (nrand x k) -> (nfree x k), ``lt``
     its transpose), an exact finite-rank factor ``lowrank`` (W, nfree x r, Sigma = W W^T), or ``update``: a function
     returning (prior source, U, D) with Sigma = Sigma_prior + U D U^T.
+
+    ``device``: a torch device when the source computes on one and the set-ups should run there (``compute``); then
+    ``tl``, ``tlt`` and ``tsigma`` are the same maps on float64 tensors on that device (the NumPy maps stay
+    available for everything else).
     """
 
     def __init__(self, space, sigma, *, l=None, lt=None, nrand=None, lowrank=None, update=None, mean=None,
-                 owner=None, label=""):
+                 owner=None, label="", device=None, tl=None, tlt=None, tsigma=None):
         self.space, self.sigma = space, sigma
         self.l, self.lt, self.nrand = l, lt, nrand
         self.lowrank, self.update, self.label = lowrank, update, label
+        self.device, self.tl, self.tlt, self.tsigma = device, tl, tlt, tsigma
         self.mean = np.zeros(space.ndof) if mean is None else mean
         self.cache = _cache_of(owner)
         # NumPy BLAS threads during the computation: limited for the NGSolve engine, whose solves they would slow
@@ -87,9 +97,11 @@ class CovarianceSource:
     def has_factor(self) -> bool:
         return self.l is not None
 
-    def samples(self, n, rng) -> np.ndarray:
-        """n zero-mean samples (nfree x n); needs a factor."""
-        return self.l(rng.standard_normal((self.nrand, n)))
+    def samples(self, n, rng):
+        """n zero-mean samples (nfree x n); needs a factor. On the device (torch) when the source has one; the white
+        noise comes from ``rng`` (NumPy) either way."""
+        noise = rng.standard_normal((self.nrand, n))
+        return self.tl(_up(noise, self.device)) if self.device is not None else self.l(noise)
 
 
 def _blas_threads(owner):
@@ -118,10 +130,11 @@ def _cache_of(owner) -> dict:
     return stored[1]
 
 
-def as_covariance(source, fes=None, convention=None) -> CovarianceSource:
+def as_covariance(source, fes=None, convention=None, compute="auto") -> CovarianceSource:
     """A :class:`CovarianceSource` from a Gaussian, LowRankGaussian, MatheronPosterior, :class:`OperatorCovariance`,
     NGSolve ``BaseMatrix`` or ``BilinearForm``, or a callable (the last four need ``fes``; ``convention`` as in
-    OperatorCovariance)."""
+    OperatorCovariance). ``compute`` (see :func:`ngsrng.backend.compute_device`): whether set-ups run on the source's
+    torch device ("auto": if it is a GPU) or with NumPy on the host."""
     from .lowrank import LowRankGaussian
     from .posterior import MatheronPosterior
     from .specs import OperatorCovariance
@@ -131,25 +144,38 @@ def as_covariance(source, fes=None, convention=None) -> CovarianceSource:
     if isinstance(source, LowRankGaussian):
         s = source.space
         ops = _FiniteRank(source.b[s.free] @ source.rinv)
+        dev = compute_device(compute, source, "a covariance set-up")  # a LowRankGaussian on a GPU, or None
+        tops = _FiniteRank(source._factor(True)) if dev is not None else None
         return CovarianceSource(s, ops.sigma, l=ops.factor, lt=ops.factor_t, nrand=ops.w.shape[1], lowrank=ops.w,
-                                mean=source.mean, owner=source, label=f"finite rank {ops.w.shape[1]}")
+                                mean=source.mean, owner=source, label=f"finite rank {ops.w.shape[1]}",
+                                **_torch_maps(dev, tops))
     if hasattr(source, "apply") and hasattr(source, "apply_t") and hasattr(source, "space"):
         s = source.space
-        ops = _Factored(source, block_columns(source.nrand, s.nfree))
+        step = block_columns(source.nrand, s.nfree)
+        ops = _Factored(source, step)
+        dev = compute_device(compute, source, "a covariance set-up")
         update = None
         if isinstance(source, MatheronPosterior):
-            update = _MatheronUpdate(source)
+            update = _MatheronUpdate(source, compute)
         elif getattr(source, "_prior", None) is not None and hasattr(source, "_maps"):
-            update = _derived_update(source)
+            update = _derived_update(source, compute)
         return CovarianceSource(s, ops.sigma, l=ops.factor, lt=ops.factor_t, nrand=source.nrand,
                                 update=update,
-                                mean=source.mean, owner=source, label=type(source).__name__)
+                                mean=source.mean, owner=source, label=type(source).__name__,
+                                **_torch_maps(dev, _TorchFactored(source, step, dev) if dev is not None else None))
     if fes is None:
         raise ValueError("a covariance given as an operator needs its space: pass fes=")
     if not isinstance(source, OperatorCovariance):
         source = OperatorCovariance(source, convention=convention)
+    compute_device(compute, source, "a covariance set-up")  # "device" raises: an operator acts on NumPy blocks
     s = SpaceInfo(fes)
     return CovarianceSource(s, source.sigma(s), owner=source, label=f"operator ({source.convention})")
+
+
+def _torch_maps(dev, ops) -> dict:
+    if dev is None:
+        return {}
+    return dict(device=dev, tl=ops.factor, tlt=ops.factor_t, tsigma=ops.sigma)
 
 
 class _FiniteRank:
@@ -187,40 +213,79 @@ class _Factored:
         return np.hstack([self.factor(self.factor_t(y[:, i:i + st])) for i in range(0, y.shape[1], st)])
 
 
+class _TorchFactored:
+    """Sigma = L L^T through a sampler's ``apply`` and ``apply_t`` on float64 tensors on its device, ``step`` columns
+    at a time."""
+
+    def __init__(self, source, step, device):
+        self.source, self.step, self.device = source, step, device
+
+    def _blocks(self, op, x):
+        out = None
+        for i in range(0, x.shape[1], self.step):
+            col = op(x[:, i:i + self.step].contiguous()).to(torch.float64)
+            if out is None:
+                out = torch.empty((col.shape[0], x.shape[1]), dtype=torch.float64, device=col.device)
+            out[:, i:i + col.shape[1]] = col
+        return out
+
+    def factor(self, e):
+        return self._blocks(self.source.apply, e)
+
+    def factor_t(self, y):
+        return self._blocks(self.source.apply_t, y)
+
+    def sigma(self, y):  # block by block: never the whole nrand x k noise-space intermediate
+        return self._blocks(lambda b: self.factor(self.factor_t(b)), y)
+
+
 class _MatheronUpdate:
     """Sigma = Sigma_prior - B K_d^-1 B^T of a Matheron posterior."""
 
-    def __init__(self, source):
-        self.source = source
+    def __init__(self, source, compute="auto"):
+        self.source, self.compute = source, compute
 
     def __call__(self):
         src = self.source
-        return as_covariance(src.prior), src.bmat, -sla.cho_solve(src.kd_chol, np.eye(src.bmat.shape[1]))
+        return (as_covariance(src.prior, compute=self.compute), src.bmat,
+                -sla.cho_solve(src.kd_chol, np.eye(src.bmat.shape[1])))
 
 
 class _DerivedUpdate:
     """Sigma - Sigma_prior = Q D Q^T for a Gaussian derived by low-rank maps (see :func:`_derived_update`)."""
 
-    def __init__(self, g, ranks):
-        self.g, self.ranks = g, ranks
+    def __init__(self, g, ranks, compute="auto"):
+        self.g, self.ranks, self.compute = g, ranks, compute
 
     def __call__(self):
         g = self.g
-        prior = as_covariance(g._prior)
+        prior = as_covariance(g._prior, compute=self.compute)
         n = g.space.nfree
         ell = min(int(sum(self.ranks)) + 10, n)
+        y0 = np.random.default_rng(0).standard_normal((n, ell))
+        if prior.device is not None:  # on the prior's device: only Q and D come back
+            mine = _TorchFactored(g, block_columns(g.nrand, n), prior.device)
+
+            def diff_t(y):
+                return mine.sigma(y) - prior.tsigma(y)
+
+            y = diff_t(_up(y0, prior.device))
+            u, sv, _ = torch.linalg.svd(y, full_matrices=False)
+            q = u[:, sv > (sv[0] * 1e-11 if sv.numel() else 0.0)]
+            d = q.T @ diff_t(q)
+            return prior, _np(q), _np(0.5 * (d + d.T))
 
         def diff(y):
             return _sigma(g, y) - prior.sigma(y)
 
-        y = diff(np.random.default_rng(0).standard_normal((n, ell)))
+        y = diff(y0)
         u, sv, _ = np.linalg.svd(y, full_matrices=False)
         q = u[:, sv > (sv[0] * 1e-11 if sv.size else 0.0)]
         d = q.T @ diff(q)
         return prior, q, 0.5 * (d + d.T)
 
 
-def _derived_update(g):
+def _derived_update(g, compute="auto"):
     """Sigma - Sigma_prior = Q D Q^T for a Gaussian derived from a prior by low-rank maps (posteriors, downdates).
 
     The difference has rank at most r = sum of the noise-map ranks + 2 x the FE-update ranks, so a sketch with
@@ -230,7 +295,7 @@ def _derived_update(g):
     ranks = [getattr(m, "rank", None) for m in g._maps] + [2 * getattr(m, "rank", np.nan) for m in g._post_maps]
     if any(r is None or not np.isfinite(r) for r in ranks):
         return None
-    return _DerivedUpdate(g, ranks)
+    return _DerivedUpdate(g, ranks, compute)
 
 
 def _sigma(g, y):
@@ -350,7 +415,7 @@ def _check_method_arg(method):
 
 
 def local_covariance(source, method="auto", *, fes=None, convention=None, rank=100, samples=None,
-                     power_iterations=2, seed=0) -> LocalCovariance:
+                     power_iterations=2, seed=0, compute="auto") -> LocalCovariance:
     """The covariance on element-local dof pairs, from which pointwise variances and traces follow.
 
     ``method``:
@@ -367,10 +432,13 @@ def local_covariance(source, method="auto", *, fes=None, convention=None, rank=1
       update, applied to the prior;
     - "mc": Monte Carlo with ``samples`` (default 1000) samples (needs a sampler: not for operator covariances).
 
-    The result is cached on the source object.
+    ``compute``: where the set-up runs: "auto" (on the source's GPU, if it has one: the applications of L, L^T or
+    Sigma and the dense algebra stay there, only the final blocks come to the host), "device" (the source's torch
+    device, also a CPU one), "host" (NumPy on the CPU). The result is the same to rounding (the random probes come
+    from NumPy either way) and is cached on the source object.
     """
     _check_method_arg(method)
-    src = as_covariance(source, fes, convention)
+    src = as_covariance(source, fes, convention, compute)
     requested = method
     if method == "auto":
         cheap = src.lowrank is not None or src.update is not None or src.space.nfree <= EXACT_LIMIT
@@ -386,6 +454,7 @@ def local_covariance(source, method="auto", *, fes=None, convention=None, rank=1
         key = ("update", prior_method, rank, samples, power_iterations, seed)
     else:
         key = (method,) if method == "exact" else (method, rank, samples, power_iterations, seed)
+    key += (str(src.device) if src.device is not None else "host",)
     if key in src.cache:
         return src.cache[key]
     with numpy_blas_threads(src.blas):
@@ -425,6 +494,21 @@ def _columns(src) -> LocalCovariance:
     rows, ptr = pattern.indices, pattern.indptr
     vals = np.empty(len(rows))
     n = s.nfree
+    if src.device is not None:  # unit blocks on the device; only the pattern's entries come back
+        dev = src.device
+        step = block_columns(n, src.nrand or 0)
+        for j0 in range(0, n, step):
+            j1 = min(j0 + step, n)
+            unit = torch.zeros((n, j1 - j0), dtype=torch.float64, device=dev)
+            unit[torch.arange(j0, j1, device=dev), torch.arange(j1 - j0, device=dev)] = 1.0
+            cols = src.tsigma(unit)
+            lo, hi = ptr[j0], ptr[j1]
+            col_of = np.repeat(np.arange(j1 - j0), np.diff(ptr[j0:j1 + 1]))
+            vals[lo:hi] = _np(cols[torch.from_numpy(rows[lo:hi]).to(dev), torch.from_numpy(col_of).to(dev)])
+        sigma = pattern.copy()
+        sigma.data = vals
+        return LocalCovariance(s, pattern=sigma.tocsr(), method="exact (all columns)",
+                               applications=n * (2 if src.has_factor else 1))
     for j0 in range(0, n, CHUNK):
         j1 = min(j0 + CHUNK, n)
         unit = np.zeros((n, j1 - j0))
@@ -456,10 +540,23 @@ def _white_noise(space):
 
 def _basis(src, rank, power_iterations, rng):
     """M-orthonormal Q (nfree x k) of the dominant range, and the exact captured part as a term [Q, Y] D [Q, Y]^T
-    = Q Y^T + Y Q^T - Q B Q^T (Y = Sigma M Q, B = Q^T M Y); returns (Q, term, applications)."""
+    = Q Y^T + Y Q^T - Q B Q^T (Y = Sigma M Q, B = Q^T M Y); returns (Q, term, applications). With a device source
+    the basis is computed there and Q is returned there (the term on the host)."""
     s = src.space
     mass = s.mass_free
     n = s.nfree
+    if src.device is not None:  # a factor on the device (operators have no device)
+        mass_t = sparse_to_torch(mass, src.device, torch.float64)
+        k = min(rank, n, src.nrand)
+        q, sv, v = randomized_svd(src.tl, lambda y: src.tlt(mass_t @ y), src.nrand, k, oversampling=0,
+                                  power_iterations=power_iterations, seed=int(rng.integers(2**31)),
+                                  orth=gram_orth(mass), device=src.device)
+        y = src.tl(v * sv)  # Sigma M Q = L (L^T M Q) = L V S
+        b = np.diag(_np(sv) ** 2)
+        apps = (2 * power_iterations + 2) * k + q.shape[1]
+        r = q.shape[1]
+        d = np.block([[-b, np.eye(r)], [np.eye(r), np.zeros((r, r))]])
+        return q, (_np(torch.cat([q, y], dim=1)), d), apps
     if src.has_factor:
         k = min(rank, n, src.nrand)
         q, sv, v = randomized_svd(src.l, lambda y: src.lt(mass @ y), src.nrand, k, oversampling=0,
@@ -488,7 +585,13 @@ def _lowrank(src, rank, samples, power_iterations, rng) -> LocalCovariance:
     s = src.space
     mass = s.mass_free
     q, term, apps = _basis(src, rank, power_iterations, rng)
-    if src.has_factor:
+    if src.device is not None:  # residual samples on the device too; only they come back
+        mass_t = sparse_to_torch(mass, src.device, torch.float64)
+        f = src.samples(samples, rng)
+        g = _np(f - q @ (q.T @ (mass_t @ f)))
+        mc = (g, g)
+        apps += samples
+    elif src.has_factor:
         f = src.samples(samples, rng)
         g = f - q @ (q.T @ (mass @ f))  # residual samples (I - P) f ~ N(0, (I-P) Sigma (I-P)^T)
         mc = (g, g)
@@ -511,7 +614,7 @@ def _monte_carlo(src, samples, rng) -> LocalCovariance:
         # (mesh dependent). They are fine for the small, rough residual in "lowrank", not on their own.
         raise ValueError("Monte Carlo variances need samples, i.e. a Gaussian with a sampler; for a covariance given "
                          "as an operator use method='exact' or 'lowrank'")
-    f = src.samples(samples, rng)
+    f = _np(src.samples(samples, rng))
     return LocalCovariance(src.space, mc=(f, f), applications=samples, method=f"Monte Carlo ({samples} samples)")
 
 
@@ -707,7 +810,7 @@ def functional_covariance(source, operator=None, *, fes=None, convention=None, *
     return 0.5 * (out + out.T)
 
 
-def sample_covariance(source, n=None, *, fes=None, mean=None, seed=None):
+def sample_covariance(source, n=None, *, fes=None, mean=None, seed=None, device=None):
     """The sample covariance of n samples as a finite-rank Gaussian N(m, C_n) (an ensemble model).
 
     ``source``: a Gaussian (or any object with ``sample``) from which n samples are drawn, or the samples themselves
@@ -718,10 +821,17 @@ def sample_covariance(source, n=None, *, fes=None, mean=None, seed=None):
     E ||C_n - C||_HS^2 = (tr(C)^2 + ||C||_HS^2) / df, so the ensemble size needed grows with the effective rank
     tr(C)^2 / ||C||_HS^2; with few samples, long-range correlations are spurious. The result has rank <= n and
     supports everything a LowRankGaussian does (conditioning: an ensemble Kalman analysis; exact pointwise variance).
+    ``device``: where the result samples (default: the source's GPU if it has one, or that of GPU samples; else the
+    CPU).
     """
     from .lowrank import LowRankGaussian
     from .seeding import inherit
 
+    if device is None:
+        if hasattr(source, "sample") and hasattr(source, "space"):
+            device = compute_device("auto", source) or "cpu"
+        else:
+            device = source.device if isinstance(source, torch.Tensor) and source.device.type != "cpu" else "cpu"
     if hasattr(source, "sample") and hasattr(source, "space"):
         space = source.space
         if n is None:
@@ -747,7 +857,7 @@ def sample_covariance(source, n=None, *, fes=None, mean=None, seed=None):
     if df < 1:
         raise ValueError("need at least two samples with the sample mean")
     b = (x - m[:, None]) / np.sqrt(df)
-    out = LowRankGaussian(space.fes, b, np.eye(k), mean=m, seed=inherit(seed, source))  # ngsrng.seeding
+    out = LowRankGaussian(space.fes, b, np.eye(k), mean=m, seed=inherit(seed, source), device=device)  # seeding
     out.df = df
     out.plan["structure"] = f"sample covariance of {k} samples (Wishart, {df} degrees of freedom)"
     return out

@@ -12,7 +12,15 @@ import numpy as np
 import scipy.special as sps
 import torch
 
-from ..backend import Rebuildable, ngs_sparse, sparse_to_torch
+from ..backend import (
+    COMPUTE,
+    DeviceCache,
+    Rebuildable,
+    compute_device,
+    ngs_sparse,
+    sparse_to_torch,
+    torch_device_of,
+)
 from ..covariance import EXACT_LIMIT
 from ..inplace import InPlace
 from ..observations import observation_operator
@@ -46,12 +54,6 @@ class XP:
 
     def where(self, c, a, b):
         return torch.where(c, a, b) if self.torch else np.where(c, a, b)
-
-    def const(self, v, like):
-        """A parameter (scalar or NumPy array of point values) in the array type of ``like``."""
-        if self.torch and isinstance(v, np.ndarray):
-            return torch.as_tensor(v, device=like.device, dtype=like.dtype)
-        return v
 
 
 def prior_of(gauss):
@@ -122,8 +124,8 @@ class GaussianAtPoints(Rebuildable):  # pickles; the NGSolve evaluation matrix i
     - an array of length npoints;
     - None: no standardisation available (only for transforms that do not need it).
 
-    Raises if the Gaussian is known to have no point values (see :func:`point_values`). If the Gaussian lives on a
-    CUDA device (torch engine), point values can be produced on the device (``on_device=True``).
+    Raises if the Gaussian is known to have no point values (see :func:`point_values`). If the Gaussian computes on a
+    torch device (the torch engine, a low-rank model on a GPU), point values can be produced there (``on_device=True``).
     """
 
     EXACT_STD_LIMIT = EXACT_LIMIT
@@ -153,12 +155,13 @@ class GaussianAtPoints(Rebuildable):  # pickles; the NGSolve evaluation matrix i
         self.reference = reference_of(gauss) if standardize_by == "prior" else gauss
         self.mean = self.eval_full @ gauss.mean
         self.center = self.eval_full @ self.reference.mean
-        self.device_capable = getattr(gauss, "engine", None) == "torch" and gauss.device.type == "cuda"
+        self.torch_device = torch_device_of(gauss)  # where on_device draws run (None: NumPy / NGSolve)
+        self.device_capable = self.torch_device is not None and self.torch_device.type != "cpu"
+        self._device = DeviceCache()  # evaluation matrices, the projection's operators, per device and dtype
         if isinstance(std, str) and std == "auto":
             cheap = hasattr(self.reference, "rinv") or self.reference.space.nfree <= self.EXACT_STD_LIMIT
             std = "exact" if cheap else "lowrank"
         self.std_method = std if isinstance(std, str) or std is None else "given"
-        self._t = None
         self.std = self._std(std, mc_samples)
         self._pin()
 
@@ -210,6 +213,14 @@ class GaussianAtPoints(Rebuildable):  # pickles; the NGSolve evaluation matrix i
             )
             # fixed probes: a deterministic estimate that leaves the sampler's own randomness alone (ngsrng.seeding)
             ref, probes = self.reference, np.random.default_rng(0)
+            dev = compute_device("auto", ref)
+            if dev is not None:  # on the reference's GPU: only the probes go there, only the sums come back
+                ev = sparse_to_torch(self._free_eval(), dev, torch.float64)
+                acc = torch.zeros(self.npoints, dtype=torch.float64, device=dev)
+                for k0 in range(0, mc_samples, 500):
+                    eta = torch.from_numpy(probes.standard_normal((min(500, mc_samples - k0), ref.nrand)).T).to(dev)
+                    acc += ((ev @ ref.apply(eta).to(torch.float64)) ** 2).sum(dim=1)
+                return np.sqrt(acc.cpu().numpy() / mc_samples)
             acc = np.zeros(self.npoints)
             for k0 in range(0, mc_samples, 500):
                 k = min(500, mc_samples - k0)
@@ -232,21 +243,39 @@ class GaussianAtPoints(Rebuildable):  # pickles; the NGSolve evaluation matrix i
     def _free_eval(self):
         return self.eval_full[:, self.reference.space.free]
 
-    def _torch_ops(self):
-        if self._t is None:
-            g = self.gauss
-            center = torch.from_numpy(self.center).to(g.device, g.dtype)
-            std = None if self.std is None else torch.from_numpy(self.std).to(g.device, g.dtype)
-            self._t = (sparse_to_torch(self.eval_full, g.device, g.dtype), center, std)
-        return self._t
+    def _torch_ops(self, dtype=None):
+        """(evaluation matrix, center, std) on the Gaussian's torch device in ``dtype`` (default: its output dtype)."""
+        dtype = getattr(self.gauss, "dtype", torch.float64) if dtype is None else dtype
+        key = ("ops", dtype)
+        if key not in self._device:
+            dev = self.torch_device
+            center = torch.from_numpy(self.center).to(dev, dtype)
+            std = None if self.std is None else torch.from_numpy(self.std).to(dev, dtype)
+            self._device[key] = (sparse_to_torch(self.eval_full, dev, dtype), center, std)
+        return self._device[key]
 
-    def draw(self, n, on_device=False):
-        """n samples of the point values (npoints x n): NumPy (float64), or a device tensor if ``on_device`` and
-        possible."""
+    def projection_ops(self, device):
+        """The L2 projection on ``device`` (float64): B on the free dofs (nfree x npoints, the load of point values),
+        a solver for the free mass matrix, and the free dofs' indices (None when every dof is free)."""
+        key = ("projection", str(device))
+        if key not in self._device:
+            from ..solvers import device_spd_solver
+
+            s = self.gauss.space
+            b = self.rule.b.tocsr()[s.free]
+            free = None if s.nfree == s.ndof else torch.from_numpy(s.free).to(device)
+            self._device[key] = (sparse_to_torch(b, device, torch.float64), device_spd_solver(s.mass_free, device),
+                                 free)
+        return self._device[key]
+
+    def draw(self, n, on_device=False, dtype=None):
+        """n samples of the point values (npoints x n): NumPy (float64), or a tensor on the Gaussian's torch device if
+        ``on_device`` and possible (in ``dtype``; default its output dtype)."""
         n = int(n)
         g = self.gauss
-        if on_device and self.device_capable:
-            return self._torch_ops()[0] @ g.sample(n)
+        if on_device and self.torch_device is not None:
+            ev = self._torch_ops(dtype)[0]
+            return ev @ g.sample(n).to(ev.dtype)
         if getattr(g, "engine", None) == "ngsolve" and hasattr(g, "_ngs_rows"):
             # CPU engine: the point values of every sample are taken in the worker thread that computes it, from
             # the float64 coefficients (no full-size intermediate, no float32 round trip)
@@ -256,13 +285,13 @@ class GaussianAtPoints(Rebuildable):  # pickles; the NGSolve evaluation matrix i
         full = g.sample(n)
         return self.eval_full @ full.double().cpu().numpy()
 
-    def standardized(self, n, on_device=False):
+    def standardized(self, n, on_device=False, dtype=None):
         """(g - m_ref) / std_ref at the points: standard normal marginals for priors (npoints x n)."""
         if self.std is None:
             raise ValueError("standardisation needs std ('exact', 'mc' or an array)")
-        if on_device and self.device_capable:
-            _, center, std = self._torch_ops()
-            return self.draw(n, True).sub_(center[:, None]).div_(std[:, None])
+        if on_device and self.torch_device is not None:
+            _, center, std = self._torch_ops(dtype)
+            return self.draw(n, True, dtype).sub_(center[:, None]).div_(std[:, None])
         z = self.draw(n)  # a fresh array: standardise in place
         z -= self.center[:, None]
         z /= self.std[:, None]
@@ -292,29 +321,60 @@ class PointwiseField(InPlace):
     Representations: "quadrature" (values at the quadrature points; a GridFunction on the IntegrationRuleSpace for
     a single sample), "projection" (L2 projection into the FE space) or "points" (values at user-given points;
     plain arrays). Subclasses implement ``_values(n)`` returning (npoints, ..., n) arrays; ``torch_capable`` says
-    whether the transform can run on a CUDA device (NumPy otherwise). ``out_dtype`` is the precision the values are
+    whether the transform has a torch path (NumPy otherwise). ``out_dtype`` is the precision the values are
     delivered in (bounded families keep their values strictly inside the support in that precision). In-place fills
     (``sample_into``, :mod:`ngsrng.inplace`) run ``sample`` on chunks of ``work_values`` internal values.
+
+    ``compute`` says where everything after the Gaussian draw runs (point evaluation, transform, projection or
+    Bernstein conversion): "auto" (on the Gaussian's GPU when the family has a torch path, so the samples never leave
+    it; on the host otherwise), "device" (on the Gaussian's torch device, also a CPU one) or "host" (NumPy and
+    NGSolve on the CPU, the Gaussian's samples copied there). The projection and the Bernstein conversion run in
+    float64 either way.
     """
 
     torch_capable = False
     out_dtype = np.float64
 
-    def __init__(self, points: GaussianAtPoints, representation="quadrature"):
+    def __init__(self, points: GaussianAtPoints, representation="quadrature", compute="auto"):
         if points.bernstein is not None:
             representation = "bernstein"
         elif points.rule is None:
             representation = "points"
         elif representation not in ("quadrature", "projection"):
             raise ValueError("representation must be 'quadrature', 'projection' or 'bernstein'")
-        self.points, self.representation = points, representation
+        if compute not in COMPUTE:
+            raise ValueError(f"compute must be one of {', '.join(COMPUTE)}, not {compute!r}")
+        self.points, self.representation, self.compute = points, representation, compute
         self.space = points.gauss.space
         self._mass_solver = None
 
     @property
     def on_device(self) -> bool:
-        return (self.torch_capable and self.points.device_capable
-                and self.representation not in ("projection", "bernstein"))
+        """Whether the draws are processed on the Gaussian's torch device (see ``compute``)."""
+        if self.compute == "host" or not self.torch_capable or self.points.torch_device is None:
+            return False
+        return self.compute == "device" or self.points.device_capable
+
+    def check_compute(self, name="this family"):
+        """Raise if ``compute="device"`` cannot be honoured (no torch device, no torch path)."""
+        if self.compute != "device":
+            return
+        compute_device("device", self.points.gauss, f"{name} with compute='device'")
+        if not self.torch_capable:
+            raise ValueError(f"compute='device': {name} has no torch path here (a user function, shape parameters "
+                             "that vary in space, or method='ppf': scipy on the CPU); use compute='auto' or 'host'")
+
+    @property
+    def _latent_dtype(self):
+        """The dtype of device draws: float64 for the coefficient representations (projection, Bernstein), as on the
+        host; the Gaussian's output dtype for point values."""
+        return torch.float64 if self.representation in ("projection", "bernstein") else None
+
+    def _latent_draw(self, n, standardize=True):
+        """n draws of the latent point values (standardised or raw) where this field computes."""
+        p, dev, dt = self.points, self.on_device, self._latent_dtype
+        draw = p.standardized if standardize else p.draw
+        return draw(n, dev) if dt is None else draw(n, dev, dtype=dt)
 
     def _values(self, n):
         raise NotImplementedError
@@ -327,7 +387,8 @@ class PointwiseField(InPlace):
             "standardised_by": _standardised_by(p),
             "point_values": p.point_values,
             "points": p.npoints,
-            "device": "gpu" if self.on_device else "cpu",
+            "device": "gpu" if self.on_device and p.torch_device.type == "cuda" else "cpu",
+            "compute": self.compute,
             "gaussian": p.gauss.plan,
         }
 
@@ -393,8 +454,11 @@ class PointwiseField(InPlace):
     def project(self, values) -> np.ndarray:
         """L2 projection of point values (npoints, ..., n) into the FE space: coefficients (ndof, ..., n).
 
-        Dirichlet dofs are zero (zero load there).
+        Dirichlet dofs are zero (zero load there). Device tensors are projected on their device (cuDSS on NVIDIA GPUs,
+        Jacobi PCG elsewhere), as torch tensors.
         """
+        if isinstance(values, torch.Tensor) and self.on_device:
+            return self._project_device(values)
         if isinstance(values, torch.Tensor):
             values = values.double().cpu().numpy()
         if self._mass_solver is None:
@@ -407,6 +471,16 @@ class PointwiseField(InPlace):
         out[self.space.free] = sol
         return out.reshape((self.space.ndof,) + shape[1:])
 
+    def _project_device(self, values):
+        b_free, solver, free = self.points.projection_ops(values.device)
+        shape = values.shape
+        sol = solver.apply(b_free @ values.reshape(shape[0], -1).to(torch.float64))
+        if free is None:
+            return sol.reshape((self.space.ndof,) + shape[1:])
+        out = torch.zeros((self.space.ndof, sol.shape[1]), dtype=torch.float64, device=values.device)
+        out[free] = sol
+        return out.reshape((self.space.ndof,) + shape[1:])
+
     MARGIN = 1e-9  # relative safety margin of the Bernstein representation (conversion rounding is ~1e-12)
 
     def bernstein_coefficients(self, values) -> np.ndarray:
@@ -415,18 +489,24 @@ class PointwiseField(InPlace):
 
         In floating point the conversion to NGSolve's basis has a rounding error (measured at the rule points, ~1e-12
         relative); values are first pulled into the interior of the family's convex range by a margin at least 1000
-        times larger (``_pull_inside``), so the guarantee survives rounding.
+        times larger (``_pull_inside``), so the guarantee survives rounding. Device tensors are converted on their
+        device (float64, torch tensors).
         """
-        if isinstance(values, torch.Tensor):
-            values = values.double().cpu().numpy()
+        if isinstance(values, torch.Tensor) and self.on_device:
+            values = values.to(torch.float64)
+            flat = values.reshape(values.shape[0], -1, values.shape[-1])
+            scale = flat.abs().amax(dim=(0, 1)).clamp_min(1e-300)
+        else:
+            if isinstance(values, torch.Tensor):
+                values = values.double().cpu().numpy()
+            flat = values.reshape(values.shape[0], -1, values.shape[-1])
+            scale = np.maximum(np.abs(flat).max(axis=(0, 1)), 1e-300)  # per sample
         shape = values.shape
-        flat = values.reshape(shape[0], -1, shape[-1])
-        scale = np.maximum(np.abs(flat).max(axis=(0, 1)), 1e-300)  # per sample
         delta = self.MARGIN
         for _ in range(3):
             inside = self._pull_inside(values, delta * scale).reshape(shape[0], -1)
             coeffs, resid = self.points.bernstein.to_coefficients(inside)
-            needed = (1e3 * resid.reshape(-1, shape[-1]) / scale).max()
+            needed = float((1e3 * resid.reshape(-1, shape[-1]) / scale).max())
             if needed <= delta:
                 break
             delta = 10 * needed
@@ -436,25 +516,35 @@ class PointwiseField(InPlace):
 
     def _pull_inside(self, values, margin):
         """Move values (npoints, ..., n) into the interior of the family's range by ``margin`` (per sample, shape
-        (n,)). Default: nothing to do (the range is not constrained, or closed and only reached exactly)."""
+        (n,)). NumPy arrays or torch tensors (then ``margin`` is one too). Default: nothing to do (the range is not
+        constrained, or closed and only reached exactly)."""
         return values
 
     def clamp_open(self, x, support, xp):
         """Keep values strictly inside a finite support (lo, hi) *in the output precision*: the transforms are exact
-        to rounding, but e.g. Phi(z) rounds to 1 for z > 8.3 in float64 and the float32 cast of 1 - 6e-8 is 1."""
+        to rounding, but e.g. Phi(z) rounds to 1 for z > 8.3 in float64 and the float32 cast of 1 - 6e-8 is 1. The
+        family's support is fixed, so the bounds are made once per array type, device and dtype."""
         if support is None:
             return x
-        dt = np.dtype(self.out_dtype)
+        key = ("clamp", str(x.device) if xp.torch else "numpy", x.dtype, np.dtype(self.out_dtype).str)
+        cache = self.__dict__.setdefault("_clamp", DeviceCache())
+        if key not in cache:
+            dt = np.dtype(self.out_dtype)
+            bounds = []
+            for bound, toward, op in ((support[0], np.inf, "max"), (support[1], -np.inf, "min")):
+                b = np.asarray(bound, dtype=float)
+                if not np.all(np.isfinite(b)):
+                    continue
+                inner = np.nextafter(b.astype(dt), np.asarray(toward, dtype=dt)).astype(np.float64)
+                if xp.torch:
+                    inner = torch.as_tensor(inner, dtype=x.dtype, device=x.device)
+                elif not inner.ndim:
+                    inner = float(inner)
+                bounds.append((inner, op))
+            cache[key] = bounds
         out = x
-        for bound, toward, op in ((support[0], np.inf, "max"), (support[1], -np.inf, "min")):
-            b = np.asarray(bound, dtype=float)
-            if not np.all(np.isfinite(b)):
-                continue
-            inner = np.nextafter(b.astype(dt), np.asarray(toward, dtype=dt)).astype(np.float64)
-            inner = xp.const(inner, out) if inner.ndim else float(inner)
+        for inner, op in cache[key]:
             if xp.torch:
-                inner = inner if isinstance(inner, torch.Tensor) else torch.tensor(inner, dtype=out.dtype,
-                                                                                   device=out.device)
                 out = torch.maximum(out, inner) if op == "max" else torch.minimum(out, inner)
             else:
                 out = np.maximum(out, inner) if op == "max" else np.minimum(out, inner)

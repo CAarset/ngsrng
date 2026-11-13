@@ -21,11 +21,15 @@ relevant fast algorithms are fast numerical inversion. Methods, all exact or ver
 transform pays for the table set-up, and ``ppf`` otherwise.
 """
 
+import warnings
+
 import numpy as np
 import scipy.special as sps
 import scipy.stats as st
 import torch
 from scipy.interpolate import CubicHermiteSpline
+
+from ..backend import DeviceCache, device_copy
 
 TABLE_MIN_VALUES = 20_000  # below this many values per call, building a table costs more than calling ppf
 # (placeholder until the benchmark fits it; table set-up is a few thousand ppf evaluations)
@@ -247,7 +251,18 @@ class Inversion:
 
     @property
     def torch_capable(self) -> bool:
-        return not self.varying and self.requested != "ppf"
+        """Whether the inversion runs in torch (on the Gaussian's device): with a table, not with scipy's ppf (shape
+        parameters varying in space, method="ppf", or a table that could not be built)."""
+        return not self.varying and self.requested != "ppf" and self.method != "ppf"
+
+    def _table_failed(self, note):
+        self.method = "ppf"
+        self.info = {"inversion": "ppf", "note": note}
+        warnings.warn(f"{self._label()}: {note}; the exact scipy ppf on the CPU is used instead (slower, and on a GPU "
+                      "the values make a round trip to the host)", RuntimeWarning, stacklevel=4)
+
+    def _label(self):
+        return f"{getattr(getattr(self.dist, 'dist', None), 'name', 'distribution')} inversion"
 
     # ------------------------------------------------------------------ continuous: Hermite table
 
@@ -281,10 +296,9 @@ class Inversion:
                     self.positive, self.s = positive, s
                     self.info.update(intervals=m, zmax=zm, variable="log q" if positive else "asinh(q/s)",
                                      max_rel_error=float(err))
-                    self._tcache = {}
+                    self._tcache = DeviceCache()
                     return
-        self.method = "ppf"  # tolerance not reachable: fall back to exact
-        self.info = {"inversion": "ppf", "note": "table tolerance not reached"}
+        self._table_failed("table tolerance not reached")  # tolerance not reachable: fall back to exact
 
     def _table(self, z, xp):
         if xp.torch:
@@ -329,14 +343,13 @@ class Inversion:
         while hi < b and d.sf(hi) > p_tail and step < 2 * DISCRETE_TABLE_MAX:
             hi, step = min(b, mid + step), 2 * step
         if not (np.isfinite(lo) and np.isfinite(hi)) or hi - lo > DISCRETE_TABLE_MAX:
-            self.method = "ppf"
-            self.info = {"inversion": "ppf", "note": "support too wide for a table"}
+            self._table_failed("support too wide for a table")
             return
         self.k = np.arange(lo, hi + 1)
         self.cdf = d.cdf(self.k)  # increasing: ppf(u) = k[first index with cdf >= u]
         self.neg_sf = -d.sf(self.k)  # increasing: the same index from the survival side, for u near 1
         self.info.update(table_size=len(self.k))
-        self._tcache = {}
+        self._tcache = DeviceCache()
 
     def _discrete(self, z, xp):
         if xp.torch:
@@ -364,11 +377,12 @@ class Inversion:
             q = self._table(z, xp)
         elif method == "discrete-table":
             q = self._discrete(z, xp)
-        elif xp.torch:  # only reached if a table could not be built
+        elif xp.torch:  # only on the draw whose table could not be built (afterwards the field draws on the host)
             q = torch.as_tensor(_q_exact(self.dist, z.double().cpu().numpy()), device=z.device, dtype=z.dtype)
         else:
             q = _q_exact(self.dist, z)
-        loc, scale = xp.const(self.loc, q), xp.const(self.scale, q)
+        loc, scale = (device_copy(self, v, q.device, q.dtype) if xp.torch and isinstance(v, np.ndarray) else v
+                      for v in (self.loc, self.scale))
         return loc + scale * q
 
 
