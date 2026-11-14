@@ -22,6 +22,8 @@ operators are applied, and all dense algebra done, on the device. The Gaussian t
 NumPy with the given seed, so the result does not depend on the device beyond rounding.
 """
 
+import math
+
 import numpy as np
 import scipy.linalg as sla
 import scipy.sparse as sp
@@ -142,3 +144,61 @@ def randomized_qr(apply_a, apply_adj, m, rank, **kwargs):
     else:
         qh, r = np.linalg.qr(s[:, None] * v.T)
     return u @ qh, r
+
+
+# ------------------------------------------------------------------ Gram matrices without forming them
+
+
+def stacked_qr(top, bottom):
+    """Householder QR of the stacked block [top; bottom] = Q R (NumPy or torch; ``bottom`` square, e.g. Gamma^T/2 or
+    sqrt(eps) I): returns Q_1 (the rows of Q against ``top``) and R, with R^T R = top^T top + bottom^T bottom.
+
+    For a Gram matrix such as Sigma_DD = (L^T e_D)^T (L^T e_D) or K_d = Gamma + G Sigma G^T, solves with R lose
+    accuracy like kappa(R) = kappa(R^T R)^(1/2), while a Cholesky factor of the formed matrix loses it like its
+    condition number: for smooth fields with many close observations or Dirichlet dofs, 1e10 and more."""
+    nr = top.shape[0]
+    if _is_torch(top):
+        q, r = torch.linalg.qr(torch.cat([top, bottom.to(top)]))
+        sign = torch.where(torch.diagonal(r) < 0, -1.0, 1.0).to(r)  # R with a non-negative diagonal: a Cholesky factor
+        return q[:nr] * sign, r * sign[:, None]
+    block = np.empty((nr + bottom.shape[0], top.shape[1]), order="F")
+    block[:nr], block[nr:] = top, bottom
+    q, r = sla.qr(block, mode="economic", overwrite_a=True, check_finite=False)
+    sign = np.where(np.diagonal(r) < 0, -1.0, 1.0)
+    return q[:nr] * sign, r * sign[:, None]
+
+
+def qr_fits(shape, device=None) -> bool:
+    """Whether :func:`stacked_qr` of a (rows x cols) block (its copy and its Q) fits in half the free memory, on the
+    host or on a CUDA ``device``."""
+    from .backend import available_memory, device_free_memory
+
+    need = 2 * (shape[0] + shape[1]) * shape[1] * 8
+    if device is not None and torch.device(device).type == "cuda":
+        return need <= 0.5 * device_free_memory(device)
+    mem = available_memory()
+    return mem is None or need <= 0.5 * mem
+
+
+GRAM_JITTER = 1e-14  # Sigma_DD + GRAM_JITTER tr(Sigma_DD) / n_D I: the regularisation of the regressions below
+
+
+def gram_regression(lt, apply_l, rows=slice(None)):
+    """The regression Sigma_{rows,D} (Sigma_DD + eps I)^-1 of Sigma = L L^T on the dofs D, from lt = L^T e_D (noise
+    space x n_D; NumPy or torch), without forming Sigma_DD: with [lt; sqrt(eps) I] = Q R (:func:`stacked_qr`),
+    Sigma_DD + eps I = R^T R and the regression is (L Q_1)[rows] R^-T (eps = GRAM_JITTER tr(Sigma_DD) / n_D).
+
+    The same in exact arithmetic as a Cholesky solve with Sigma_DD, but rounding errors (e.g. the run-to-run
+    differences of a multithreaded set-up) grow with kappa(Sigma_DD)^(1/2) instead of kappa(Sigma_DD) (measured, nu = 5
+    and 288 Dirichlet dofs: samples of differently rounded set-ups agree to 1e-11 instead of 7e-7). ``apply_l``:
+    noise-space columns -> coefficients (``rows`` of them are kept)."""
+    nd = lt.shape[1]
+    if _is_torch(lt):
+        eps = GRAM_JITTER * float((lt * lt).sum()) / nd
+        q1, r = stacked_qr(lt, math.sqrt(eps) * torch.eye(nd, dtype=lt.dtype, device=lt.device))
+        lq = apply_l(q1.contiguous())[rows]
+        return torch.linalg.solve_triangular(r, lq.T, upper=True).T
+    eps = GRAM_JITTER * float(np.einsum("ij,ij->", lt, lt)) / nd
+    q1, r = stacked_qr(lt, math.sqrt(eps) * np.eye(nd))
+    lq = apply_l(np.ascontiguousarray(q1))[rows]
+    return sla.solve_triangular(r, lq.T, lower=False, check_finite=False).T

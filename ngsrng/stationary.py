@@ -78,6 +78,7 @@ from scipy.special import kv
 from .backend import DeviceCache, Rebuildable, available_memory, device_copy, resolve_device, sparse_to_torch
 from .inplace import InPlace
 from .quadrature import QuadratureRule
+from .randomized import GRAM_JITTER, gram_regression, qr_fits
 from .seeding import as_source, inherit
 from .solvers import NGSolveDirect
 from .space import SpaceInfo, coefficient_vector, mass_form
@@ -459,43 +460,6 @@ class _GridSource:
         return out
 
 
-_JITTER = 1e-14  # Sigma_DD + _JITTER tr(Sigma_DD) / n_D I: the boundary update's regularisation
-
-
-def _qr_fits(shape, device) -> bool:
-    """Whether the QR of an (nrand + n_D) x n_D block and its Q fit in half the free memory (host or device)."""
-    need = 2 * (shape[0] + shape[1]) * shape[1] * 8
-    if device is not None and torch.device(device).type == "cuda":
-        from .backend import device_free_memory
-
-        return need <= 0.5 * device_free_memory(device)
-    mem = available_memory()
-    return mem is None or need <= 0.5 * mem
-
-
-def _qr_regression(lt, apply_l, free):
-    """The boundary update's regression Sigma_FD (Sigma_DD + eps I)^-1 from lt = L^T e_D (noise space x n_D; NumPy
-    or torch), without forming Sigma_DD: a Householder QR [lt; sqrt(eps) I] = Q R gives Sigma_DD + eps I = R^T R, and
-    the regression is (L_F Q_1) R^-T (Q_1: the first nrand rows of Q; eps = _JITTER tr(Sigma_DD) / n_D, as for the
-    Cholesky factor). The same in exact arithmetic as cho_solve on Sigma_DD, but rounding errors (e.g. from a
-    multithreaded set-up) grow with kappa(R) = kappa(Sigma_DD)^(1/2) instead of kappa(Sigma_DD), which reaches 1e10 and
-    more for smooth fields with many Dirichlet dofs (measured, nu = 5 and 288 Dirichlet dofs: samples of differently
-    rounded set-ups agree to 1e-11 instead of 7e-7).
-    ``apply_l``: noise-space columns -> all-dof coefficients; ``free``: the free rows."""
-    nr, nd = lt.shape
-    if isinstance(lt, torch.Tensor):
-        eps = _JITTER * float((lt * lt).sum()) / nd
-        q, r = torch.linalg.qr(torch.cat([lt, math.sqrt(eps) * torch.eye(nd, dtype=lt.dtype, device=lt.device)]))
-        lq = apply_l(q[:nr].contiguous())[free]
-        return torch.linalg.solve_triangular(r, lq.T, upper=True).T
-    eps = _JITTER * float(np.einsum("ij,ij->", lt, lt)) / nd
-    block = np.empty((nr + nd, nd), order="F")
-    block[:nr], block[nr:] = lt, math.sqrt(eps) * np.eye(nd)
-    q, r = sla.qr(block, mode="economic", overwrite_a=True, check_finite=False)
-    lq = apply_l(q[:nr])[free]
-    return sla.solve_triangular(r, lq.T, lower=False, check_finite=False).T
-
-
 class StationaryMatern(InPlace, Rebuildable):
     """Matérn Gaussian random function on ``fes`` whose law does not depend on position (see the module docstring):
     unit pointwise variance up to the FE projection, correlation range ``length``, smoothness ``nu``.
@@ -683,25 +647,25 @@ class StationaryMatern(InPlace, Rebuildable):
 
     def _setup_conditioning(self):
         """The boundary update from L^T e_D (n_D applications of the factor's transpose). Dense: the regression
-        Sigma_FD Sigma_DD^-1 (n_F x n_D, kept when small) by a QR of L^T e_D (:func:`_qr_regression`; n_D more
-        applications of the factor). Matrix-free: the Cholesky factor of Sigma_DD = (L^T e_D)^T (L^T e_D)."""
+        Sigma_FD Sigma_DD^-1 (n_F x n_D, kept when small) by a QR of L^T e_D (n_D more applications of the factor;
+        :func:`ngsrng.randomized.gram_regression`). Matrix-free: the Cholesky factor of Sigma_DD = Gram(L^T e_D)."""
         nd, nf, ndof = self._dir.size, self.space.nfree, self.space.ndof
         dense = nf * nd <= DENSE_CONDITIONING_VALUES
         if self._torch:  # the applications and the QR on the device; the regression comes back once
             e = torch.zeros((ndof, nd), dtype=F64, device=self.device)
             e[torch.from_numpy(self._dir).to(self.device), torch.arange(nd, device=self.device)] = 1.0
             lt = self._project_t_torch(e)
-            if dense and _qr_fits(lt.shape, self.device):
+            if dense and qr_fits(lt.shape, self.device):
                 free = device_copy(self, self.space.free, self.device)
-                self._cond = ("dense", _qr_regression(lt, self._project_torch, free).cpu().numpy())
+                self._cond = ("dense", gram_regression(lt, self._project_torch, free).cpu().numpy())
                 return
             sdd = (lt.T @ lt).cpu().numpy()
         else:
             e = np.zeros((ndof, nd))
             e[self._dir, np.arange(nd)] = 1.0
             lt = self._project_t(e)
-            if dense and _qr_fits(lt.shape, None):
-                self._cond = ("dense", _qr_regression(lt, self._project, self.space.free))
+            if dense and qr_fits(lt.shape):
+                self._cond = ("dense", gram_regression(lt, self._project, self.space.free))
                 return
             sdd = lt.T @ lt
         del lt
@@ -709,7 +673,7 @@ class StationaryMatern(InPlace, Rebuildable):
         if mem is not None and nd * nd * 8 > 0.5 * mem:
             raise MemoryError(f"conditioning on {nd} Dirichlet dofs needs a {nd} x {nd} dense block")
         sdd = 0.5 * (sdd + sdd.T)
-        self._cond = ("matrix-free", sla.cho_factor(sdd + _JITTER * np.trace(sdd) / nd * np.eye(nd), lower=True))
+        self._cond = ("matrix-free", sla.cho_factor(sdd + GRAM_JITTER * np.trace(sdd) / nd * np.eye(nd), lower=True))
 
     def _sigma_rows(self, x_full, rows):
         """(Sigma x)[rows] for full-dof columns x."""

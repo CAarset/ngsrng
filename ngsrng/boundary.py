@@ -76,6 +76,7 @@ import scipy.sparse.linalg as spla
 
 from .backend import Rebuildable, available_memory
 from .covariance import as_covariance, block_columns
+from .randomized import gram_regression, qr_fits
 from .space import SpaceInfo, assemble, to_scipy
 
 try:  # torch rows arrive from the GPU engine; the algebra below is written to run in either backend
@@ -217,6 +218,11 @@ class BoundarySampler(Rebuildable):
         self.info = {"name": self.name, "n_bnd": self.n_bnd, "dofs": self.dofs.copy()}
 
     @property
+    def _small(self) -> bool:
+        """Whether the lifting is small enough to be stored (dense)."""
+        return self.space.nfree * self.n_bnd <= DENSE_LIFTING_VALUES
+
+    @property
     def sigma_bb(self):
         """Covariance of the boundary DoFs (n_bnd x n_bnd): ``n_bnd`` applications of ``Sigma_h``, ``CHUNK`` at a
         time, keeping only the boundary rows (dense ``n_bnd^2``, never ``n_free x n_bnd``)."""
@@ -283,9 +289,9 @@ class BoundarySampler(Rebuildable):
         if self._sparse_form is not None:
             qii, qib = self._sparse_blocks()
             return -np.asarray(qii.solve(qib @ d.T)).reshape(-1, d.shape[0]).T
-        self._factor_bb()
-        if self._cols is not None:  # small problem: the dense lifting is cheaper than an application of Sigma_h
+        if self._small:  # small problem: the dense lifting is cheaper than an application of Sigma_h
             return d @ self._dense_lifting()[self._int_pos].T
+        self._factor_bb()
         y = np.zeros((self.space.nfree, d.shape[0]))
         y[self._pos] = sla.cho_solve(self._chol, d.T)
         return np.asarray(self._src.sigma(y), dtype=np.float64)[self._int_pos].T
@@ -333,9 +339,9 @@ class BoundarySampler(Rebuildable):
             if pyamg_available():  # no GPU sparse direct solver (AMD): AMG-preconditioned CG, solved tightly
                 return "sparse", TorchAMGPCG(q[ii][:, ii], dev, f64, tol=1e-12), qib
             return None
-        self._factor_bb()
-        if self._cols is not None:
+        if self._small:
             return "dense", _torch.from_numpy(np.ascontiguousarray(self._dense_lifting()[self._int_pos])).to(dev), None
+        self._factor_bb()
         from .backend import same_device, torch_device_of
 
         g = self.source  # a sampler computing on this device (torch engine, low-rank model, Matheron posterior)
@@ -348,9 +354,22 @@ class BoundarySampler(Rebuildable):
             self._chol = sla.cho_factor(self.sigma_bb, lower=True)
 
     def _dense_lifting(self):
-        """Sigma E Sigma_BB^-1 on the free DoFs (n_free x n_bnd), stored only for small problems."""
+        """Sigma E Sigma_BB^-1 on the free DoFs (n_free x n_bnd), stored only for small problems. With a factor
+        Sigma_h = L L^T (and at least n_bnd noise dimensions), from a QR of L^T E (:func:`gram_regression`: n_bnd
+        applications of L^T and of L, as for Sigma_BB; rounding grows with kappa(Sigma_BB)^(1/2), not kappa(Sigma_BB),
+        which is large for smooth fields with many trace DoFs per correlation length); otherwise by a Cholesky solve
+        with Sigma_BB."""
         if self._dense is None:
-            self._dense = sla.cho_solve(self._chol, self._cols.T).T
+            src = self._src
+            if src.has_factor and src.nrand >= self.n_bnd and qr_fits((src.nrand, self.n_bnd)):
+                e = np.zeros((self.space.nfree, self.n_bnd))
+                e[self._pos, np.arange(self.n_bnd)] = 1.0
+                self._dense = gram_regression(np.asarray(src.lt(e), dtype=np.float64),
+                                              lambda q: np.asarray(src.l(q), dtype=np.float64))
+            else:
+                self.sigma_bb
+                self._factor_bb()
+                self._dense = sla.cho_solve(self._chol, self._cols.T).T
             self._dense[self._pos] = np.eye(self.n_bnd)  # R P = I exactly
         return self._dense
 

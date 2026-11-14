@@ -17,7 +17,6 @@ import warnings
 
 import ngsolve as ngs
 import numpy as np
-import scipy.linalg as sla
 import torch
 
 # Calibrations measure the built-in rule-based "auto" choices, never a previously installed tuning.
@@ -324,8 +323,8 @@ class PosteriorContext:
             y, var = self.data(m)
             obs = LinearObservations(prior, averages=(self.centers(m), 0.05, "gaussian"), noise=var, factorize=False)
             mat = MatheronPosterior(obs, data=y)
-            gs = _dense(obs.gf) @ mat.bmat  # G Sigma0 G^T
-            pred = gs - gs @ sla.cho_solve(mat.kd_chol, gs)
+            gw = _dense(obs.gf) @ mat.w  # G Sigma_post G^T = G Sigma0 G^T - (G W)(G W)^T, no inverse of K_d
+            pred = _dense(obs.gf) @ mat.bmat - gw @ gw.T
             self.refs[m] = (pred, mat.mean)
         return self.refs[m]
 
@@ -386,8 +385,8 @@ def run_posterior(task: Task, ctx: PosteriorContext, rec: dict):
         pred_ref, mean_ref = ctx.reference(m)
         gf = _dense(obs.gf)
         if method == "matheron":
-            pred = gf @ post.bmat
-            pred = pred - pred @ sla.cho_solve(post.kd_chol, pred)
+            gw = gf @ post.w
+            pred = gf @ post.bmat - gw @ gw.T
         else:
             yt = (
                 torch.cat(

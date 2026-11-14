@@ -44,7 +44,7 @@ from .backend import (
 )
 from .inplace import InPlace
 from .observations import CHUNK, dense_if_full, observation_operator, whiten, whitener
-from .randomized import randomized_qr
+from .randomized import randomized_qr, stacked_qr
 from .seeding import inherit
 from .space import coefficient_columns, coefficient_vector
 
@@ -509,7 +509,7 @@ class LinearObservations:
 
         ``noise_scaling`` (one weight w_i >= 0 per observation) multiplies the noise precision of observation i by
         w_i, i.e. divides its variance by w_i (w_i = 0 ignores it). The factorisation does not depend on the weights,
-        so a re-weighted posterior costs only an l x l eigendecomposition: the Gaussian step of iteratively
+        so a re-weighted posterior costs only an SVD of a rank x m matrix: the Gaussian step of iteratively
         reweighted least squares and of Gibbs samplers for scale-mixture noise (Student-t, Laplace).
 
         ``mean`` (instead of ``data``) sets the mean directly: a Gaussian with this posterior covariance centred
@@ -526,21 +526,22 @@ class LinearObservations:
     def _posterior_from(self, scaling, data, seed, form):
         """Posterior with the noise precision of observation i multiplied by ``scaling[i]`` >= 0 (None: unchanged).
 
-        The factorisation does not depend on the scaling, so re-scaled posteriors cost only an l x l
-        eigendecomposition (public as ``posterior(noise_scaling=...)``).
+        The factorisation does not depend on the scaling, so re-scaled posteriors cost only an SVD of R S^1/2 (rank x
+        m; :meth:`_scaled_svd`) (public as ``posterior(noise_scaling=...)``).
         """
         sc = self._scaling(scaling)
         # NumPy BLAS threads busy-wait against NGSolve's threads even on these small l x l problems
         prior = self.prior
         with numpy_blas_threads(getattr(prior, "_cpu_blas_threads", 1) if getattr(prior, "engine", "") != "torch"
                                 else None):
-            middle = np.eye(self.rank) + (self.r * sc) @ self.r.T  # I + R S R^T
-            lam, v = np.linalg.eigh(middle)
-            a = (v * (lam**-0.5 - 1.0)) @ v.T
+            u, t, wt = self._scaled_svd(sc)
+            root = np.sqrt(1.0 + t**2)
+            a = (u * (-(t**2) / (root * (1.0 + root)))) @ u.T  # (I + R S R^T)^-1/2 - I, without cancellation
             mean = prior.mean
             if data is not None:
                 resid = np.asarray(data, dtype=float) - self.G @ mean
-                coeff = np.linalg.solve(middle, self.r @ (sc * whiten(self.wkind, self.wdata, resid)))
+                # (I + R S R^T)^-1 R S w = U diag(t / (1 + t^2)) W^T S^1/2 w
+                coeff = u @ (t / (1.0 + t**2) * (wt @ (np.sqrt(sc) * whiten(self.wkind, self.wdata, resid))))
                 lq = self._get_lq()
                 mean[prior.space.free] += _host(lq @ torch.from_numpy(coeff).to(lq)) if isinstance(lq, torch.Tensor) \
                     else lq @ coeff
@@ -561,6 +562,13 @@ class LinearObservations:
         label = f"{self.m} linear observations ({kind}, FE-space update, rank {self.rank})"
         return self.prior._derive(label, mean, post_map=update, seed=seed, exact=self._exact_record(scaling))
 
+    def _scaled_svd(self, sc):
+        """The SVD R S^1/2 = U diag(t) W^T (S = diag(sc)): I + R S R^T = U diag(1 + t^2) U^T (plus the identity off the
+        range of U), and every function of it follows from t without forming it. Forming it squares the spread of R's
+        singular values (up to signal / noise), and its eigendecomposition then loses the weakly informed directions
+        (measured: errors of 6e-3 in the update and 1e-6 in the posterior covariance at noise 1e-6)."""
+        return np.linalg.svd(self.r * np.sqrt(sc)[None, :], full_matrices=False)
+
     def _scaling(self, scaling) -> np.ndarray:
         sc = np.ones(self.m) if scaling is None else np.asarray(scaling, dtype=float)
         if sc.shape != (self.m,) or (sc < 0).any():
@@ -574,12 +582,11 @@ class LinearObservations:
 
         S = diag(noise_scaling) (the noise precision of observation i times its entry; default 1). Exact for an exact
         factorisation; for a randomised one it is the covariance of ``posterior(form="noise")``. No solves beyond
-        ``lq()`` (once): an r x r inverse per scaling, so many scalings (reweighting, experimental designs) are cheap.
+        ``lq()`` (once): an SVD of a rank x m matrix per scaling, so many scalings (reweighting, experimental designs)
+        are cheap.
         Pass it to :meth:`ngsrng.LocalCovariance.plus`, or use :meth:`local_covariance`."""
-        sc = self._scaling(noise_scaling)
-        middle = np.eye(self.rank) + (self.r * sc) @ self.r.T
-        d = np.linalg.inv(0.5 * (middle + middle.T)) - np.eye(self.rank)
-        return self.lq(), 0.5 * (d + d.T)
+        u, t, _ = self._scaled_svd(self._scaling(noise_scaling))
+        return self.lq(), (u * (-(t**2) / (1.0 + t**2))) @ u.T  # (I + R S R^T)^-1 - I
 
     def local_covariance(self, noise_scaling=None, prior_method="exact", **prior_options):
         """The posterior covariance on element-local dof pairs (:class:`ngsrng.LocalCovariance`): its ``variance()``
@@ -647,43 +654,52 @@ class MatheronPosterior(InPlace):
         f_post = f0 + B K_d^-1 (y + e - G f0),   f0 ~ prior,  e ~ N(0, Gamma),
         B = Sigma0 G^T,  K_d = Gamma + G Sigma0 G^T.
 
+    K_d is never formed: a Householder QR [L^T G^T; Gamma^T/2] = Q R gives K_d = R^T R, and with W = L Q_1 (Q_1: the
+    rows of Q against L^T G^T), B K_d^-1 = W R^-T and B K_d^-1 B^T = W W^T. Rounding errors then grow with
+    kappa(K_d)^(1/2) instead of kappa(K_d), which is up to (signal / noise)^2 for many close observations of a smooth
+    field: measured, 225 observations of a nu = 5 field with noise 1e-6 (kappa 1.6e13), the update moves by 6e-11
+    instead of 2.5e-6 under a rounding-size change of the set-up, and K_d is factorised where Cholesky would fail.
+
     Setup: m applications of L^T and of L. Per sample: one prior sample plus O(nfree m).
 
-    ``compute``: "auto" (on the prior's GPU if it has one: B, the Cholesky factor of K_d and G are kept there, the
-    noise is drawn there, and the samples never leave it), "device" (the prior's torch device, also a CPU one) or
-    "host" (NumPy on the CPU: dense algebra and noise there, the prior's samples copied over). ``bmat`` and
-    ``kd_chol`` are NumPy either way (made from the device on first access).
+    ``compute``: "auto" (on the prior's GPU if it has one: W, R and G are kept there, the noise is drawn there, and
+    the samples never leave it), "device" (the prior's torch device, also a CPU one) or "host" (NumPy on the CPU:
+    dense algebra and noise there, the prior's samples copied over). ``w`` (W), ``rfac`` (R) and, derived from them,
+    ``bmat`` (B = W R), ``kd`` (R^T R) and ``kd_chol`` (R as an upper Cholesky factor for ``scipy.linalg.cho_solve``)
+    are NumPy either way (made from the device on first access).
     """
 
     def __init__(self, obs: LinearObservations, data=None, seed=None, compute="auto"):
         prior, s = obs.prior, obs.prior.space
-        check_memory(prior, obs.m, prior.nrand + 2 * s.nfree, "Matheron conditioning",
+        check_memory(prior, obs.m, 2 * (prior.nrand + obs.m) + s.nfree, "Matheron conditioning",
                      "Use LinearObservations(..., rank=k).posterior() for many observations.")
         dev = compute_device(compute, prior, "MatheronPosterior")
         g = obs.gf  # (m x nfree), sparse or dense
         gamma = np.diag(1.0 / obs.wdata**2) if obs.wkind == "diag" else np.asarray(obs.noise, dtype=float)
         self.g, self.prior, self.ma = g, prior, obs.m
         self.gamma_half = np.linalg.cholesky(gamma)
-        self._dev, self._device, self._bmat = dev, DeviceCache(), None
-        lt = obs._lt(g.T)
-        if dev is not None:  # B = Sigma0 G^T and G B on the device; only K_d (m x m) comes to the host
-            bmat = obs._l(lt.to(dev))
-            self._device["bmat"] = bmat
-            kd = gamma + _host(self._g_on(dev) @ bmat)
+        self._dev, self._device, self._w = dev, DeviceCache(), None
+        lt = obs._lt(g.T)  # L^T G^T (nrand x m)
+        if dev is not None:  # the QR and W = L Q_1 on the device; only R (m x m) comes to the host
+            q1, r = stacked_qr(lt.to(dev, torch.float64), torch.from_numpy(np.ascontiguousarray(self.gamma_half.T)))
+            del lt
+            self._device["w"] = obs._l(q1.contiguous()).to(torch.float64)
+            self._device["r"] = r
+            self.rfac = _host(r)
         else:
-            self._bmat = obs._l(lt.cpu().numpy())  # Sigma0 G^T (nfree x m_a)
-            kd = gamma + np.asarray(g @ self._bmat)
-        del lt
-        self.kd = kd  # K_d = Gamma + G Sigma0 G^T (m x m)
-        self.kd_chol = sla.cho_factor(kd)
+            q1, r = stacked_qr(lt.cpu().numpy(), self.gamma_half.T)
+            del lt
+            self._w = np.asarray(obs._l(np.ascontiguousarray(q1)), dtype=np.float64)  # W = L Q_1 (nfree x m)
+            self.rfac = r
+        del q1
         self._prior = prior if getattr(prior, "_prior", None) is None else prior._prior
         self._mean = prior.mean
-        if data is not None:
-            w = sla.cho_solve(self.kd_chol, np.asarray(data, dtype=float) - obs.G @ self._mean)
+        if data is not None:  # mean + B K_d^-1 (y - G m) = mean + W R^-T (y - G m)
+            v = sla.solve_triangular(self.rfac, np.asarray(data, dtype=float) - obs.G @ self._mean, trans="T")
             if dev is not None:
-                self._mean[s.free] += _host(self._device["bmat"] @ torch.from_numpy(w).to(dev))
+                self._mean[s.free] += _host(self._device["w"] @ torch.from_numpy(v).to(dev))
             else:
-                self._mean[s.free] += self._bmat @ w
+                self._mean[s.free] += self._w @ v
         self.source = inherit(seed, prior)  # seed=None: a child of the prior's randomness (ngsrng.seeding)
         self.space = s
         self.device = dev if dev is not None else torch.device("cpu")
@@ -697,14 +713,29 @@ class MatheronPosterior(InPlace):
         return self._dev
 
     @property
+    def w(self) -> np.ndarray:
+        """W = L Q_1 (nfree x m), NumPy: B K_d^-1 = W R^-T, and the posterior covariance is Sigma0 - W W^T."""
+        if self._w is None:
+            self._w = _host(self._device["w"])
+        return self._w
+
+    @property
     def bmat(self) -> np.ndarray:
-        """B = Sigma0 G^T (nfree x m), NumPy."""
-        if self._bmat is None:
-            self._bmat = _host(self._device["bmat"])
-        return self._bmat
+        """B = Sigma0 G^T = W R (nfree x m), NumPy."""
+        return self.w @ self.rfac
+
+    @property
+    def kd(self) -> np.ndarray:
+        """K_d = Gamma + G Sigma0 G^T = R^T R (m x m), NumPy."""
+        return self.rfac.T @ self.rfac
+
+    @property
+    def kd_chol(self):
+        """K_d's Cholesky factor in the form of ``scipy.linalg.cho_factor``: (R, False), R upper triangular."""
+        return self.rfac, False
 
     def __getstate__(self):  # host arrays only: the device copies are made again on first use
-        self.bmat
+        self.w
         return dict(self.__dict__)
 
     def _g_on(self, dev, transpose=False):
@@ -715,14 +746,15 @@ class MatheronPosterior(InPlace):
         return self._device[key]
 
     def _ops(self):
-        """(B, chol(K_d), Gamma^1/2, G, mean, free indices) on the device, float64, made once."""
+        """(W, R, Gamma^1/2, G, mean, free indices) on the device, float64, made once."""
         dev = self._dev
         if "ops" not in self._device:
-            if "bmat" not in self._device:
-                self._device["bmat"] = torch.from_numpy(self._bmat).to(dev)
-            chol = torch.linalg.cholesky(torch.from_numpy(self.kd).to(dev))
+            if "w" not in self._device:
+                self._device["w"] = torch.from_numpy(self._w).to(dev)
+            if "r" not in self._device:
+                self._device["r"] = torch.from_numpy(self.rfac).to(dev)
             free = None if self.space.nfree == self.space.ndof else torch.from_numpy(self.space.free).to(dev)
-            self._device["ops"] = (self._device["bmat"], chol, torch.from_numpy(self.gamma_half).to(dev),
+            self._device["ops"] = (self._device["w"], self._device["r"], torch.from_numpy(self.gamma_half).to(dev),
                                    self._g_on(dev), torch.from_numpy(self._mean).to(dev), free)
         return self._device["ops"]
 
@@ -736,33 +768,33 @@ class MatheronPosterior(InPlace):
 
     def apply(self, eta: torch.Tensor) -> torch.Tensor:
         if self._dev is not None:
-            bmat, chol, gh, g, _, _ = self._ops()
+            w, r, gh, g, _, _ = self._ops()
             e = eta.detach().to(self._dev, torch.float64)
             e = e[:, None] if e.ndim == 1 else e
             f0 = self.prior.apply(e[: self.prior.nrand]).to(torch.float64)
-            out = f0 + bmat @ torch.cholesky_solve(gh @ e[self.prior.nrand :] - g @ f0, chol)
+            out = f0 + w @ torch.linalg.solve_triangular(r.mT, gh @ e[self.prior.nrand :] - g @ f0, upper=False)
             return out[:, 0] if eta.ndim == 1 else out
         e = eta.detach().cpu().double()
         e = e[:, None] if e.ndim == 1 else e
         f0 = self.prior.apply(e[: self.prior.nrand]).double().cpu().numpy()
         noise = self.gamma_half @ e[self.prior.nrand :].numpy()
-        corr = self.bmat @ sla.cho_solve(self.kd_chol, noise - np.asarray(self.g @ f0))
+        corr = self.w @ sla.solve_triangular(self.rfac, noise - np.asarray(self.g @ f0), trans="T")
         out = torch.from_numpy(f0 + corr)
         return out[:, 0] if eta.ndim == 1 else out
 
     def apply_t(self, y: torch.Tensor) -> torch.Tensor:
         """Adjoint of ``apply``: y -> [L0^T (y - G^T K_d^-1 B^T y); Gamma^T/2 K_d^-1 B^T y]."""
         if self._dev is not None:
-            bmat, chol, gh, *_ = self._ops()
+            wmat, r, gh, *_ = self._ops()
             v = y.detach().to(self._dev, torch.float64)
             v = v[:, None] if v.ndim == 1 else v
-            w = torch.cholesky_solve(bmat.T @ v, chol)
+            w = torch.linalg.solve_triangular(r, wmat.T @ v, upper=True)  # K_d^-1 B^T v = R^-1 W^T v
             top = self.prior.apply_t(v - self._g_on(self._dev, transpose=True) @ w).to(torch.float64)
             out = torch.cat([top, gh.T @ w], dim=0)
             return out[:, 0] if y.ndim == 1 else out
         v = y.detach().cpu().double()
         v = v[:, None] if v.ndim == 1 else v
-        w = sla.cho_solve(self.kd_chol, self.bmat.T @ v.numpy())
+        w = sla.solve_triangular(self.rfac, self.w.T @ v.numpy())  # K_d^-1 B^T v = R^-1 W^T v
         top = self.prior.apply_t(torch.from_numpy(np.ascontiguousarray(v.numpy() - np.asarray(self.g.T @ w))))
         top = top.double().cpu()
         out = torch.cat([top, torch.from_numpy(self.gamma_half.T @ w)], dim=0)

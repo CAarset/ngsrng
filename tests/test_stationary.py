@@ -153,6 +153,8 @@ def test_boundary_update_is_insensitive_to_rounding_in_the_set_up():
     through a Cholesky factor of Sigma_DD (here kappa(Sigma_DD) ~ 1e8: smooth field, many Dirichlet dofs per length)."""
     import scipy.linalg as sla
 
+    from ngsrng.randomized import GRAM_JITTER, gram_regression
+
     fes = ngs.H1(ngs.Mesh(ngs.unit_square.GenerateMesh(maxh=0.1)), order=2, dirichlet=".*")
     f = ngsrng.StationaryMatern(fes, 1.0, 5.0, construction="torus", seed=1)
     assert f.plan["conditioning"]["mode"] == "dense"
@@ -165,18 +167,18 @@ def test_boundary_update_is_insensitive_to_rounding_in_the_set_up():
 
     def cholesky_route(lt):
         s = lt.T @ lt
-        factor = sla.cho_factor(s + st._JITTER * np.trace(s) / nd * np.eye(nd), lower=True)
+        factor = sla.cho_factor(s + GRAM_JITTER * np.trace(s) / nd * np.eye(nd), lower=True)
         return sla.cho_solve(factor, f._project(lt)[free].T).T
 
     c = f._project(np.random.default_rng(0).standard_normal((f.nrand, 3)))
     moved = lt * (1 + 1e-14 * np.random.default_rng(1).standard_normal(lt.shape))
     change = {}
-    for name, make in (("qr", lambda m: st._qr_regression(m, f._project, free)), ("cholesky", cholesky_route)):
+    for name, make in (("qr", lambda m: gram_regression(m, f._project, free)), ("cholesky", cholesky_route)):
         base, other = (c[free] - make(m) @ c[f._dir] for m in (lt, moved))
         change[name] = np.linalg.norm(other - base) / np.linalg.norm(base)
     assert change["qr"] < 1e-10 and change["cholesky"] > 20 * change["qr"]
     # the field uses that regression, and both routes agree (same law)
-    np.testing.assert_allclose(f._cond[1], st._qr_regression(lt, f._project, free), rtol=0, atol=1e-10)
+    np.testing.assert_allclose(f._cond[1], gram_regression(lt, f._project, free), rtol=0, atol=1e-10)
     np.testing.assert_allclose(f._cond[1] @ c[f._dir], cholesky_route(lt) @ c[f._dir], rtol=0,
                                atol=1e-6 * np.abs(c[free]).max())
 

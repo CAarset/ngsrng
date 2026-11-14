@@ -311,3 +311,36 @@ def test_reweighted_posterior_variance_and_trace():
         assert abs(lc.trace()[0] - float(np.sum(want * mass.toarray()))) < 1e-10 * np.trace(want)
         np.testing.assert_allclose(lc.values(e), np.diag(e @ want @ e.T), rtol=1e-9)
     assert obs.local_covariance().variance().space.ndof > 0  # the variance map as a GridFunction
+
+
+@pytest.mark.parametrize("noise_std", [1e-6, 1e-8])
+def test_posteriors_stay_accurate_for_close_observations_and_small_noise(noise_std):
+    """150 observations of a smooth 1D field, much closer than its correlation length, with small noise: K_d = Gamma +
+    G Sigma0 G^T has a condition number up to ~1e17, and R's singular values span the signal-to-noise ratio. Every
+    posterior route (the factor update in both forms, its covariance update, Matheron) agrees with the inverse-free
+    Sigma0 - W W^T (W = L Q_1, [L^T G^T; Gamma^T/2] = Q R); forming K_d or I + R R^T instead lost ~1e-6 here, gave
+    NaN at noise 1e-8, or could not factorise K_d."""
+    from ngsolve.meshes import Make1DMesh
+
+    fes = ngs.H1(Make1DMesh(400), order=2)
+    g = ngsrng.Gaussian(fes, ngsrng.matern_correlation(0.5, nu=4.5).bind(fes), dtype="float64", seed=0)
+    obs = LinearObservations(g, points=np.linspace(0.2, 0.8, 150)[:, None], noise=noise_std**2)
+    l = lambda x: g.apply(torch.from_numpy(np.ascontiguousarray(x))).double().numpy()  # noqa: E731
+    v = np.random.default_rng(0).standard_normal((g.space.nfree, 3))
+    sig0v = l(g.apply_t(torch.from_numpy(v)).double().numpy())
+    gmat = obs.gf.toarray() if hasattr(obs.gf, "toarray") else np.asarray(obs.gf)
+    lt = obs._lt(gmat.T).cpu().numpy()
+    q, _ = np.linalg.qr(np.vstack([lt, noise_std * np.eye(gmat.shape[0])]))
+    w = l(q[: lt.shape[0]])
+    ref = sig0v - w @ (w.T @ v)
+
+    def err(x):
+        return np.linalg.norm(x - ref) / np.linalg.norm(sig0v)
+
+    for post in (obs.posterior(), obs.posterior(form="noise"), MatheronPosterior(obs)):
+        assert err(post.apply(post.apply_t(torch.from_numpy(v))).double().numpy()) < 1e-10, type(post).__name__
+    u, d = obs.posterior_update()
+    assert err(sig0v + u @ (d @ (u.T @ v))) < 1e-10
+    mp = MatheronPosterior(obs)
+    np.testing.assert_allclose(mp.kd, mp.rfac.T @ mp.rfac)  # the derived attributes stay available
+    np.testing.assert_allclose(mp.bmat, mp.w @ mp.rfac)

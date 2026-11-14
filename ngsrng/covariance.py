@@ -257,8 +257,7 @@ class _MatheronUpdate:
 
     def __call__(self):
         src = self.source
-        return (as_covariance(src.prior, compute=self.compute), src.bmat,
-                -sla.cho_solve(src.kd_chol, np.eye(src.bmat.shape[1])))
+        return as_covariance(src.prior, compute=self.compute), src.w, -np.eye(src.w.shape[1])  # Sigma0 - W W^T
 
 
 class _DerivedUpdate:

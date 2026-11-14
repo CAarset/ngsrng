@@ -477,3 +477,27 @@ def test_conditioning_on_the_device(mesh, monkeypatch, power):
     rng.normal(bnd="left", bnd_values=data, out=buf)
     assert torch.equal(buf[:, torch.as_tensor(sam.dofs, device="cuda")].cpu(),
                        torch.from_numpy(data).expand(6, -1))
+
+
+def test_dense_lifting_of_a_factored_source_avoids_sigma_bb():
+    """For a source with a factor Sigma = L L^T the stored lifting comes from a QR of L^T E (no Cholesky factor of
+    Sigma_BB, whose condition number squares that of the QR's R) and agrees with the Cholesky-route lifting."""
+    import scipy.linalg as dla
+
+    from ngsrng.randomized import gram_regression
+
+    mesh = ngs.Mesh(ngs.unit_square.GenerateMesh(maxh=0.1))
+    fes = ngs.H1(mesh, order=2)
+    g = ngsrng.Gaussian(fes, ngsrng.matern_correlation(0.5, nu=3).bind(fes), dtype="float64", seed=0)
+    sam = BoundarySampler(g, "left")
+    lift = sam.lifting
+    assert sam._chol is None and sam._sigma_bb is None  # Sigma_BB was neither formed nor factorised
+    np.testing.assert_allclose(lift[sam._pos], np.eye(sam.n_bnd), atol=1e-12)
+    src = sam._src
+    e = np.zeros((sam.space.nfree, sam.n_bnd))
+    e[sam._pos, np.arange(sam.n_bnd)] = 1.0
+    lt = src.lt(e)
+    np.testing.assert_allclose(lift[sam._int_pos], gram_regression(lt, src.l)[sam._int_pos], rtol=0, atol=1e-12)
+    cols = src.l(lt)  # Sigma E
+    chol = dla.cho_solve(dla.cho_factor(cols[sam._pos]), cols.T).T
+    assert np.abs(lift[sam._int_pos] - chol[sam._int_pos]).max() < 1e-6 * np.abs(chol).max()
