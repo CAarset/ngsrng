@@ -109,6 +109,57 @@ def test_lowrank_and_monte_carlo_estimates_are_unbiased_with_valid_errors():
     np.testing.assert_allclose(lc.values(e1), local_covariance(g1, "exact").values(e1), rtol=1e-7)
 
 
+def test_fe_space_basis_spans_the_noise_space_range():
+    """With more noise than free dofs the "lowrank" basis is computed in FE space. Subspace iteration on Sigma M from
+    L Omega spans the range of the noise-space randomised SVD of L from the same Omega, (Sigma M)^q L Omega; the
+    estimator starts from Sigma D^(1/2) Omega instead (D = diag M) and is unbiased."""
+    import ngsrng.covariance as cov
+    from ngsrng.randomized import gaussian_block, gram_orth, randomized_svd
+
+    fes = ngs.H1(ngs.Mesh(ngs.unit_square.GenerateMesh(maxh=0.15)), order=2)
+    _, g = _setup(fes, length=0.4)
+    src = as_covariance(g, compute="host")
+    mass, k = g.space.mass_free, 20
+    assert src.nrand > g.space.nfree
+    omega = gaussian_block(src.nrand, k, 7)
+    q_noise, _, _ = randomized_svd(src.l, lambda y: src.lt(mass @ y), src.nrand, k, oversampling=0,
+                                   power_iterations=2, seed=7, orth=gram_orth(mass))
+    q_fe = cov._subspace_iteration(src.l(omega), src.sigma, mass, cov._stable_orth(mass), 2)
+    np.testing.assert_allclose(q_fe.T @ (mass @ q_fe), np.eye(k), atol=1e-12)
+    cosines = np.linalg.svd(q_noise.T @ (mass @ q_fe), compute_uv=False)  # of the principal angles
+    np.testing.assert_allclose(cosines, 1.0, atol=1e-9)
+    # the estimator: FE-space basis, unbiased (within its standard errors of the exact variance)
+    lc = local_covariance(g, "lowrank", rank=k, samples=64)
+    assert "FE space" in lc.method and lc.applications == 8 * k + 64  # 2 (q + 2) k + samples
+    e = ngsrng.observation_operator(fes, points=_points(fes))[:, g.space.free]
+    ref = local_covariance(g, "exact").values(e)
+    v, se = lc.values(e, stderr=True)
+    assert np.abs((v - ref) / se).max() < 5
+    q, _, apps, where = cov._basis(src, k, 2, np.random.default_rng(0))
+    assert where == "FE space" and apps == 8 * k and q.shape == (g.space.nfree, k)
+    np.testing.assert_allclose(q.T @ (mass @ q), np.eye(k), atol=1e-12)
+
+
+def test_lowrank_basis_in_noise_space_when_it_is_the_smaller_one():
+    fes = SPACES["2D-L2-p1"]()  # diagonal mass: as much noise as free dofs
+    g = ngsrng.default_rng(fes, seed=1, precision=ngsrng.matern_dg(fes, kappa=8.0), dtype="float64").gaussian()
+    lc = local_covariance(g, "lowrank", rank=10, samples=16)
+    assert g.nrand <= g.space.nfree and "noise space" in lc.method and lc.applications == 7 * 10 + 16
+
+
+def test_samples_do_not_depend_on_the_block_size(monkeypatch):
+    import ngsrng.covariance as cov
+
+    fes = ngs.H1(ngs.Mesh(ngs.unit_square.GenerateMesh(maxh=0.2)), order=2)
+    _, g = _setup(fes)
+    src = as_covariance(g, compute="host")
+    a = src.samples(40, np.random.default_rng(3))
+    monkeypatch.setattr(cov, "block_columns", lambda *rows: 7)
+    b = src.samples(40, np.random.default_rng(3))
+    np.testing.assert_array_equal(a, b)
+    assert a.shape == (g.space.nfree, 40)
+
+
 def test_operator_covariances_conventions_and_forms():
     fes = ngs.H1(ngs.Mesh(ngs.unit_square.GenerateMesh(maxh=0.2)), order=2, dirichlet="bottom")
     u, v = fes.TnT()

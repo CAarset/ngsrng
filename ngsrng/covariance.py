@@ -35,7 +35,7 @@ import scipy.sparse.linalg as spla
 import torch
 
 from .backend import compute_device, numpy_blas_threads, sparse_to_torch
-from .randomized import gram_orth, randomized_svd
+from .randomized import euclidean_orth, gram_orth, randomized_svd
 from .space import SpaceInfo, coefficient_vector
 
 # Largest free-dof count for which "auto" computes the local covariance exactly from all columns of Sigma (one
@@ -99,9 +99,19 @@ class CovarianceSource:
 
     def samples(self, n, rng):
         """n zero-mean samples (nfree x n); needs a factor. On the device (torch) when the source has one; the white
-        noise comes from ``rng`` (NumPy) either way."""
-        noise = rng.standard_normal((self.nrand, n))
-        return self.tl(_up(noise, self.device)) if self.device is not None else self.l(noise)
+        noise comes from ``rng`` (NumPy) either way. Sample j is made from the j-th run of nrand consecutive draws,
+        a block of columns at a time: the noise is never formed for all n samples at once (nrand x n values), and
+        the samples do not depend on the block size."""
+        step = block_columns(self.nrand, self.space.nfree)
+        out = None
+        for i in range(0, n, step):
+            noise = rng.standard_normal((min(step, n - i), self.nrand)).T
+            f = self.tl(_up(noise, self.device)) if self.device is not None else self.l(noise)
+            if out is None:
+                out = (torch.empty((f.shape[0], n), dtype=f.dtype, device=f.device) if isinstance(f, torch.Tensor)
+                       else np.empty((f.shape[0], n)))
+            out[:, i:i + f.shape[1]] = f
+        return out
 
 
 def _blas_threads(owner):
@@ -428,8 +438,9 @@ def local_covariance(source, method="auto", *, fes=None, convention=None, rank=1
       iterations), the exact local covariance of the part of Sigma it captures (Sigma - (I-P) Sigma (I-P)^T,
       P = Q Q^T M), and Monte Carlo with ``samples`` (default 32) samples for the residual (I-P) Sigma (I-P)^T only
       (white-noise probes for apply-only covariances). Unbiased; the error shrinks with the residual's variance, so
-      it pays off for fast spectral decay (smooth fields, long correlation lengths). For a prior plus low-rank
-      update, applied to the prior;
+      it pays off for fast spectral decay (smooth fields, long correlation lengths). The basis is computed in the
+      smaller of the noise space and FE space (FE space for element-local white noise: less memory and time; the
+      result's ``method`` says which). For a prior plus low-rank update, applied to the prior;
     - "mc": Monte Carlo with ``samples`` (default 1000) samples (needs a sampler: not for operator covariances).
 
     ``compute``: where the set-up runs: "auto" (on the source's GPU, if it has one: the applications of L, L^T or
@@ -538,14 +549,78 @@ def _white_noise(space):
     return noise, minv
 
 
+def _stable_orth(mass):
+    """M-orthonormaliser for powered FE-space blocks: a Euclidean QR first, then Cholesky QR in the M inner product.
+    The columns of (Sigma M)^q Y spread over the eigenvalues of Sigma M to the power q, and Cholesky QR alone squares
+    that spread (its Gram matrix), so it would fail or drop the small directions; after the Euclidean QR the M-Gram
+    matrix is as well conditioned as M."""
+    orth = gram_orth(mass)
+    return lambda y: orth(euclidean_orth(y))
+
+
+def _subspace_iteration(y, sigma, mass_op, orth, power_iterations):
+    """M-orthonormal basis of the range of (Sigma M)^q y, re-orthonormalised after every application of Sigma."""
+    for _ in range(power_iterations):
+        y = sigma(mass_op @ orth(y))
+    return orth(y)
+
+
+def _fe_start(src, k, rng):
+    """Start block of the FE-space subspace iteration, Sigma D^(1/2) Omega (D = diag M, Omega nfree x k standard
+    normal), on the source's device if it has one; and its cost in applications of L, L^T or Sigma. D^(1/2) Omega is
+    white noise (covariance M) up to the spectral equivalence of diag M and M, which holds uniformly in the mesh size,
+    also on graded meshes (M Omega, covariance M^2, would weight the large elements); it is drawn in FE space, not in
+    the noise space, where nrand x k draws would cost more than the iteration."""
+    z = np.sqrt(src.space.mass_free.diagonal())[:, None] * rng.standard_normal((src.space.nfree, k))
+    if src.device is not None:
+        return src.tsigma(_up(z, src.device)), 2 * k
+    return src.sigma(z), (2 if src.has_factor else 1) * k
+
+
 def _basis(src, rank, power_iterations, rng):
     """M-orthonormal Q (nfree x k) of the dominant range, and the exact captured part as a term [Q, Y] D [Q, Y]^T
-    = Q Y^T + Y Q^T - Q B Q^T (Y = Sigma M Q, B = Q^T M Y); returns (Q, term, applications). With a device source
-    the basis is computed there and Q is returned there (the term on the host)."""
+    = Q Y^T + Y Q^T - Q B Q^T (Y = Sigma M Q, B = Q^T M Y); returns (Q, term, applications, where). With a device
+    source the basis is computed there and Q is returned there (the term on the host). The captured part is exact
+    and the Monte Carlo residual unbiased for any Q; Q only decides how much variance is left to Monte Carlo.
+
+    With a factor Sigma = L L^T and no more noise than free dofs (nrand <= nfree), Q is the randomised SVD of L in
+    the noise space: the range of (Sigma M)^q L Omega (q = ``power_iterations``), (2q + 3) k applications of L or
+    L^T. Otherwise (more noise than free dofs: element-local or stiffness-shaped white noise; or an operator
+    covariance) Q comes from subspace iteration on Sigma M in FE space, on nfree x k blocks: the range of
+    (Sigma M)^q Sigma D^(1/2) Omega (:func:`_fe_start`), 2 (q + 2) k applications of L or L^T, or (q + 2) k of Sigma.
+    Note: the FE-space form and its analysis (half a power iteration further than the noise-space start, for one more
+    application per column; the start white noise up to a mesh-independent factor) are recent and still to be
+    double-checked; the measurements agree with them (same errors and standard errors as the noise-space form, less
+    memory and time where nrand is several times nfree).
+    """
+    s = src.space
+    n = s.nfree
+    if src.has_factor and src.nrand <= n:
+        return _noise_basis(src, rank, power_iterations, rng) + ("noise space",)
+    dev = src.device  # a factor on the device (operators have no device)
+    mass = s.mass_free
+    mass_op = sparse_to_torch(mass, dev, torch.float64) if dev is not None else mass
+    sigma = src.tsigma if dev is not None else src.sigma
+    per = 2 if src.has_factor else 1  # applications of L, L^T or Sigma per application of Sigma
+    k = min(rank, n)
+    y, apps = _fe_start(src, k, rng)
+    q = _subspace_iteration(y, sigma, mass_op, _stable_orth(mass), power_iterations)
+    y = sigma(mass_op @ q)
+    apps += per * (power_iterations + 1) * k
+    b = _np(q.T @ (mass_op @ y))
+    b = 0.5 * (b + b.T)
+    r = q.shape[1]
+    d = np.block([[-b, np.eye(r)], [np.eye(r), np.zeros((r, r))]])
+    qy = _np(torch.cat([q, y], dim=1)) if dev is not None else np.hstack([q, y])
+    return q, (qy, d), apps, "FE space"
+
+
+def _noise_basis(src, rank, power_iterations, rng):
+    """_basis by the randomised SVD of the factor L, in the noise space (nrand <= nfree)."""
     s = src.space
     mass = s.mass_free
     n = s.nfree
-    if src.device is not None:  # a factor on the device (operators have no device)
+    if src.device is not None:
         mass_t = sparse_to_torch(mass, src.device, torch.float64)
         k = min(rank, n, src.nrand)
         q, sv, v = randomized_svd(src.tl, lambda y: src.tlt(mass_t @ y), src.nrand, k, oversampling=0,
@@ -557,25 +632,13 @@ def _basis(src, rank, power_iterations, rng):
         r = q.shape[1]
         d = np.block([[-b, np.eye(r)], [np.eye(r), np.zeros((r, r))]])
         return q, (_np(torch.cat([q, y], dim=1)), d), apps
-    if src.has_factor:
-        k = min(rank, n, src.nrand)
-        q, sv, v = randomized_svd(src.l, lambda y: src.lt(mass @ y), src.nrand, k, oversampling=0,
-                                  power_iterations=power_iterations, seed=int(rng.integers(2**31)),
-                                  orth=gram_orth(mass))
-        y = src.l(v * sv)  # Sigma M Q = L (L^T M Q) = L V S
-        b = np.diag(sv**2)
-        apps = (2 * power_iterations + 2) * k + q.shape[1]
-    else:
-        k = min(rank, n)
-        orth = gram_orth(mass)
-        y = src.sigma(mass @ rng.standard_normal((n, k)))
-        for _ in range(power_iterations):
-            y = src.sigma(mass @ orth(y))
-        q = orth(y)
-        y = src.sigma(mass @ q)
-        b = q.T @ (mass @ y)
-        b = 0.5 * (b + b.T)
-        apps = (power_iterations + 2) * k
+    k = min(rank, n, src.nrand)
+    q, sv, v = randomized_svd(src.l, lambda y: src.lt(mass @ y), src.nrand, k, oversampling=0,
+                              power_iterations=power_iterations, seed=int(rng.integers(2**31)),
+                              orth=gram_orth(mass))
+    y = src.l(v * sv)  # Sigma M Q = L (L^T M Q) = L V S
+    b = np.diag(sv**2)
+    apps = (2 * power_iterations + 2) * k + q.shape[1]
     r = q.shape[1]
     d = np.block([[-b, np.eye(r)], [np.eye(r), np.zeros((r, r))]])
     return q, (np.hstack([q, y]), d), apps
@@ -584,7 +647,7 @@ def _basis(src, rank, power_iterations, rng):
 def _lowrank(src, rank, samples, power_iterations, rng) -> LocalCovariance:
     s = src.space
     mass = s.mass_free
-    q, term, apps = _basis(src, rank, power_iterations, rng)
+    q, term, apps, where = _basis(src, rank, power_iterations, rng)
     if src.device is not None:  # residual samples on the device too; only they come back
         mass_t = sparse_to_torch(mass, src.device, torch.float64)
         f = src.samples(samples, rng)
@@ -604,7 +667,8 @@ def _lowrank(src, rank, samples, power_iterations, rng) -> LocalCovariance:
         mc = (a, minv(w))
         apps += samples
     return LocalCovariance(s, terms=[term], mc=mc, applications=apps,
-                           method=f"low rank {q.shape[1]} (exact) + Monte Carlo residual ({samples} samples)")
+                           method=f"low rank {q.shape[1]} (exact, basis in {where}) + Monte Carlo residual "
+                                  f"({samples} samples)")
 
 
 def _monte_carlo(src, samples, rng) -> LocalCovariance:
