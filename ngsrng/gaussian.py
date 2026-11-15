@@ -336,7 +336,7 @@ class Gaussian(DenseOf, InPlace, Rebuildable):
             self.noise.ngs_setup(s)
             self._ngs_mass = ngs_sparse(s.mass) if self.n_mass_steps else None
             # work vectors (eta, z, c, tmp, result) per thread: samples run in parallel threads
-            self._work = Scratch(self._new_work)
+            self._work = Scratch(type(self)._new_work)
         self._maps = []  # noise-space maps, applied to eta before the pipeline
         self._post_maps = []  # FE-space maps, applied to the pipeline's output
         # CPU engine: float64 torch copies of the noise sampler and the mass matrix (for apply_t). Shared with derived
@@ -604,7 +604,7 @@ class Gaussian(DenseOf, InPlace, Rebuildable):
         mean, free = self._mean, self.space.free
 
         def work(lo, hi):
-            w = self._work.get()
+            w = self._work.get(self)
             e, res = w[0].FV().NumPy(), w[4]
             r = res.FV().NumPy()
             ev = evaluate.CreateColVector() if evaluate is not None else None

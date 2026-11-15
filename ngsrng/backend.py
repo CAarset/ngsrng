@@ -465,17 +465,23 @@ class Rebuildable:
 
 
 class Scratch:
-    """Per-thread work objects (e.g. NGSolve vectors), created by ``factory`` on first use in each thread: shared
-    temporaries would make concurrent applications race."""
+    """Per-thread work objects (e.g. NGSolve vectors), created by ``factory(*args)`` on first use in each thread
+    (``get(*args)``): shared temporaries would make concurrent applications race.
+
+    An object keeping its own work vectors passes its class's function and itself, ``Scratch(type(self)._new_work)``
+    and ``get(self)``, never its bound method: ``self -> Scratch -> self._new_work -> self`` is a reference cycle, which
+    only a full garbage collection frees, so every such object (and the factorisations and samplers it holds, memory
+    the collector does not see) would outlive its last use until then (measured: 0.3-0.5 GB per sampler set-up in
+    long-lived worker processes). Shallow copies sharing the Scratch (``_reseeded``, ``spawn``) pass themselves."""
 
     def __init__(self, factory):
         self.factory = factory
         self._tls = threading.local()
 
-    def get(self):
+    def get(self, *args):
         obj = getattr(self._tls, "obj", None)
         if obj is None:
-            obj = self._tls.obj = self.factory()
+            obj = self._tls.obj = self.factory(*args)
         return obj
 
     def __getstate__(self):  # copy.copy of an owner shares the factory, not other threads' objects

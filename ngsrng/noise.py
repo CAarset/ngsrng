@@ -287,7 +287,7 @@ class ChebyshevNoise(NoiseSampler):
         self.ngs_space = space
         self._ngs_a = ngs_sparse(self.at)
         self._ngs_out = ngs_sparse(sp.diags(self.dsqrt).tocsr(), rows=space.free, nrows=space.ndof)
-        self._ngs_tmp = Scratch(self._new_tmp)  # per thread
+        self._ngs_tmp = Scratch(type(self)._new_tmp)  # per thread
         return self
 
     def _new_tmp(self):
@@ -295,7 +295,7 @@ class ChebyshevNoise(NoiseSampler):
 
     def ngs_apply(self, eta, out):
         alpha, beta = 2.0 / (self.hi - self.lo), (self.hi + self.lo) / (self.hi - self.lo)
-        b1, b2, b0, av = self._ngs_tmp.get()
+        b1, b2, b0, av = self._ngs_tmp.get(self)
         b1[:] = 0.0
         b2[:] = 0.0
         # Coefficients as Python floats: numpy scalars hijack ``scalar * BaseVector`` and break the expression.
@@ -493,14 +493,14 @@ class LocalGramNoise(NoiseSampler):
         self._ngs_hb = ngs_sparse(self.h_broken) if self.h_broken.nnz else None
         self._ngs_hg = ngs_sparse(self.h_boundary, rows=space.free, nrows=space.ndof) if self.h_boundary.nnz else None
         self._ngs_eft = ngs_sparse(self.eft, rows=space.free, nrows=space.ndof)
-        self._ngs_y = Scratch(self._new_broken_vector)  # per thread
+        self._ngs_y = Scratch(type(self)._new_broken_vector)  # per thread
         return self
 
     def _new_broken_vector(self):
         return ngs.la.BaseVector(self.nbroken)
 
     def ngs_apply(self, eta, out):
-        e, y = eta.FV().NumPy(), self._ngs_y.get()
+        e, y = eta.FV().NumPy(), self._ngs_y.get(self)
         y[:] = 0.0
         yn = y.FV().NumPy()
         off = 0

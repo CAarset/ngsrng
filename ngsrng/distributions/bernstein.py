@@ -284,7 +284,7 @@ class SymmetricFactor(Rebuildable):
     def __init__(self, a):
         self.a = sp.csr_matrix(a)
         self._factorize()
-        self._vectors = Scratch(self._new_vectors)
+        self._vectors = Scratch(type(self)._new_vectors)
 
     def _factorize(self):
         self.mat = ngs_sparse(self.a)
@@ -303,7 +303,7 @@ class SymmetricFactor(Rebuildable):
         out = np.empty((cols.shape[1], cols.shape[0]))
 
         def work(lo, hi):
-            rhs, sol = self._vectors.get()
+            rhs, sol = self._vectors.get(self)
             for k in range(lo, hi):
                 rhs.FV().NumPy()[:] = cols[:, k]
                 sol.data = self.inv * rhs
