@@ -44,7 +44,7 @@ class _NGSolveBase(Solver, Rebuildable):
         # mass solves on the dgjumps-free twin (same dofs): no facet couplings in the graph, hence no needless fill
         self.fes = space.plain if form is mass_form else space.fes
         self._vin = None
-        self._vectors = Scratch(self._new_vectors)
+        self._vectors = Scratch(type(self)._new_vectors)
 
     def _new_vectors(self):
         return self.mat.CreateColVector(), self.mat.CreateColVector()
@@ -68,7 +68,7 @@ class _NGSolveBase(Solver, Rebuildable):
         out = np.empty((xs.shape[1], xs.shape[0]))  # rows: contiguous writes from the threads
 
         def work(lo, hi):
-            rhs, sol = self._vectors.get()
+            rhs, sol = self._vectors.get(self)
             rhs_np, sol_np = rhs.FV().NumPy(), sol.FV().NumPy()
             for k in range(lo, hi):
                 rhs_np[:] = 0.0
