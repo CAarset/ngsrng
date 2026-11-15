@@ -64,8 +64,8 @@ accurate one for your space and hardware.
 - **Large batches, fast.**
   - Thousands of samples refilled in place (`out=`, a NumPy array or a torch tensor), threaded on the CPU.
   - On NVIDIA GPUs the solver is cuDSS; on AMD GPUs, AMG-preconditioned CG.
-  - Dense samplers: `d.dense()` draws a field at chosen DoFs (a boundary trace, say) or under an observation by
-    two small matrix products, with the same law. `save` writes one `.npz` that loads without NGSolve.
+  - Dense samplers: `d.dense()` draws a field at chosen DoFs (a boundary trace, say), `(E @ d).dense()` its
+    observations, by two small matrix products, with the same law. Set up once; `save` writes one `.npz`.
 - **Reproducible like torch.**
   - `seed=None` follows `torch.manual_seed`.
   - Samplers pickle and spawn, and DataLoader workers get their own streams.
@@ -172,7 +172,7 @@ use [ngsplot](https://github.com/CAarset/ngsplot), which draws the same pictures
 | chi-square, Student-t, Wishart, matrix log-normal, Dirichlet, NIG | sums, scale mixtures, Bartlett and process constructions | exact at every stored point | 1.4–14× |
 | non-Gaussian Karhunen–Loève fields | KL modes with uniform, Rademacher, Laplace or any scipy coefficients | covariance exact | one product |
 | correlated components (`ngsrng.correlated`): pointwise families and Gaussian fields drawn jointly | the components' latent Gaussians mixed by the cross-correlation's Cholesky factor | each component's law exact; latent cross-correlation exact | the components' own draws |
-| dense samplers (`d.dense()`): any of the above that is one Gaussian and a pointwise map, at chosen DoFs or under an observation | the latent covariance at the points the outputs depend on, factorised once; then the family's map and the output map | the same law (eigenvalues below 1e-12 of the largest dropped) | two small matrix products |
+| dense samplers (`d.dense()`, `(E @ d).dense()`, `E @ sampler`): any of the above that is one Gaussian and a pointwise map, at chosen DoFs or observed | the latent covariance at the points the outputs depend on, factorised once (QR, cut SVD); then the family's map and the output map, folded for Gaussian fields | the same law (eigenvalues below `rtol` = 1e-12 of the largest dropped; `rtol=None`: none) | two small matrix products |
 
 Costs are relative to one Gaussian sample and come from a CPU smoke run, so treat them as indicative. Every
 generator reports its choices: `rng.info(...)` and `Gaussian(...).plan`.

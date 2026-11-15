@@ -34,7 +34,7 @@ import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 import torch
 
-from .backend import compute_device, numpy_blas_threads, sparse_to_torch
+from .backend import compute_device, numpy_blas_threads, owned_cache, sparse_to_torch
 from .randomized import euclidean_orth, gram_orth, randomized_svd
 from .space import SpaceInfo, coefficient_vector
 
@@ -126,18 +126,12 @@ def _blas_threads(owner):
 
 
 def _cache_of(owner) -> dict:
-    """A cache dict on ``owner``, tied to its identity: shallow copies (e.g. posteriors derived from a prior by
-    ``copy.copy``) must not share their original's results."""
+    """A cache dict on ``owner`` for ``owner`` alone: shallow copies (e.g. posteriors derived from a prior by
+    ``copy.copy``) must not share their original's results; an unpickled owner keeps its own
+    (:func:`ngsrng.backend.owned_cache`)."""
     if owner is None:
         return {}
-    try:
-        stored = owner.__dict__.get("_ngsrng_covariance_cache")
-        if stored is None or stored[0] != id(owner):
-            stored = (id(owner), {})
-            owner.__dict__["_ngsrng_covariance_cache"] = stored
-    except AttributeError:  # e.g. pybind objects
-        return {}
-    return stored[1]
+    return owned_cache(owner, "_ngsrng_covariance_cache")
 
 
 def as_covariance(source, fes=None, convention=None, compute="auto") -> CovarianceSource:

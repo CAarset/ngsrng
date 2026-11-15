@@ -2,14 +2,17 @@
 
     d = rng.distribution("uniform", -1, 20, representation="bernstein", bnd="left")
     A = d.dense(device="cuda")                     # the FE coefficients at the trace DoFs (bnd=), or at dofs=[...]
-    B = d.dense(observe=E, device="cuda", dtype="float32")    # E @ the coefficients, E any (m x ndof) matrix
+    B = (E @ d).dense(device="cuda")               # E @ the coefficients, E any (m x ndof) matrix; = d.dense(observe=E)
+    C = E @ A                                      # a dense sampler composed with E (no new set-up)
     c = A.sample(n, generator=gen)                 # (n, len(A.dofs)); correlated fields: (n, k, m)
     A.save("traces.npz")
-    A2 = ngsrng.DenseSampler.load("traces.npz", device="cuda")   # numpy and torch only: no NGSolve needed
+    A2 = ngsrng.DenseSampler.load("traces.npz", device="cuda")   # the stored law: no mesh, space or assembly
 
-``dense()`` exists on every distribution (``rng.distribution(...)``), on ``ngsrng.correlated(...)`` and on the
+``dense()`` exists on every distribution (``rng.distribution(...)``), on ``ngsrng.correlated(...)``, on observed laws
+(``E @ d``: an :class:`ObservedField`, or an :class:`ngsrng.ObservedGaussian` for Gaussian fields) and on the
 Gaussians (``Gaussian``, ``LowRankGaussian``, ``MatheronPosterior``, ``StationaryMatern``: their coefficients). The
-set-up is made once per object and arguments and kept there; draws are matrix products, on any device.
+set-up is made once per object and arguments and kept there (it survives pickling, and ``Generator.spawn`` children
+share it); draws are matrix products, on any device.
 
 What is dense, and why it is exact
 ----------------------------------
@@ -18,41 +21,52 @@ Every family it covers is a pointwise map of one latent Gaussian, followed by li
     z ~ N(0, I_r)  ->  w = m + F z     latent values at the points S that determine the outputs
                    ->  v = T(w)        the family's pointwise map (an affine map for Gaussian fields)
                    ->  y = A v         the representation's linear map to the outputs (FE coefficients at the chosen
-                                       DoFs, composed with bnd= and observe=)
+                                       DoFs, composed with bnd= and the observation)
 
-- **The points S.** Only the latent values that the outputs depend on: the columns of A that are not zero. For
-  ``representation="bernstein"`` and a trace (``bnd=``) these are the Bernstein domain points on the boundary (the
-  trace of a Bernstein function depends only on its domain points there); for values at points (the default
-  ``"quadrature"`` representation, ``points=``) the chosen points; for Gaussian FE fields the chosen DoFs, or the
-  observations themselves when there are fewer of them than DoFs they depend on. A is found by solving with the
-  representation's mass matrix (one solve per output), and its entries below ``ZERO`` times the largest of their
-  row are rounding (exact zeros of the conversion): they are dropped (``info["zero_drop"]`` records the largest).
-- **The latent covariance** K = G Sigma G^T at S (G the evaluation at S, standardised as the family standardises
-  its latent; Sigma the coefficient covariance, conditioning included) is the exact discrete covariance of what
-  ``d.sample()`` draws: it comes from |S| applications of the factor L^T (:func:`ngsrng.observed.operator_covariance`).
-- **The factor** F: the eigendecomposition of K, over the eigenvalues above ``rtol`` times the largest (exact up to
-  that cutoff: ||K - F F^T||_2 <= rtol max eig K), in decreasing order: the columns of F are the Karhunen-Loeve modes
-  at S, so ``rank=`` / ``tol=`` truncate it optimally (``info["exact"]`` and ``info["captured_variance"]`` say what
-  was kept). **Pinned points**, whose variance is at most ``rtol`` times the largest (a Dirichlet DoF, a point
-  conditioned to the noise level, a point a family standardises to a constant), get a zero row: they equal their
-  mean exactly, and the rest is factorised without any jitter.
+- **The points S** are those the outputs depend on, found exactly, without a threshold. For
+  ``representation="bernstein"`` an NGSolve coefficient on a mesh node (vertex, edge, face, cell) depends exactly on
+  the Bernstein domain points in that node's closure (a trace: the domain points on the boundary). For values at
+  points (the default ``"quadrature"`` representation, ``points=``) and for Gaussian FE fields, S is the set the output
+  map reads; the L2 projection (``"projection"``) reads every point. A Gaussian field observed by fewer observations
+  than the DoFs they read has the observations themselves as its latent.
+- **The latent covariance** K = G Sigma G^T at S (G the evaluation at S, standardised as the family standardises its
+  latent; Sigma the coefficient covariance, conditioning included) is the exact discrete covariance of what
+  ``d.sample()`` draws. It is never formed: a QR of Y = L^T G^T (|S| applications of the factor L^T) gives R with
+  R^T R = K to the rounding of Y (:func:`ngsrng.observed.covariance_factor`).
+- **The factor** F: with ``rtol`` (default 1e-12) the SVD of R, cut at eigenvalues below rtol times the largest
+  (||K - F F^T||_2 <= rtol max eig K; each direction's standard deviation off by at most sqrt(rtol) of the largest),
+  as one thin matrix whose columns are the Karhunen-Loeve modes at S, in decreasing order, so ``rank=`` / ``tol=``
+  truncate it optimally (``info["exact"]`` and ``info["captured_variance"]`` say what was kept). ``rtol=None`` (or 0)
+  without rank / tol: no truncation, F = R^T. Points with exactly zero variance (Dirichlet DoFs, points a family
+  standardises to a constant) get exactly zero rows: they equal their mean, without any jitter; ``pin=`` also pins
+  points whose variance is at most pin times the largest.
+- **Gaussian fields fold**: their map is affine, so y = A m' + (A F) z; when one m x r' matrix (A F, recompressed by an
+  SVD to r' <= min(m, r) columns) costs less than F and A (|S| r + nnz(A) per sample), the output map is folded into
+  the factor. Decided at set-up and after each composition. Pointwise families keep F and A apart (T is in between).
 - **Correlated components** (``ngsrng.correlated``) share K: the joint factor is L_R (x) F (R the cross-correlation),
   and each component keeps its own mean, map and output map.
 - **The Bernstein range guarantee** holds as in ``d.sample()``: the map comes before the linear conversion, and the
   values are pulled inside the family's range by a relative margin of at least 1000 times the conversion's measured
   rounding (summed over S, so it bounds every sample) before it.
 
-The law is that of ``d.sample()`` (its marginal at the chosen DoFs, or its image under ``observe``), up to the
-eigenvalue cutoff and rounding; the draws themselves differ (another random stream). Data drawn by either route can
-be mixed. Not covered: ``bnd_values=`` (conditioning on a trace), families built from several latents (chi-square
-sums, Student-t, Wishart, Dirichlet, ...), and Karhunen-Loeve fields; Gaussian FE fields and every pointwise
-family of one latent (closed-form quantiles, numerical inversion with constant parameters, ``transformed``,
-``indicator``) are. ``save`` stores the closed-form maps (``uniform``, ``lognormal``, ``normal``, ...,
-``indicator``) and Gaussian fields; numerically inverted families (``gamma``, ``beta``, ...) sample in the process.
+The law is that of ``d.sample()`` (its marginal at the chosen DoFs, or its image under the observation), up to the
+cut and rounding; the draws themselves differ (another random stream). Data drawn by either route can be mixed. Not
+covered: ``bnd_values=`` (conditioning on a trace), families built from several latents (chi-square sums, Student-t,
+Wishart, Dirichlet, ...), Karhunen-Loeve fields, and spatially varying shape parameters of numerically inverted
+families.
 
-Size: up to ``MAX_POINTS`` latent points by default (an 800 MB float64 factor at the limit; ``max_points=`` moves
-it). The set-up costs |S| applications of L^T and an |S| x |S| eigendecomposition; a draw costs |S| r + nnz(A)
-multiply-adds per sample and component.
+Observations: two syntaxes, both exact
+--------------------------------------
+``(E @ d).dense()`` (or ``d.dense(observe=E)``) sets up for the observations: only what E reads. ``E @ d.dense()``
+composes an existing dense sampler with E, without a new set-up (also a loaded one): the latent points E no longer
+reads are dropped (a Gaussian's marginal: rows of its factor), the factor is recompressed when it has more columns
+than rows, and Gaussian components fold as above. Without truncation the two give the same law at the same cost per
+draw; with ``rank=`` / ``tol=`` they differ, both correctly: the first keeps the best modes for the observations, the
+second those of the field.
+
+Size: up to ``MAX_POINTS`` latent points by default (``max_points=`` moves it). The set-up costs |S| applications of
+L^T, a QR and an SVD of |S| columns; a draw costs |S| r + nnz(A) (folded: m r') multiply-adds per sample and
+component.
 
 Randomness
 ----------
@@ -66,12 +80,13 @@ torch, keyed per block of ``block`` samples (fast; the samples then depend on th
 
 Stored samplers
 ---------------
-``save(path)`` writes one ``.npz`` (no pickles): the factor, the means, the maps (family, parameters, range), the
-output maps, the DoF indices and latent points, and provenance (ngsrng version and commit, space, mesh hash,
-representation, stream convention). ``DenseSampler.load(path, device=...)`` needs NumPy and torch only. Without
-ngsrng at all, a stored sampler of a closed-form family draws with NumPy and SciPy::
+``save(path)`` writes one ``.npz`` without pickles or code: the factor, the means, the maps (closed forms: family,
+parameters and range; numerical inversions: the scipy.stats distribution's name and parameters; ``transformed`` with
+a NumPy or torch function: its name), the output maps, the DoF indices and latent points, and provenance (ngsrng
+version and commit, space, mesh hash, representation, stream convention). ``DenseSampler.load(path, device=...)``
+rebuilds the sampler from these arrays alone. Without ngsrng, a stored sampler draws with NumPy and SciPy::
 
-    import json, numpy as np
+    import json, numpy as np, scipy.stats as st
     from scipy.special import ndtr
     s = np.load("sampler.npz")
     meta = json.loads(str(s["meta"]))
@@ -80,19 +95,25 @@ ngsrng at all, a stored sampler of a closed-form family draws with NumPy and Sci
     for i, c in enumerate(meta["components"]):
         w = s[f"mean{i}"] + z[:, i] @ s["factor"].T               # latent values (n, |S|)
         p = {k: s[v] if isinstance(v, str) else v for k, v in c["params"].items()}
-        v = {"uniform": lambda w, low, high: low + (high - low) * ndtr(w),
-             "lognormal": lambda w, mean, sigma: np.exp(mean + sigma * w),
-             "affine": lambda w, shift, scale: shift + scale * w}[c["map"]](w, **p)
+        if c["map"] == "inversion":                               # e.g. gamma: loc + scale F^-1(Phi(w))
+            q = c["stored"]
+            v = q["loc"] + q["scale"] * getattr(st, q["scipy"])(*q["args"], **q["kwds"]).ppf(ndtr(w))
+        else:
+            v = {"uniform": lambda w, low, high: low + (high - low) * ndtr(w),
+                 "lognormal": lambda w, mean, sigma: np.exp(mean + sigma * w),
+                 "affine": lambda w, shift, scale: shift + scale * w}[c["map"]](w, **p)
         if c["out_shape"]:                                         # the output map (none: the values themselves)
             a = np.zeros(c["out_shape"])
             a[s[f"out{i}_rows"], s[f"out{i}_cols"]] = s[f"out{i}_vals"]
             v = v @ a.T                                            # (n, m): component i
 
-(the other closed forms are in :mod:`ngsrng.quantiles`; ``DenseSampler.from_noise(z)`` gives the same values from the
-same z, up to the range margins of bounded families, which move values within ~1e-9 of a bound by at most that.)
+(the other closed forms are ``transforms.CLOSED``; ``DenseSampler.from_noise(z)`` gives the same values from the same
+z, up to the range margins of bounded families, which move values within ~1e-9 of a bound by at most that, and the
+1e-10 accuracy of inversion tables.)
 """
 
 import hashlib
+import importlib
 import json
 import math
 import numbers
@@ -102,36 +123,59 @@ import numpy as np
 import scipy.sparse as sp
 import torch
 
-from .backend import DeviceCache, resolve_device, resolve_dtype
+from .backend import DeviceCache, owned_cache, resolve_device, resolve_dtype, sparse_to_torch
 from .inplace import InPlace, as_tensor, default_work_values
-from .quantiles import MAPS, NAMES, XP
-from .seeding import Source, as_source, one_draw
+from .seeding import Source, as_source, inherit, one_draw
 
-__all__ = ["DenseSampler"]
+__all__ = ["DenseSampler", "ObservedField"]
 
 FORMAT = "ngsrng.dense/1"
-MAX_POINTS = 10_000  # latent points of an exact dense factor by default (|S|^2 float64: 0.8 GB at the limit)
-RTOL = 1e-12  # eigenvalues below rtol * max are dropped; points with variance below rtol * max are pinned
-ZERO = 1e-11  # entries of the output map below ZERO * (their row's largest) are rounding of exact zeros
-MARGIN = 1e-9  # the Bernstein representation's smallest relative range margin (as PointwiseField.MARGIN)
-BLOCK_NORMALS = 2**22  # standard normals per keyed block of device noise
-DENSE_OUT = 2**22  # output maps up to this many entries are kept dense on the device, larger ones sparse
+MAX_POINTS = 10_000  # latent points of a dense factor by default (|S|^2 float64: 0.8 GB at the limit)
+RTOL = 1e-12  # the default cut: eigenvalues of K below rtol times the largest
+BLOCK_NORMALS = 2**22  # standard normals per keyed block of device noise (performance, not accuracy)
+DENSE_OUT = 2**22  # output maps up to this many entries are dense on the device, larger ones sparse (performance)
 
 
 def _affine(w, xp, shift, scale):
     return shift + scale * w
 
 
-MAPS = {**MAPS, "affine": _affine}
+def _maps():
+    """name -> pointwise map (the closed forms, the excursion indicator, the affine map of Gaussian fields)."""
+    global _MAPS
+    if _MAPS is None:
+        from .distributions.transforms import CLOSED, _exceeds
+
+        _MAPS = {name: entry[0] for name, entry in CLOSED.items()} | {"indicator": _exceeds, "affine": _affine}
+    return _MAPS
+
+
+_MAPS = None
+LIVE = ("inversion", "pointmap", "object")  # maps held as objects of the process (rebuilt on load where stored)
+
+
+def _xp(torch_mode):
+    from .distributions.pointwise import XP
+
+    return XP(torch_mode)
+
+
+def _margin():
+    from .distributions.pointwise import PointwiseField
+
+    return PointwiseField.MARGIN
 
 
 class DenseSampler(InPlace):
     """Draws of a field at chosen DoFs or under a linear observation, by dense products (see :mod:`ngsrng.dense`).
 
-    Made by ``dense()`` (on a distribution, ``ngsrng.correlated(...)`` or a Gaussian) or :meth:`load`. ``sample(n)``
-    gives (n, m), or (n, k, m) for k correlated components (a tuple when their output sizes differ); ``dofs`` (the
-    DoF indices of the outputs, None under ``observe=``), ``rank``, ``info``, :meth:`save`, :meth:`to`.
+    Made by ``dense()`` (on a distribution, ``ngsrng.correlated(...)``, an observed law or a Gaussian), by ``E @
+    sampler`` or by :meth:`load`. ``sample(n)`` gives (n, m), or (n, k, m) for k correlated components (a tuple when
+    their output sizes differ); ``dofs`` (the DoF indices of the outputs, None for an observation), ``rank``, ``info``,
+    :meth:`save`, :meth:`to`.
     """
+
+    __array_ufunc__ = None  # E @ sampler: NumPy (and SciPy, torch) leave the product to __rmatmul__
 
     def __init__(self, law, *, device="cpu", dtype=None, noise=None, seed=None, output=None, work_values=None):
         self.law = law
@@ -166,7 +210,7 @@ class DenseSampler(InPlace):
     @property
     def dofs(self):
         """The indices of the outputs among the values ``d.sample()`` returns (FE DoFs for coefficient
-        representations), or None for an observation (``observe=``)."""
+        representations), or None for an observation."""
         return self.law.get("dofs")
 
     @property
@@ -182,7 +226,7 @@ class DenseSampler(InPlace):
     def __repr__(self):
         i = self.law["info"]
         return (f"DenseSampler({i.get('law', '')}: {self.components} x {self.nout} outputs, {self.latent_points} "
-                f"latent points, rank {self.rank}, {'exact' if i.get('exact') else 'truncated'}, device={self.device})")
+                f"latent values, rank {self.rank}, {'exact' if i.get('exact') else 'truncated'}, device={self.device})")
 
     def to(self, device=None, dtype=None, noise=None, seed=None, output=None) -> "DenseSampler":
         """The same law with other sampling settings. What is not given is kept: the set-up, and the randomness (the
@@ -193,6 +237,19 @@ class DenseSampler(InPlace):
                             dtype=self.dtype if dtype is None else dtype, noise=noise,
                             seed=self.source if seed is None else seed,
                             output=self.output if output is None else output)
+
+    def __rmatmul__(self, operator):
+        """``E @ sampler``: the outputs observed by E (m2 x m), a dense sampler again, without a new set-up: the latent
+        values E no longer reads are dropped, the factor recompressed, Gaussian components folded where cheaper.
+        Same randomness (stream) and sampling settings."""
+        from .observed import _as_operator
+
+        if not isinstance(self.nout, int):
+            raise ValueError("E @ sampler: the components have outputs of different sizes")
+        e = _as_operator(operator, self.nout)
+        law = _compose(self.law, e)
+        return DenseSampler(law, device=self.device, dtype=self.dtype, noise=self.noise, seed=self.source,
+                            output=self.output, work_values=self.work_values)
 
     # ------------------------------------------------------------------ draws
 
@@ -313,14 +370,14 @@ class DenseSampler(InPlace):
 
     def _map(self, i, c, w):
         spec = self.law["components"][i]
-        if spec["map"] == "object":  # a transform of the process (numerical inversion, transformed)
+        if spec["map"] in LIVE:  # a numerical inversion or a pointwise function (an object of the process)
             t = spec["transform"]
             if getattr(t, "torch_capable", False):
-                v = t(w, XP(True))
+                v = t(w, _xp(True))
             else:
-                v = torch.as_tensor(t(w.double().cpu().numpy(), XP(False)), device=w.device).to(w.dtype)
+                v = torch.as_tensor(t(w.double().cpu().numpy(), _xp(False)), device=w.device).to(w.dtype)
         else:
-            v = MAPS[spec["map"]](w, XP(True), **c["params"])
+            v = _maps()[spec["map"]](w, _xp(True), **c["params"])
         for bound, op in c["clamp"]:  # strictly inside the support in the output precision
             v = torch.maximum(v, bound) if op == "max" else torch.minimum(v, bound)
         if c["pull"] is not None:  # Bernstein: inside the range by a margin safe against the conversion's rounding
@@ -344,13 +401,8 @@ class DenseSampler(InPlace):
             a = spec["out"]
             if a is not None:
                 a = sp.csr_matrix(a)
-                if a.shape[0] * a.shape[1] <= DENSE_OUT:
-                    a = t(a.toarray())
-                else:
-                    from .backend import sparse_to_torch
-
-                    a = sparse_to_torch(a, dev, wd)
-            params = {k: (t(v) if isinstance(v, np.ndarray) else float(v)) for k, v in spec["params"].items()}
+                a = t(a.toarray()) if a.shape[0] * a.shape[1] <= DENSE_OUT else sparse_to_torch(a, dev, wd)
+            params = {k: (t(v) if isinstance(v, np.ndarray) else v) for k, v in spec["params"].items()}
             comps.append({"mean": t(spec["mean"]), "params": params, "out": a,
                           "clamp": _clamp_bounds(spec.get("support"), self.dtype, t),
                           "pull": _pull_bounds(spec.get("pull"), t)})
@@ -383,9 +435,9 @@ class DenseSampler(InPlace):
         self._device = DeviceCache()
 
     def save(self, path):
-        """Write the sampler's law to one ``.npz`` file (no pickles; see the module docstring for its layout and a
-        NumPy reference sampler). Closed-form families and Gaussian fields; numerically inverted families (gamma,
-        beta, ...) and ``transformed`` sample only in the process that built them."""
+        """Write the sampler's law to one ``.npz`` file, without pickles or code (see the module docstring for its
+        layout and a NumPy reference sampler). Every map is stored but ``transformed`` with a function other than a
+        NumPy or torch one (which would need its code)."""
         law = self.law
         arrays = {"factor": law["factor"], "mix": law["mix"]}
         for key in ("dofs", "latent_index", "latent_coordinates"):
@@ -395,9 +447,8 @@ class DenseSampler(InPlace):
         for i, spec in enumerate(law["components"]):
             if spec["map"] == "object":
                 raise NotImplementedError(
-                    f"component {spec['name']}: its map ({spec['label']}) is a numerical inversion or a user "
-                    "function, which is not stored; save works for closed-form families (uniform, lognormal, normal, "
-                    "exponential, ...), indicator and Gaussian fields")
+                    f"component {spec['name']}: its map ({spec['label']}) is a user function, whose code a file "
+                    "without pickles cannot hold (NumPy and torch functions are stored by name)")
             arrays[f"mean{i}"] = spec["mean"]
             params = {}
             for name, v in spec["params"].items():
@@ -405,13 +456,13 @@ class DenseSampler(InPlace):
                     arrays[f"param{i}_{name}"] = v
                     params[name] = f"param{i}_{name}"
                 else:
-                    params[name] = float(v)
+                    params[name] = v
             entry = {"name": spec["name"], "map": spec["map"], "params": params, "nout": int(spec["nout"]),
                      "support": _store_pair(spec.get("support"), arrays, f"support{i}"),
                      "pull": None if spec.get("pull") is None else
                      {"range": _store_pair(spec["pull"]["range"], arrays, f"range{i}"),
                       "margin": float(spec["pull"]["margin"])},
-                     "out_shape": None}
+                     "out_shape": None, "stored": spec.get("stored") if spec["map"] in LIVE else None}
             if spec["out"] is not None:
                 a = sp.coo_matrix(spec["out"])
                 arrays[f"out{i}_rows"], arrays[f"out{i}_cols"], arrays[f"out{i}_vals"] = a.row, a.col, a.data
@@ -423,8 +474,8 @@ class DenseSampler(InPlace):
 
     @classmethod
     def load(cls, path, device="cpu", dtype=None, noise=None, seed=None, output=None) -> "DenseSampler":
-        """A sampler from a file written by :meth:`save` (NumPy and torch only; no NGSolve). ``dtype`` defaults to
-        the dtype it was saved with."""
+        """A sampler from a file written by :meth:`save` (its arrays alone: no mesh, space or assembly). ``dtype``
+        defaults to the dtype it was saved with."""
         with np.load(path, allow_pickle=False) as f:
             arrays = {k: f[k] for k in f.files}
         meta = json.loads(str(arrays.pop("meta")))
@@ -432,17 +483,20 @@ class DenseSampler(InPlace):
             raise ValueError(f"{path}: not a stored ngsrng dense sampler ({FORMAT})")
         comps = []
         for i, c in enumerate(meta["components"]):
-            params = {k: arrays[v] if isinstance(v, str) else v for k, v in c["params"].items()}
+            params = {k: arrays[v] if isinstance(v, str) and v in arrays else v for k, v in c["params"].items()}
             pull = c.get("pull")
             out = None
             if c["out_shape"] is not None:
                 out = sp.csr_matrix((arrays[f"out{i}_vals"], (arrays[f"out{i}_rows"], arrays[f"out{i}_cols"])),
                                     shape=tuple(c["out_shape"]))
-            comps.append({"name": c["name"], "map": c["map"], "params": params, "nout": c["nout"],
-                          "mean": arrays[f"mean{i}"], "out": out,
-                          "support": _load_pair(c.get("support"), arrays),
-                          "pull": None if pull is None else {"range": _load_pair(pull["range"], arrays),
-                                                             "margin": pull["margin"]}})
+            spec = {"name": c["name"], "map": c["map"], "params": params, "nout": c["nout"],
+                    "mean": arrays[f"mean{i}"], "out": out, "label": c["map"],
+                    "support": _load_pair(c.get("support"), arrays),
+                    "pull": None if pull is None else {"range": _load_pair(pull["range"], arrays),
+                                                       "margin": pull["margin"]}}
+            if c["map"] in LIVE:
+                spec.update(stored=c["stored"], transform=_rebuild_map(c["map"], c["stored"]))
+            comps.append(spec)
         law = {"factor": arrays["factor"], "mix": arrays["mix"], "components": comps, "work64": meta["work64"],
                "dofs": arrays.get("dofs"), "latent_index": arrays.get("latent_index"),
                "latent_coordinates": arrays.get("latent_coordinates"), "info": meta["info"]}
@@ -514,11 +568,67 @@ def _json_default(x):
     return str(x)
 
 
-# ====================================================================== set-up (needs NGSolve)
+# ---------------------------------------------------------------------- maps held as objects: storage
+
+
+def _stored_map(t):
+    """(kind, description) of a numerical inversion or a pointwise function, as a file without code can hold it:
+    an inversion by its scipy.stats distribution (name and constant parameters), a NumPy or torch function by name;
+    ("object", None) otherwise."""
+    from .distributions.inversion import Inversion
+
+    if isinstance(t, Inversion):
+        dist = t.dist
+        gen = getattr(dist, "dist", None)
+        name = getattr(gen, "name", None)
+        import scipy.stats as st
+
+        if name is None or type(getattr(st, name, None)) is not type(gen):
+            return "object", None
+        args = [float(a) for a in dist.args]
+        kwds = {k: float(v) for k, v in dist.kwds.items()}
+        return "inversion", {"scipy": name, "args": args, "kwds": kwds, "loc": float(t.loc), "scale": float(t.scale),
+                             "method": t.requested, "tol": float(t.tol), "zmax": float(t.zmax_request)}
+    func = getattr(t, "func", None)
+    if func is not None and hasattr(t, "torch_func"):  # transforms.PointMap
+        module = "numpy" if isinstance(func, np.ufunc) else getattr(func, "__module__", None) or ""
+        name = getattr(func, "__name__", None)
+        if name and (module == "numpy" or module.startswith("torch")):
+            try:
+                found = getattr(importlib.import_module(module), name, None)
+            except ImportError:
+                found = None
+            if found is func:
+                return "pointmap", {"module": module, "name": name, "torch": bool(t.torch_func)}
+    return "object", None
+
+
+def _rebuild_map(kind, p):
+    if kind == "inversion":
+        import scipy.stats as st
+
+        from .distributions.inversion import Inversion
+
+        t = Inversion(getattr(st, p["scipy"])(*p["args"], **p["kwds"]), p["loc"], p["scale"], method=p["method"],
+                      tol=p["tol"], zmax=p["zmax"])
+        t._resolve(10**9, True)  # the table, as the sampler that was saved used
+        return t
+    if kind == "pointmap":
+        from .distributions.transforms import PointMap
+
+        if not (p["module"] == "numpy" or p["module"].startswith("torch")):
+            raise ValueError(f"a stored pointwise function must be a NumPy or torch function, not {p['module']}")
+        return PointMap(getattr(importlib.import_module(p["module"]), p["name"]), p["torch"])
+    raise ValueError(f"unknown stored map {kind!r}")
+
+
+# ====================================================================== set-up
 
 
 class DenseOf:
-    """Mixin of the Gaussians: ``dense()``, the dense sampler of their coefficients."""
+    """Mixin of the Gaussians: ``dense()``, the dense sampler of their coefficients, and ``E @ gaussian``."""
+
+    __array_ufunc__ = None  # E @ gaussian: NumPy (and SciPy, torch) leave the product to __rmatmul__
 
     def dense(self, dofs=None, observe=None, **kwargs) -> DenseSampler:
         """A :class:`ngsrng.DenseSampler` of this Gaussian's coefficients: at ``dofs`` (default all) or under
@@ -526,75 +636,254 @@ class DenseOf:
         :func:`ngsrng.dense.dense`). Set up once per arguments and kept with the Gaussian; ``save`` stores it."""
         return dense(self, dofs, observe, **kwargs)
 
+    def __rmatmul__(self, operator):
+        """``E @ gaussian``: the observations E f (an :class:`ngsrng.ObservedGaussian`)."""
+        from .observed import ObservedGaussian, _as_operator
 
-def dense(source, dofs=None, observe=None, *, rank=None, tol=None, rtol=RTOL, max_points=MAX_POINTS, device=None,
-          dtype=None, noise=None, seed=None, output=None) -> DenseSampler:
-    """The dense sampler of ``source`` (a distribution, ``ngsrng.correlated(...)`` or a Gaussian); see
-    :mod:`ngsrng.dense`. The set-up is made once per source and law arguments and kept on the source; the sampler
-    once per further arguments.
+        return ObservedGaussian(self, operator=_as_operator(operator, self.space.ndof), seed=inherit(None, self))
+
+
+class ObservedField(InPlace):
+    """``E @ d``: a linear map E of the values of a distribution's draws (``d`` from ``rng.distribution(...)``, a
+    pointwise family, or ``ngsrng.correlated(...)``). Gaussian fields observed are an :class:`ngsrng.ObservedGaussian`
+    instead. ``sample(size)`` draws ``d`` and applies E (one result per component for correlated fields; ``out=``
+    fills buffers in place, :mod:`ngsrng.inplace`); ``dense()`` is ``d.dense(observe=E)``; ``E2 @ this`` is
+    ``(E2 E) @ d``."""
+
+    __array_ufunc__ = None
+
+    def __init__(self, source, operator):
+        from .observed import _as_operator
+
+        self.source = source
+        self.nvalues = _nvalues(source)
+        self.operator = _as_operator(operator, self.nvalues)
+        self.m = self.operator.shape[0]
+        self.components = len(source._parts) if hasattr(source, "_parts") else 1
+        self._torch = DeviceCache()
+
+    @property
+    def info(self) -> dict:
+        return {"law": f"E @ draws (m = {self.m})", "of": self.source.info}
+
+    def __repr__(self):
+        return f"ObservedField(m={self.m}, of {self.source!r})"
+
+    def __rmatmul__(self, operator):
+        from .observed import _as_operator
+
+        return ObservedField(self.source, _as_operator(operator, self.m) @ self.operator)
+
+    def sample(self, size=None, output=None, out=None):
+        """(*size, m) observations of draws of the distribution (``size=None``: one, (m,)); a tuple of them for
+        correlated fields. ``out``: a buffer of that shape (one per component for correlated fields) filled in
+        place and returned."""
+        if out is not None:
+            bufs = list(out) if isinstance(out, (list, tuple)) else [out]
+            self.sample_into([as_tensor(b).reshape(-1, self.m) for b in bufs])
+            return out
+        x = self.source.sample(1 if size is None else size, output="torch")
+        res = tuple(self._apply(xi, size) for xi in x) if isinstance(x, tuple) else self._apply(x, size)
+        if (output or ("numpy" if _first(res).device.type == "cpu" else "torch")) == "numpy":
+            return tuple(r.cpu().numpy() for r in res) if isinstance(res, tuple) else res.cpu().numpy()
+        return res
+
+    rvs = sample
+
+    def sample_into(self, rows):
+        """Fill (n, m) rows in place (one buffer per component for correlated fields), drawing the distribution in
+        chunks of ``work_values`` values (one draw: the same values as ``sample``)."""
+        bufs = list(rows) if isinstance(rows, (list, tuple)) else [rows]
+        bufs = [as_tensor(b) for b in bufs]
+        if len(bufs) != self.components or any(b.ndim != 2 or b.shape[1] != self.m for b in bufs):
+            raise ValueError(f"out: {self.components} buffer(s) of shape (n, {self.m})")
+        n = bufs[0].shape[0]
+        step = max(1, int(self.work_values // (self.nvalues + self.m)))
+        for k0 in range(0, n, step):
+            k1 = min(n, k0 + step)
+            x = self.source.sample(k1 - k0, output="torch")
+            for b, xi in zip(bufs, x if isinstance(x, tuple) else (x,)):
+                b[k0:k1].copy_(self._apply(xi, k1 - k0))
+        return rows
+
+    def _apply(self, x, size):
+        if not x.is_floating_point():  # discrete families: the observations are real
+            x = x.to(torch.float64)
+        key = (str(x.device), x.dtype)
+        if key not in self._torch:
+            self._torch[key] = sparse_to_torch(self.operator, x.device, x.dtype)
+        flat = x.reshape(-1, self.nvalues)
+        y = (self._torch[key] @ flat.T).T
+        return y[0] if size is None else y.reshape(*x.shape[:-1], self.m)
+
+    def dense(self, dofs=None, observe=None, **kwargs) -> DenseSampler:
+        """``d.dense(observe=E)``: set up for these observations (``dofs``: some of them; ``observe``: a further
+        map)."""
+        from .observed import _as_operator
+
+        if dofs is not None and observe is not None:
+            raise ValueError("give dofs= or observe=, not both")
+        e = self.operator
+        if dofs is not None:
+            e = e[np.asarray(dofs, dtype=np.int64).ravel()]
+        elif observe is not None:
+            e = _as_operator(observe, self.m) @ e
+        return dense(self.source, None, e, **kwargs)
+
+
+def _first(res):
+    return res[0] if isinstance(res, tuple) else res
+
+
+def _nvalues(source) -> int:
+    from .correlated import CorrelatedFields
+
+    if isinstance(source, CorrelatedFields):
+        return source._parts[0].nvalues
+    return _Part.of_field(source.field, source.generator, source.name, check=False).nvalues
+
+
+def observe_distribution(d, operator):
+    """``E @ d`` for a distribution: an :class:`ngsrng.ObservedGaussian` for a Gaussian FE field (E composed with the
+    field's ``bnd=`` restriction and ``points=`` evaluation), an :class:`ObservedField` otherwise."""
+    from .generator import _NormalField
+    from .observed import ObservedGaussian
+
+    field = d.field
+    bnd = getattr(field, "bnd", None)
+    if isinstance(field, _NormalField) and (bnd is None or bnd["values"] is None):
+        part = _Part.of_field(field, d.generator, d.name)
+        rows, _ = part.output_rows(None, operator)
+        g = part.latent_rows(rows)
+        return ObservedGaussian(field.gauss, operator=g, loc=part.loc, scale=part.scale, seed=d.generator._seed(),
+                                dtype=d.generator.dtype)
+    return ObservedField(d, operator)
+
+
+def dense(source, dofs=None, observe=None, *, rank=None, tol=None, rtol=RTOL, pin=None, max_points=MAX_POINTS,
+          device=None, dtype=None, noise=None, seed=None, output=None) -> DenseSampler:
+    """The dense sampler of ``source`` (a distribution, ``ngsrng.correlated(...)``, an observed law or a Gaussian);
+    see :mod:`ngsrng.dense`. The set-up is made once per source and law arguments and kept (on the source; for
+    distributions also on their generator, so that ``spawn`` children share it); the sampler once per further
+    arguments.
 
     Parameters
     ----------
     dofs : indices of the outputs among the values a draw returns (FE DoFs for coefficient representations). Default:
         the trace DoFs with ``bnd=``, else all.
     observe : a linear map of those values (m x nvalues; SciPy sparse, NumPy or torch): the outputs are
-        ``observe @ values`` (after ``bnd=``). Not with ``dofs``.
-    rank, tol : truncate the factor to its leading ``rank`` modes, or to the fewest modes that keep a fraction
-        1 - ``tol`` of the latent variance (Karhunen-Loeve; ``info["exact"]`` is then False).
-    rtol : the eigenvalue cutoff of the exact factor and the pinning threshold (relative to the largest).
-    max_points : the largest number of latent points (a clear error beyond).
+        ``observe @ values`` (after ``bnd=``), as for ``(observe @ source).dense()``. Not with ``dofs``.
+    rtol : the cut: eigenvalues of the latent covariance below rtol times the largest are dropped (default 1e-12);
+        None or 0: no cut.
+    rank, tol : keep only the leading ``rank`` modes, or the fewest that keep a fraction 1 - ``tol`` of the latent
+        variance (Karhunen-Loeve; ``info["exact"]`` is then False).
+    pin : latent values whose variance is at most pin times the largest are set to their mean (default None: only
+        those with exactly zero variance).
+    max_points : the largest number of latent values (a clear error beyond).
     device, dtype, noise, seed, output : where and how it samples (default: as the source's own draws; ``noise``
         "host" or "device", see the module docstring; ``seed`` default: a child of the source's randomness).
     """
     from .correlated import CorrelatedFields
     from .generator import FieldDistribution
+    from .observed import ObservedGaussian
 
+    if isinstance(source, ObservedField):
+        return source.dense(dofs, observe, rank=rank, tol=tol, rtol=rtol, pin=pin, max_points=max_points,
+                            device=device, dtype=dtype, noise=noise, seed=seed, output=output)
+    if dofs is not None and observe is not None:
+        raise ValueError("give dofs= or observe=, not both")
+    shared = None  # (generator, key) under which a generator keeps the set-up for its spawned children
     if isinstance(source, FieldDistribution):
-        owner, parts, mix = source.field, [_Part.of_field(source.field, source.generator, source.name)], np.eye(1)
-        parent, keep64 = source.generator, source.generator._output_kind(source.field, source.name)[1]
+        owner, mix, parent = source.field, np.eye(1), source.generator
+        parts = [_Part.of_field(source.field, source.generator, source.name)]
+        keep64 = source.generator._output_kind(source.field, source.name)[1]
         out_dtype, out_device = (torch.float64 if keep64 else source.generator.dtype), source.generator.device
+        shared = _shared_key(source.generator, [source.field])
     elif isinstance(source, CorrelatedFields):
-        owner = source
+        owner, mix, parent = source, source._mix, source._parts[0].gen
         parts = [_Part.of_field(p.field, p.gen, p.name) for p in source._parts]
-        mix, parent = source._mix, source._parts[0].gen
         out_dtype = torch.float64 if any(p.keep64 for p in source._parts) else parent.dtype
         out_device = parent.device
+        if all(p.gen is parent for p in source._parts):
+            shared = _shared_key(parent, [p.field for p in source._parts], source._mix)
+    elif isinstance(source, ObservedGaussian):
+        owner, mix, parent, parts = source, np.eye(1), source, [_Part.of_observed(source)]
+        out_dtype, out_device = source.dtype, source.device
     elif hasattr(source, "apply_t") and hasattr(source, "space") and hasattr(source, "mean"):
         owner, parts, mix, parent = source, [_Part.of_gaussian(source)], np.eye(1), source
         out_dtype = getattr(source, "dtype", torch.float64)
         out_device = getattr(source, "torch_device", None) or getattr(source, "device", "cpu")
     else:
-        raise TypeError(f"dense samplers are made from distributions, correlated fields or Gaussians, not "
-                        f"{type(source).__name__}")
-    if dofs is not None and observe is not None:
-        raise ValueError("give dofs= or observe=, not both")
-    law_key = (_digest(dofs), _digest(observe), rank, tol, float(rtol), int(max_points))
-    cache = _cache_of(owner)
-    if law_key not in cache["laws"]:
-        cache["laws"][law_key] = _build_law(parts, mix, dofs, observe, rank, tol, float(rtol), int(max_points))
-    law = cache["laws"][law_key]
+        raise TypeError(f"dense samplers are made from distributions, correlated fields, observed laws or "
+                        f"Gaussians, not {type(source).__name__}")
+    rtol = None if not rtol else float(rtol)
+    law_key = (_digest(dofs), _digest(observe), rank, tol, rtol, pin, int(max_points))
+    cache = owned_cache(owner, "_ngsrng_dense")
+    laws, samplers = cache.setdefault("laws", {}), cache.setdefault("samplers", {})
+    if law_key not in laws:
+        law = None
+        if shared is not None:
+            law = shared[0]._dense_laws.get(shared[1] + (law_key,), (None, None))[1]
+        if law is None and isinstance(source, ObservedGaussian) and _reusable(source, dofs, observe, rank, tol, rtol,
+                                                                              pin):
+            law = _law_from_observed(source)
+        if law is None:
+            law = _build_law(parts, mix, dofs, observe, rank, tol, rtol, pin, int(max_points))
+        if shared is not None:
+            shared[0]._dense_laws[shared[1] + (law_key,)] = (shared[2] + (law_key,), law)
+        laws[law_key] = law
+    law = laws[law_key]
     device = resolve_device(out_device if device is None else device)
     dtype = out_dtype if dtype is None else resolve_dtype(dtype)
     key = law_key + (str(device), str(dtype), noise, _digest(seed), output)
-    if key not in cache["samplers"]:
+    if key not in samplers:
         src = seed if seed is not None else _child_source(parent)
-        cache["samplers"][key] = DenseSampler(law, device=device, dtype=dtype, noise=noise, seed=src, output=output)
-    return cache["samplers"][key]
+        samplers[key] = DenseSampler(law, device=device, dtype=dtype, noise=noise, seed=src, output=output)
+    return samplers[key]
+
+
+def _reusable(obs, dofs, observe, rank, tol, rtol, pin) -> bool:
+    """Whether an ObservedGaussian's own factor is the dense sampler's: the same cut, no selection or truncation, and
+    its noise folded into it (or none)."""
+    return (obs.method == "factor" and dofs is None and observe is None and rank is None and tol is None and pin is None
+            and rtol == obs.rtol and (obs._folded or obs._noise_sampler is None))
+
+
+def _law_from_observed(obs) -> dict:
+    """The dense law of an ObservedGaussian from its factor (no new set-up)."""
+    f = obs._F64.cpu().numpy()
+    comp = {"name": "observed", "map": "affine", "label": "affine", "params": {"shift": np.zeros(obs.m), "scale": 1.0},
+            "mean": obs.mean, "out": None, "nout": obs.m, "support": None, "pull": None}
+    part = _Part.of_observed(obs)
+    info = {"law": "Gaussian observations", "components": [{"name": "observed", "map": "affine",
+                                                            "representation": "observations", "bnd": None}],
+            "outputs": obs.m, "selection": "all", "latent": "outputs", "rank": int(f.shape[1]), "exact": True,
+            "covariance": obs.plan.get("covariance"), "captured_variance": 1.0 - obs.plan.get("dropped_trace", 0.0),
+            "dropped_trace": obs.plan.get("dropped_trace", 0.0),
+            "truncation": {"rtol": obs.rtol, "rank": None, "tol": None, "pin": None}, "reused": "the sampler's factor",
+            "provenance": _provenance(part)}
+    law = {"factor": f, "mix": np.eye(1), "components": [comp], "work64": False, "dofs": np.arange(obs.m),
+           "latent_index": None, "latent_coordinates": None, "info": info}
+    return _compile(law)
+
+
+def _shared_key(gen, fields, mix=None):
+    """(generator, key, how to rebuild the key after unpickling) of a set-up the generator keeps for its spawned
+    children: the fields' keys in the generator (None if a field is not one of its own)."""
+    infos = []
+    for field in fields:
+        found = gen._key_of(field)
+        if found is None:
+            return None
+        infos.append(found)
+    keys = tuple(k for k, _ in infos)
+    extra = _digest(None if mix is None else np.asarray(mix))
+    return gen, (keys, extra), ([i for _, i in infos], extra)
 
 
 def _child_source(parent) -> Source:
     src = getattr(parent, "source", None)
     return src.spawn() if isinstance(src, Source) else Source()
-
-
-def _cache_of(owner) -> dict:
-    """The dense set-ups kept on ``owner``, tied to its identity (shallow copies, e.g. derived posteriors, must not
-    share them)."""
-    stored = owner.__dict__.get("_ngsrng_dense")
-    if stored is None or stored[0] != id(owner):
-        stored = (id(owner), {"laws": {}, "samplers": {}})
-        owner.__dict__["_ngsrng_dense"] = stored
-    return stored[1]
 
 
 def _digest(x):
@@ -604,7 +893,8 @@ def _digest(x):
     if isinstance(x, (np.random.SeedSequence, np.random.Generator, torch.Generator, Source)):
         return ("id", id(x))
     if isinstance(x, torch.Tensor):
-        x = x.detach().cpu().numpy()
+        x = x.detach().cpu()
+        x = x.to_dense().numpy() if x.layout != torch.strided else x.numpy()
     h = hashlib.sha256()
     if sp.issparse(x):
         x = sp.csr_matrix(x)
@@ -620,15 +910,17 @@ def _digest(x):
 class _Part:
     """One component, as the set-up needs it: its latent Gaussian, how its values come from it, and its map."""
 
+    noise = None  # observation noise (an m x q factor) of an ObservedGaussian
+
     @classmethod
-    def of_field(cls, field, gen, name):
+    def of_field(cls, field, gen, name, check=True):
         from .distributions.transforms import MarginalField
         from .generator import _NormalField
 
         p = cls()
         p.name, p.field = name, field
         bnd = getattr(field, "bnd", None)
-        if bnd is not None and bnd["values"] is not None:
+        if check and bnd is not None and bnd["values"] is not None:
             raise NotImplementedError("bnd_values= conditions the field on a trace; dense samplers cover bnd= alone "
                                       "(the trace restriction)")
         p.bnd = None if bnd is None else bnd["sampler"]
@@ -642,9 +934,9 @@ class _Part:
             p.nvalues = field.space.ndof if field.evaluation is None else field.evaluation.shape[0]
         else:
             raise NotImplementedError(
-                f"{name}: dense samplers cover pointwise maps of one latent Gaussian (uniform, lognormal, gamma, beta, "
-                "..., normal with a representation=, marginal, indicator, transformed) and Gaussian fields; this "
-                "family is built from several latents or is not a function of point values")
+                f"{name}: dense samplers and E @ d cover pointwise maps of one latent Gaussian (uniform, lognormal, "
+                "gamma, beta, ..., normal with a representation=, marginal, indicator, transformed) and Gaussian "
+                "fields; this family is built from several latents or is not a function of point values")
         return p
 
     @classmethod
@@ -655,20 +947,27 @@ class _Part:
         p.loc, p.scale, p.evaluation, p.nvalues = np.asarray(g.mean, dtype=float), 1.0, None, g.space.ndof
         return p
 
+    @classmethod
+    def of_observed(cls, obs):
+        """An ObservedGaussian: its observations y = G (loc + scale (f - mean)) + e are the values."""
+        p = cls()
+        p.name, p.field, p.bnd, p.kind, p.gauss, p.points = "observed", obs, None, "observed", obs.field, None
+        p.representation = "observations"
+        p.nvalues, p.obs = obs.m, obs
+        return p
+
     @property
     def space(self):
-        return self.gauss.space
+        return self.obs.space if self.kind == "observed" else self.gauss.space
 
     def output_rows(self, dofs, observe):
         """The output map on the values a draw returns (m x nvalues, CSR), with ``bnd=`` (DoFs off the trace are
         zero in a draw) folded in, and the DoF indices of the outputs (None for an observation)."""
+        from .observed import _as_operator
+
         n = self.nvalues
         if observe is not None:
-            o = observe.detach().cpu().numpy() if isinstance(observe, torch.Tensor) else observe
-            o = sp.csr_matrix(o, dtype=np.float64)
-            if o.shape[1] != n:
-                raise ValueError(f"observe has {o.shape[1]} columns; a draw of {self.name} has {n} values")
-            out_dofs = None
+            o, out_dofs = _as_operator(observe, n), None
         else:
             if dofs is None:
                 out_dofs = (np.setdiff1d(np.arange(n), self.bnd._off) if self.bnd is not None else np.arange(n))
@@ -681,32 +980,41 @@ class _Part:
             keep = np.ones(n)
             keep[self.bnd._off] = 0.0
             o = (o @ sp.diags(keep)).tocsr()
-            o.eliminate_zeros()
+        o.eliminate_zeros()
         return o, out_dofs
 
     # -------------------------------------------------------------- the representation's linear map
 
     def latent_rows(self, rows):
-        """``rows`` (m x nvalues) composed with the map from the latent vector to the values: the coefficients of a
-        Gaussian field (with ``points=``, their evaluation), or the representation's map from the latent point values
-        (Bernstein conversion, L2 projection, identity). Returns (CSR m x nlatent, largest dropped entry, relative)."""
+        """``rows`` (m x nvalues) composed with the linear map from the latent vector to the values: the
+        coefficients of a Gaussian field (with ``points=``, their evaluation), or the representation's map from the
+        latent point values (identity for values at points; the L2 projection, from one mass solve per row). For the
+        Bernstein representation the exact pattern only (ones where an entry may be nonzero; the values come from
+        :meth:`forward_columns`). CSR, m x (latent vector length)."""
         if self.kind == "coefficients":
-            return (rows @ self.evaluation).tocsr() if self.evaluation is not None else rows, 0.0
-        if self.representation in ("quadrature", "points"):
-            return rows, 0.0
-        return _solve_rows(self, rows)
+            g = (rows @ self.evaluation).tocsr() if self.evaluation is not None else rows
+            g.eliminate_zeros()
+            return g
+        if self.kind == "observed" or self.representation in ("quadrature", "points"):
+            return rows
+        if self.representation == "bernstein":
+            touched = np.unique(rows.indices)
+            dep = self.points.bernstein.dependence(touched)
+            pattern = (abs(rows[:, touched]) @ dep).tocsr()
+            pattern.data[:] = 1.0
+            return pattern
+        return _projection_rows(self, rows)
 
     def forward_columns(self, rows, cols):
         """For the Bernstein representation: ``rows`` applied to the library's own conversion of the unit vectors at
         ``cols`` (dense m x |cols|), and the sum of their conversion residuals (the rounding bound of any sample)."""
         bern = self.points.bernstein
-        npts = bern.npoints
         out = np.empty((rows.shape[0], len(cols)))
         resid = 0.0
         step = 256
         for j0 in range(0, len(cols), step):
             blk = cols[j0:j0 + step]
-            e = np.zeros((npts, len(blk)))
+            e = np.zeros((bern.npoints, len(blk)))
             e[blk, np.arange(len(blk))] = 1.0
             c, res = bern.to_coefficients(e)
             out[:, j0:j0 + len(blk)] = rows @ c
@@ -731,21 +1039,24 @@ class _Part:
         return (sp.diags(d) @ e).tocsr(), self.field._latent_mean()[idx]
 
     def mapping(self, idx, mean):
-        """The pointwise map of the latent at ``idx`` as stored by the sampler: name, parameters, support, pull."""
+        """The pointwise map of the latent at ``idx`` as the sampler keeps it: name, parameters, support, pull."""
         if self.kind == "coefficients":  # loc + scale (g - mean_g)
             return {"map": "affine", "params": {"shift": self.loc[idx] - self.scale * mean, "scale": float(self.scale)},
                     "support": None, "pull": None, "label": "affine"}
         t = self.field.transform
+        npts = self.points.npoints
         support = getattr(t, "support", None)
         pull_range = support or getattr(t, "closed_range", None)
-        spec = {"label": self.field.label, "support": _restrict_pair(support, idx, self.points.npoints),
+        spec = {"label": self.field.label, "support": _restrict_pair(support, idx, npts),
                 "pull": None if self.representation != "bernstein" or pull_range is None else
-                {"range": _restrict_pair(pull_range, idx, self.points.npoints), "margin": MARGIN}}
-        func = getattr(t, "func", None)
-        if func is not None and func in NAMES and hasattr(t, "params"):  # ClosedForm
-            spec.update(map=NAMES[func], params={k: _restrict(v, idx, self.points.npoints)
-                                                 for k, v in t.params.items()})
-            return spec
+                {"range": _restrict_pair(pull_range, idx, npts), "margin": _margin()}}
+        from .distributions.transforms import ClosedForm
+
+        if isinstance(t, ClosedForm):
+            names = {func: name for name, func in _maps().items()}
+            if t.func in names:
+                spec.update(map=names[t.func], params={k: _restrict(v, idx, npts) for k, v in t.params.items()})
+                return spec
         from .distributions.inversion import Inversion
 
         if isinstance(t, Inversion):
@@ -753,7 +1064,8 @@ class _Part:
                 raise NotImplementedError(f"{self.name}: a numerical inversion with parameters that vary in space has "
                                           "no dense sampler (constant parameters are supported)")
             t._resolve(10**9, True)  # the table (as d.sample() on a GPU or for large draws), or ppf
-        spec.update(map="object", params={}, transform=t)
+        kind, stored = _stored_map(t)
+        spec.update(map=kind, params={}, transform=t, stored=stored)
         return spec
 
 
@@ -773,66 +1085,58 @@ def _restrict_pair(pair, idx, npoints):
     return tuple(out)
 
 
-def _solve_rows(part, rows):
-    """rows C for the representation's map C from latent point values to FE coefficients, from the transposes (one
-    mass solve per row): Bernstein C = M^-1 R (same-rule mass on all dofs), projection C = M_free^-1 B_free (zero at
-    fixed dofs). Entries below ZERO times their row's largest are rounding of exact zeros and dropped."""
-    field, m = part.field, rows.shape[0]
-    space = part.space
-    if part.representation == "bernstein":
-        bern = field.points.bernstein
-        r = bern._operators()[1]  # ndof x npoints
+def _projection_rows(part, rows):
+    """rows C for the L2 projection C = M_free^-1 B_free (zero at fixed dofs), from the transposes: one mass solve
+    per row. Its rows are dense (every point contributes to every coefficient)."""
+    from .solvers import NGSolveDirect
+    from .space import mass_form
 
-        def block(rt):  # (ndof x b) -> (b x npoints)
-            return np.asarray((r.T @ bern._mass.solve(rt)).T)
-    else:  # projection
-        from .solvers import NGSolveDirect
-        from .space import mass_form
-
-        if field._mass_solver is None:
-            field._mass_solver = NGSolveDirect(space, mass_form)
-        free = space.free
-        bf = field.points.rule.b.tocsr()[free]
-
-        def block(rt):
-            x = field._mass_solver.apply(torch.from_numpy(np.ascontiguousarray(rt[free]))).numpy()
-            return np.asarray((bf.T @ x).T)
-
+    field, space = part.field, part.space
+    if field._mass_solver is None:
+        field._mass_solver = NGSolveDirect(space, mass_form)
+    free = space.free
+    bf = field.points.rule.b.tocsr()[free]
     rt_all = rows.T.tocsc()
-    pieces, dropped = [], 0.0
-    for i0 in range(0, m, 256):
+    pieces = []
+    for i0 in range(0, rows.shape[0], 256):
         rt = rt_all[:, i0:i0 + 256].toarray()
-        b = block(rt)
-        top = np.abs(b).max(axis=1, keepdims=True)
-        small = np.abs(b) <= ZERO * top
-        if small.any():
-            dropped = max(dropped, float((np.abs(b) * small / np.maximum(top, 1e-300)).max()))
-        b[small] = 0.0
-        pieces.append(sp.csr_matrix(b))
-    return sp.vstack(pieces).tocsr(), dropped
+        x = field._mass_solver.apply(torch.from_numpy(np.ascontiguousarray(rt[free]))).numpy()
+        pieces.append(sp.csr_matrix(np.asarray((bf.T @ x).T)))
+    return sp.vstack(pieces).tocsr()
 
 
-def _build_law(parts, mix, dofs, observe, rank, tol, rtol, max_points) -> dict:
+def _build_law(parts, mix, dofs, observe, rank, tol, rtol, pin, max_points) -> dict:
+    from .observed import covariance_factor
+
     t0 = time.perf_counter()
     k = len(parts)
     p0 = parts[0]
     outs = [p.output_rows(dofs, observe) for p in parts]
     lat = [p.latent_rows(o) for p, (o, _) in zip(parts, outs)]
-    support = np.unique(np.concatenate([np.unique(sp.csr_matrix(a).indices) for a, _ in lat]))
+    support = np.unique(np.concatenate([sp.csr_matrix(a).indices for a in lat] + [np.zeros(0, dtype=np.int64)]))
     m0 = outs[0][0].shape[0]
-    at_outputs = k == 1 and p0.kind == "coefficients" and m0 < support.size
+    at_outputs = p0.kind == "observed" or (k == 1 and p0.kind == "coefficients" and m0 < support.size)
     nlat = m0 if at_outputs else support.size
     if nlat > max_points:
         raise ValueError(
             f"the outputs depend on {nlat} latent values, more than max_points={max_points} (a dense factor of "
             f"{8 * nlat**2 / 2**30:.1f} GiB): choose fewer DoFs (dofs=, bnd=) or a representation whose outputs "
             "depend on fewer values (representation='bernstein' rather than 'projection'), or raise max_points")
-    comps = []
-    for i, (p, (o, _), (a, _)) in enumerate(zip(parts, outs, lat)):
-        if at_outputs:  # a Gaussian field observed: the observations are the latent
+    comps, scale, noise = [], 1.0, None
+    for p, (o, _), a in zip(parts, outs, lat):
+        if p.kind == "observed":  # the observations (with their noise) are the latent; loc and scale inside
+            obs = p.obs
+            g_full = (o @ sp.csr_matrix(obs.G)).tocsr()
+            g_op = g_full[:, obs.space.free] if len(obs.space.free) < obs.space.ndof else g_full
+            mean = np.asarray(o @ obs._mean).ravel()
+            nf = obs._noise_factor()
+            scale, noise = obs.scale, None if nf is None else np.asarray(o @ nf)
+            spec = {"map": "affine", "label": "affine", "params": {"shift": np.zeros(m0), "scale": 1.0},
+                    "support": None, "pull": None}
+            out = None
+        elif at_outputs:  # a Gaussian field observed by fewer observations than the DoFs they read
             a_full = sp.csr_matrix(a)
-            free = p.space.free
-            g_op = a_full[:, free].tocsr()
+            g_op = a_full[:, p.space.free].tocsr()
             mean = np.asarray(a_full @ np.asarray(p.gauss.mean, dtype=float)).ravel()
             spec = {"map": "affine", "label": "affine",
                     "params": {"shift": np.asarray(a_full @ p.loc).ravel() - p.scale * mean, "scale": float(p.scale)},
@@ -844,16 +1148,15 @@ def _build_law(parts, mix, dofs, observe, rank, tol, rtol, max_points) -> dict:
             a_s = sp.csr_matrix(a)[:, support].tocsr()
             if p.kind == "points" and p.representation == "bernstein":
                 fwd, resid = p.forward_columns(o, support)
-                fwd[sp.csr_matrix(a_s).toarray() == 0] = 0.0  # the pattern of the exact conversion
-                a_s = sp.csr_matrix(fwd)
+                a_s = sp.csr_matrix(a_s.multiply(fwd))  # the exact pattern, the conversion's values
                 if spec["pull"] is not None:
-                    spec["pull"] = {**spec["pull"], "margin": max(MARGIN, 1e3 * resid)}
+                    spec["pull"] = {**spec["pull"], "margin": max(spec["pull"]["margin"], 1e3 * resid)}
             out = None if _is_identity(a_s) else a_s
         spec.update(name=p.name, mean=mean, out=out, nout=o.shape[0], g=g_op)
         comps.append(spec)
     # the latent covariance (shared by the components) and its factor
-    k_lat, route = _covariance(p0, comps[0]["g"])
-    factor, finfo = _factor(k_lat, rtol, rank, tol)
+    f, finfo = covariance_factor(p0.gauss, comps[0]["g"], p0.space, scale=scale, noise=noise, rtol=rtol, rank=rank,
+                                 tol=tol, pin=pin)
     for c in comps:
         del c["g"]
     work64 = any(p.kind == "points" and p.representation in ("projection", "bernstein") for p in parts)
@@ -867,17 +1170,98 @@ def _build_law(parts, mix, dofs, observe, rank, tol, rtol, max_points) -> dict:
         "selection": ("observe" if observe is not None else "dofs" if dofs is not None else
                       f"trace of '{p0.bnd.name}'" if p0.bnd is not None else "all"),
         "latent": "outputs" if at_outputs else ("coefficients" if p0.kind == "coefficients" else "points"),
-        "latent_points": int(nlat),
         **finfo,
-        "covariance": route,
-        "zero_drop": max(d for _, d in lat),
-        "memory_bytes": int(factor.nbytes + sum(_nbytes(c) for c in comps)),
-        "setup_s": round(time.perf_counter() - t0, 3),
         "provenance": _provenance(p0),
     }
-    return {"factor": factor, "mix": np.asarray(mix, dtype=float), "components": comps, "work64": work64,
-            "dofs": outs[0][1], "latent_index": None if at_outputs else support,
-            "latent_coordinates": None if at_outputs else _coordinates(p0, support), "info": info}
+    law = {"factor": f.cpu().numpy(), "mix": np.asarray(mix, dtype=float), "components": comps, "work64": work64,
+           "dofs": outs[0][1], "latent_index": None if at_outputs else support,
+           "latent_coordinates": None if at_outputs else _coordinates(p0, support), "info": info}
+    law = _compile(law)
+    law["info"]["setup_s"] = round(time.perf_counter() - t0, 3)
+    return law
+
+
+# ---------------------------------------------------------------------- composition and compilation
+
+
+def _compose(law, e) -> dict:
+    """The law of E @ (the outputs of ``law``), compiled (:func:`_compile`)."""
+    comps = []
+    for c in law["components"]:
+        a = e.copy() if c["out"] is None else (e @ sp.csr_matrix(c["out"])).tocsr()
+        a.eliminate_zeros()
+        comps.append({**c, "out": a, "nout": e.shape[0]})
+    info = {**law["info"], "selection": "observe (composed)", "outputs": int(e.shape[0])}
+    return _compile({**law, "components": comps, "dofs": None, "info": info})
+
+
+def _compile(law) -> dict:
+    """Make a law's representation small, without changing it (exact, no tolerance):
+
+    1. latent values no output reads are dropped (a Gaussian's marginal: rows of its factor);
+    2. a factor with more columns than rows is recompressed to as many columns (F V from the SVD F = U s V^T: the
+       same covariance, z -> V^T z is again standard normal, the same V for every component keeps their coupling);
+    3. Gaussian (affine) components with one output map A fold it into the factor, y = A m' + (A F) z (A F recompressed
+       the same way to at most m columns), when that costs less per sample (m r' < |S| r + nnz(A))."""
+    comps = law["components"]
+    f = law["factor"]
+    nlat = f.shape[0]
+    used = np.arange(nlat)
+    if all(c["out"] is not None for c in comps):
+        used = np.unique(np.concatenate([sp.csr_matrix(c["out"]).indices for c in comps] + [np.zeros(0, np.int64)]))
+    if used.size < nlat:
+        law = _restrict_law(law, used)
+        comps, f = law["components"], law["factor"]
+    if f.shape[1] > f.shape[0]:
+        f = _recompress(f)
+    law = {**law, "factor": f}
+    outs = [c["out"] for c in comps]
+    if all(c["map"] == "affine" for c in comps) and outs[0] is not None and \
+            all(o is outs[0] or (o.shape == outs[0].shape and (o != outs[0]).nnz == 0) for o in outs):
+        a = sp.csr_matrix(outs[0])
+        g = np.asarray(a @ f)
+        if g.shape[1] > g.shape[0]:
+            g = _recompress(g)
+        if a.shape[0] * g.shape[1] < f.shape[0] * f.shape[1] + a.nnz:
+            new = []
+            for c in comps:
+                shift = c["params"]["shift"]
+                new.append({**c, "out": None, "mean": np.asarray(a @ c["mean"]).ravel(),
+                            "params": {**c["params"], "shift": np.asarray(a @ shift).ravel() if np.ndim(shift) else
+                                       shift * np.asarray(a.sum(axis=1)).ravel()}})
+            law = {**law, "factor": g, "components": new, "latent_index": None, "latent_coordinates": None,
+                   "info": {**law["info"], "latent": "outputs", "folded": True}}
+    info = law["info"]
+    info.update(latent_points=int(law["factor"].shape[0]), rank=int(law["factor"].shape[1]),
+                memory_bytes=int(law["factor"].nbytes + sum(_nbytes(c) for c in law["components"])))
+    return law
+
+
+def _recompress(f):
+    """F V_r (n x n) for F (n x r), r > n: the same F F^T with n columns, rows that are zero stay exactly zero."""
+    _, s, vt = np.linalg.svd(f, full_matrices=False)
+    return f @ vt.T
+
+
+def _restrict_law(law, used) -> dict:
+    """The law at the latent values ``used`` only."""
+    n = law["factor"].shape[0]
+
+    def cut(x):
+        return x[used] if isinstance(x, np.ndarray) and x.ndim and x.shape[0] == n else x
+
+    comps = []
+    for c in law["components"]:
+        new = {**c, "mean": c["mean"][used], "params": {k: cut(v) for k, v in c["params"].items()},
+               "out": None if c["out"] is None else sp.csr_matrix(c["out"])[:, used].tocsr()}
+        if c.get("support") is not None:
+            new["support"] = tuple(cut(b) for b in c["support"])
+        if c.get("pull") is not None:
+            new["pull"] = {**c["pull"], "range": tuple(cut(b) for b in c["pull"]["range"])}
+        comps.append(new)
+    return {**law, "factor": law["factor"][used], "components": comps,
+            "latent_index": None if law.get("latent_index") is None else law["latent_index"][used],
+            "latent_coordinates": None if law.get("latent_coordinates") is None else law["latent_coordinates"][used]}
 
 
 def _is_identity(a) -> bool:
@@ -896,57 +1280,10 @@ def _nbytes(c) -> int:
     return int(n)
 
 
-def _covariance(part, g):
-    """K = G Sigma G^T (dense float64 torch, on the Gaussian's device) and how it was computed."""
-    from .observed import operator_covariance
-
-    if g.shape[0] == 0:
-        return torch.zeros((0, 0), dtype=torch.float64), "empty"
-    return operator_covariance(part.gauss, g, part.space)
-
-
-def _factor(k, rtol, rank, tol):
-    """F (n x r, NumPy float64) with F F^T = K up to the cutoff, in decreasing eigenvalue order; pinned rows zero."""
-    n = k.shape[0]
-    k = 0.5 * (k + k.T)
-    diag = torch.diagonal(k).clamp_min(0.0)
-    top = float(diag.max()) if n else 0.0
-    pinned = diag <= rtol * top if top > 0 else torch.ones(n, dtype=torch.bool, device=k.device)
-    free = torch.nonzero(~pinned).ravel()
-    total = float(diag.sum())
-    f = np.zeros((n, 0))
-    lam = np.zeros(0)
-    if free.numel():
-        w, v = torch.linalg.eigh(k[free][:, free])
-        w, v = w.flip(0), v.flip(1)  # decreasing
-        keep = w > rtol * float(w[0]) if float(w[0]) > 0 else torch.zeros_like(w, dtype=torch.bool)
-        w, v = w[keep], v[:, keep]
-        exact = int(w.numel())
-        if rank is not None:
-            w, v = w[:int(rank)], v[:, :int(rank)]
-        if tol is not None and w.numel():
-            frac = torch.cumsum(w, 0) / max(total, 1e-300)
-            r = int(torch.searchsorted(frac, torch.tensor(1.0 - float(tol), dtype=frac.dtype, device=frac.device))) + 1
-            w, v = w[:r], v[:, :r]
-        # a fixed sign per mode (largest entry positive): the factor does not depend on the eigensolver's choice
-        big = v.abs().argmax(dim=0)
-        sign = torch.sign(v[big, torch.arange(v.shape[1], device=v.device)])
-        v = v * torch.where(sign == 0, torch.ones_like(sign), sign)
-        f = np.zeros((n, w.numel()))
-        f[free.cpu().numpy()] = (v * torch.sqrt(w)).cpu().numpy()
-        lam = w.cpu().numpy()
-    else:
-        exact = 0
-    captured = float(lam.sum()) / total if total > 0 else 1.0
-    info = {"rank": int(f.shape[1]), "exact": f.shape[1] == exact, "captured_variance": captured,
-            "dropped_trace": max(0.0, 1.0 - captured), "rtol": rtol, "pinned": int(pinned.sum()),
-            "truncation": None if rank is None and tol is None else {"rank": rank, "tol": tol}}
-    return f, info
-
-
 def _law_label(parts, k):
     p = parts[0]
-    what = "Gaussian field" if p.kind == "coefficients" else f"{p.field.label} ({p.representation})"
+    what = {"coefficients": "Gaussian field", "observed": "Gaussian observations"}.get(p.kind) or \
+        f"{p.field.label} ({p.representation})"
     return what if k == 1 else f"{k} correlated components: " + ", ".join(q.name for q in parts)
 
 
@@ -1003,3 +1340,4 @@ def _version():
             except (OSError, subprocess.SubprocessError):
                 commit = None
     return version, commit
+

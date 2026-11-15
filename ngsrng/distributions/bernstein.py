@@ -115,7 +115,8 @@ class BernsteinForm:
         self.fit = self.values(self.ref_points).T @ np.linalg.pinv(self.bq.T)  # (nloc, nq)
         verts = np.array([[v.nr for v in el.vertices] for el in mesh.Elements(ngs.VOL)])
         self.ne = len(verts)
-        self._number(verts, conforming=fes.type == "h1ho")
+        self.verts, self.conforming = verts, fes.type == "h1ho"  # element vertex numbers (ne x vertices per element)
+        self._number(verts, conforming=self.conforming)
         rows = sp.kron(sp.identity(self.ne, format="csr"), sp.csr_matrix(self.fit), format="csr")
         self.evaluation = (rows @ self.rule.evaluation_full)[self.first].tocsr()  # (npoints x ndof)
         bm = self.rule.b
@@ -123,6 +124,7 @@ class BernsteinForm:
         self._mapped = None
         self._ops = None  # the conversion's sparse operators (made on first use; see _operators)
         self._device = DeviceCache()  # the conversion's operators on torch devices (to_coefficients of tensors)
+        self._topology = None  # per dof its node, per support the domain points (dependence; made on first use)
 
     def __getstate__(self):  # the operators are rebuilt on first use (P is about as large as the rule's matrices)
         return {**self.__dict__, "_ops": None}
@@ -193,6 +195,71 @@ class BernsteinForm:
                 f"the space is not the full P_p / Q_p space ({self.npoints} Bernstein functions, {self.space.ndof} "
                 "dofs): variable orders or special flags are not supported"
             )
+
+    # ---------------------------------------------------------------- which coefficients depend on which
+
+    def dependence(self, dofs) -> sp.csr_matrix:
+        """Which Bernstein coefficients the NGSolve coefficients ``dofs`` depend on: a 0/1 matrix (len(dofs) x
+        npoints), exact (from the mesh topology, not from rounding).
+
+        H1: NGSolve's basis is hierarchical, a coefficient belongs to a mesh node (vertex, edge, face, cell) and is a
+        linear function of the FE function on that node's closure (the other basis functions vanish there, or belong
+        to the closure's own nodes). On that closure only the Bernstein functions of the domain points in it do not
+        vanish, so the coefficient depends exactly on those points: the points whose vertices (those with a positive
+        weight) are vertices of the node. L2: a coefficient depends on the domain points of its element."""
+        nodes, by_support = self._nodes()
+        dofs = np.asarray(dofs, dtype=np.int64).ravel()
+        rows, cols, found = [], [], {}
+        for r, d in enumerate(dofs):
+            node = nodes[d]
+            pts = found.get(node)
+            if pts is None:
+                if node[0] == "element":
+                    pts = self.local_to_global[node[1]]
+                else:
+                    subsets = (w for k in range(1, len(node) + 1) for w in itertools.combinations(node, k))
+                    pts = np.unique(np.concatenate([by_support.get(w, np.zeros(0, np.int64)) for w in subsets]))
+                found[node] = pts
+            rows.append(np.full(len(pts), r))
+            cols.append(pts)
+        rows = np.concatenate(rows) if rows else np.zeros(0, np.int64)
+        cols = np.concatenate(cols) if cols else np.zeros(0, np.int64)
+        return sp.csr_matrix((np.ones(rows.size), (rows, cols)), shape=(dofs.size, self.npoints))
+
+    def _nodes(self):
+        """(per dof: the sorted vertex numbers of its node, or ("element", number) for L2; per sorted vertex tuple:
+        the domain points with exactly those vertices), made on first use."""
+        if self._topology is None:
+            mesh, fes = self.space.mesh, self.space.fes
+            nodes = [None] * fes.ndof
+            if self.conforming:
+                for nt in (ngs.VERTEX, ngs.EDGE, ngs.FACE, ngs.CELL):
+                    for i in range(mesh.nnodes(nt)):
+                        nid = ngs.NodeId(nt, i)
+                        dofs = fes.GetDofNrs(nid)
+                        if not dofs:
+                            continue
+                        verts = (i,) if nt == ngs.VERTEX else tuple(sorted(v.nr for v in mesh[nid].vertices))
+                        for d in dofs:
+                            if d >= 0:
+                                nodes[d] = verts
+                nloc = len(self.lattice)
+                positive = self.weights > 0  # (nloc, vertices per element): the vertices of each local point
+                support = {}
+                for j, flat in enumerate(self.first):
+                    el, loc = divmod(int(flat), nloc)
+                    support.setdefault(tuple(sorted(int(v) for v in self.verts[el][positive[loc]])), []).append(j)
+                by_support = {k: np.asarray(v, dtype=np.int64) for k, v in support.items()}
+            else:
+                for el in mesh.Elements(ngs.VOL):
+                    for d in fes.GetDofNrs(el):
+                        if d >= 0:
+                            nodes[d] = ("element", el.nr)
+                by_support = {}
+            if any(n is None for n in nodes):
+                raise NotImplementedError("some dofs belong to no mesh node: an unsupported space for dense samplers")
+            self._topology = (nodes, by_support)
+        return self._topology
 
     # ---------------------------------------------------------------- maps
 
