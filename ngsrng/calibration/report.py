@@ -319,7 +319,8 @@ def distributions_section(df):
         "families live at quadrature points; Student-t processes and type-G fields are FE functions. Validity: KS "
         "p-value of known marginals (should not be tiny), Poisson mean error, variance ratio vs theory (~1). "
         "'-host' cases (GPU only) process the Gaussian's draws on the host (compute='host'): against their device "
-        "counterparts they decide where the post-processing runs.\n",
+        "counterparts they decide where the post-processing runs. '-dense' cases: the field at mesh vertices by a "
+        "dense sampler (d.dense(observe=...); its set-up in dense_setup_s).\n",
     ]
     df = df.assign(platform=platform(df))
     ok = df[df.status == "ok"]
@@ -330,6 +331,8 @@ def distributions_section(df):
             "per_sample_s",
             "out_per_sample_s",
             "overhead_vs_gauss",
+            "dense_setup_s",
+            "latent_points",
             "compute",
             "device",
             "inversion",
