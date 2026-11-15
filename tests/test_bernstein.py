@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 import scipy.stats as st
 from ngsolve.meshes import Make1DMesh, MakeStructured2DMesh, MakeStructured3DMesh
+from stat_checks import assert_law
 
 import ngsrng
 from ngsrng.distributions.bernstein import BernsteinForm
@@ -92,11 +93,11 @@ def test_uniform_stays_inside_everywhere(name):
 def test_bernstein_marginals_and_other_ranges():
     fes = ngs.H1(ngs.Mesh(ngs.unit_square.GenerateMesh(maxh=0.15)), order=2, dirichlet="left")
     rng = ngsrng.default_rng(fes, seed=2, correlation=0.4, dtype="float64")
-    u = rng.uniform(size=2000, representation="bernstein")
+    u = rng.uniform(size=5000, representation="bernstein")
     # NGSolve's first nv dofs are the vertex values, and Q_h f equals f at the vertices: exact uniform marginals
     free_vertices = [v for v in range(fes.mesh.nv) if fes.FreeDofs()[v]]
     for i in free_vertices[:: max(1, len(free_vertices) // 4)][:4]:
-        assert st.kstest(u[:, i], st.uniform().cdf).pvalue > 1e-4
+        assert_law(u[:, i], st.uniform().cdf, what=f"vertex {i}")
     left = [v.nr for v in fes.mesh.vertices if abs(v.point[0]) < 1e-12]
     np.testing.assert_allclose(u[:, left], 0.5)  # a deterministic (Dirichlet) point maps to the median
     dirichlet = rng.dirichlet([0.5, 1.0, 2.0], size=10, representation="bernstein")

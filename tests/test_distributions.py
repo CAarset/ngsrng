@@ -1,10 +1,13 @@
-"""Statistical checks (fixed seeds, 5-sigma-type tolerances) of the distribution families."""
+"""The laws of the distribution families: exact laws checked on i.i.d. values at a false-failure rate of 1e-12
+(:mod:`stat_checks`), and exact constructions."""
 
 import ngsolve as ngs
 import numpy as np
 import pytest
 import scipy.linalg as sla
 import scipy.stats as st
+import torch
+from stat_checks import assert_bounded_mean, assert_law, assert_normal, assert_uniform_pit
 
 import ngsrng
 from ngsrng.distributions import (
@@ -23,8 +26,7 @@ from ngsrng.distributions import (
 from ngsrng.distributions.pointwise import XP
 from ngsrng.reference import exact_covariance
 
-N = 3000
-P_MIN = 1e-5  # KS p-value threshold: ~100 KS tests per run, so 1e-3 would fail spuriously about every tenth run
+N = 10000
 
 
 @pytest.fixture(scope="module")
@@ -68,24 +70,26 @@ def test_exact_pointwise_std(prior, points):
 def test_copula_marginals(points, name, args, ref):
     v = named_marginal(points, name, *args).sample(N)
     for q in _probe(v):
-        assert st.kstest(v[q], ref.cdf).pvalue > P_MIN
+        assert_law(v[q], ref.cdf, what=f"{name} at point {q}")
 
 
 def test_scipy_marginal_and_discrete(points):
     v = marginal(points, st.genextreme(0.2)).sample(N)
-    assert st.kstest(v[0], st.genextreme(0.2).cdf).pvalue > P_MIN
+    assert_law(v[0], st.genextreme(0.2).cdf)
     k = named_marginal(points, "poisson", 3.0).sample(N)
+    poisson = st.poisson(3.0)
     for q in _probe(k):
-        counts = np.bincount(k[q].astype(int), minlength=12)[:12]
-        expect = st.poisson(3.0).pmf(np.arange(12)) * N
-        assert st.chisquare(counts[:9], expect[:9] * counts[:9].sum() / expect[:9].sum()).pvalue > P_MIN
+        assert np.array_equal(k[q], np.round(k[q]))
+        assert_law(k[q], poisson.cdf, left_cdf=lambda t: poisson.cdf(t - 1), what=f"poisson at point {q}")
 
 
 def test_chi_square_and_indicator(points):
     c = ChiSquareField(points, 3).sample(N)
-    assert abs(c.mean() - 3) < 0.05 and abs(c.var() - 6) < 0.3
     ind = indicator(points, 1.0).sample(N)
-    assert abs(ind.mean() - st.norm.sf(1.0)) < 0.01
+    assert set(np.unique(ind)) <= {0.0, 1.0}
+    for q in _probe(c):
+        assert_law(c[q], st.chi2(3).cdf, what=f"chi-square at point {q}")
+        assert_bounded_mean(ind[q], st.norm.sf(1.0), 0.0, 1.0, what=f"indicator at point {q}")
 
 
 @pytest.mark.parametrize("construction, df", [("process", 4), ("bartlett", 4), ("bartlett", 2.5)])
@@ -103,7 +107,7 @@ def test_wishart_marginal_law(points, construction, df, inverse):
     for a in (np.array([1.0, 0.0]), np.array([0.6, -0.8])):
         for q in _probe(w):
             x = np.einsum("i,nij,j->n", a, m[q], a) / (a @ s @ a)
-            assert st.kstest(x, st.chi2(df).cdf).pvalue > P_MIN
+            assert_law(x, st.chi2(df).cdf, what=f"a^T W a at point {q}")
 
 
 def test_wishart_process_needs_integer_df(points):
@@ -134,36 +138,37 @@ def test_dirichlet(points):
     assert x.shape == (points.npoints, 3, N)
     np.testing.assert_allclose(x.sum(1), 1.0, atol=1e-12)
     for k in range(3):
-        assert st.kstest(x[0, k], st.beta(alpha[k], alpha.sum() - alpha[k]).cdf).pvalue > P_MIN
+        assert_law(x[0, k], st.beta(alpha[k], alpha.sum() - alpha[k]).cdf, what=f"component {k}")
 
 
-def _functional_variance(prior, x):
-    m = prior.space.mass
-    one = np.ones(prior.space.ndof)
-    return (one @ m @ (np.asarray(x) - prior.mean[:, None])).var(), one @ m
+def _functional(prior, x):
+    """The functional f = int (x - mean) dx of draws x (ndof x n), and its weights w = M 1 (all dofs)."""
+    w = np.ones(prior.space.ndof) @ prior.space.mass
+    return w @ (np.asarray(x) - prior.mean[:, None]), w
 
 
 def test_student_t_covariance(prior):
-    x = StudentTField(prior, 8, seed=7).sample(6000)
-    var, w = _functional_variance(prior, x)
+    """The t-process's finite-dimensional laws are multivariate t: a functional is sqrt(its Gaussian variance) times
+    a t_8 variable (hence the covariance 8/6 of the Gaussian's)."""
+    f, w = _functional(prior, StudentTField(prior, 8, seed=7).sample(N))
     wf = w[prior.space.free]
-    gauss_var = wf @ exact_covariance(prior) @ wf
-    assert abs(var / gauss_var - 8 / 6) < 0.15
+    assert_law(f / np.sqrt(wf @ exact_covariance(prior) @ wf), st.t(8).cdf)
 
 
 @pytest.mark.parametrize("mixing", ["nig", "gamma"])
 def test_type_g_keeps_covariance_and_has_heavy_tails(prior, mixing):
+    """The exact law: the mixing variables V_e (mean 1, variance nu / |e|: inverse Gaussian or gamma), and, given them,
+    a Gaussian field whose noise on element e is scaled by sqrt(V_e), so that a functional f = w^T (x - mean) is
+    N(0, sum_k (L^T w)_k^2 V_e(k)). Hence E V = 1 keeps the Gaussian's covariance, and Var V > 0 gives heavy tails."""
     field = TypeGField(prior, mixing, nu=0.05, seed=8)
-    v = field.mixing_variables(4000)
-    assert abs(v.mean() - 1) < 0.01
-    x = field.sample(N)
-    var, w = _functional_variance(prior, x)
-    wf = w[prior.space.free]
-    assert abs(var / (wf @ exact_covariance(prior) @ wf) - 1) < 5 * np.sqrt(2 / N)
-    pts = GaussianAtPoints(prior, std=None)
-    # heavy tails: the median over points of the excess kurtosis (nig over 12 seeds: 0.79 +- 0.04; the Gaussian
-    # prior: 0.00 +- 0.03). A single point's estimate (sd ~0.15) failed for a third of the seeds at threshold 0.3.
-    assert np.median(st.kurtosis(pts.rule.values(np.asarray(x)), axis=1)) > 0.4
+    shape = field.volumes[:, None] / field.nu
+    law = st.invgauss(1 / shape, scale=shape) if mixing == "nig" else st.gamma(shape, scale=1 / shape)
+    assert_uniform_pit(field.mixing_variables(4000), law.cdf, what="mixing variables")
+    x = TypeGField(prior, mixing, nu=0.05, seed=9).sample(N)
+    v = TypeGField(prior, mixing, nu=0.05, seed=9).mixing_variables(N)  # the same streams: the draws' V_e
+    f, w = _functional(prior, x)
+    a = prior.apply_t(torch.from_numpy(w[prior.space.free])).double().numpy() ** 2
+    assert_normal(f / np.sqrt(a @ v[field.element_of_column]), 0.0, 1.0)
 
 
 def test_type_g_needs_white_noise():
@@ -180,9 +185,9 @@ def test_representations(prior, points):
     assert gf.space.type == "irspace"
     gf2 = field.sample()
     assert isinstance(gf2, ngs.GridFunction) and gf2.space is prior.space.fes
-    raw = transformed(points, np.exp).sample(N)  # exp(g) without standardisation
-    expect = np.exp(points.mean + points.std**2 / 2)
-    assert np.all(np.abs(raw.mean(axis=1) / expect - 1) < 5 * np.sqrt((np.exp(points.std**2) - 1) / N))
+    raw = transformed(points, np.exp).sample(N)  # exp(g) without standardisation: lognormal at every point
+    for q in _probe(raw):
+        assert_law(raw[q], st.lognorm(points.std[q], scale=np.exp(points.mean[q])).cdf, what=f"point {q}")
 
 
 def test_torch_path_matches_numpy(prior):

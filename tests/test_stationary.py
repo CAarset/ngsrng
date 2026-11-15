@@ -7,6 +7,8 @@ import ngsolve as ngs
 import numpy as np
 import pytest
 import torch
+from scipy.stats import norm
+from stat_checks import assert_law
 
 import ngsrng
 import ngsrng.stationary as st
@@ -299,13 +301,29 @@ def test_pointwise_families_on_a_dirichlet_field(coarse):
     rng = ngsrng.default_rng(fes, seed=3, dtype="float64",
                              correlation=ngsrng.matern_correlation(LENGTH, nu=2, boundary="torus"))
     assert rng.info("uniform", -0.2, 1.0, representation="bernstein")["standardised_by"].startswith("prior")
-    u = np.asarray(rng.uniform(-0.2, 1.0, size=300, representation="bernstein"))
+    u = np.asarray(rng.uniform(-0.2, 1.0, size=4000, representation="bernstein"))
     fixed = np.flatnonzero(~np.array(fes.FreeDofs(), bool))
     np.testing.assert_allclose(u[:, fixed[fixed < coarse.nv]], 0.4, atol=1e-12)  # vertex dofs: the median
-    xyz = vertices(coarse)
-    far = xyz[np.argmin(np.linalg.norm(xyz - [0.5, 0.7], axis=1))]  # a vertex: exact marginals there
-    vals = basis_at(fes, np.array([[0.5, 0.02], far])) @ u.T
-    assert vals.var(1)[0] < 0.25 * vals.var(1)[1] and vals.var(1)[1] == pytest.approx(1.2**2 / 12, rel=0.3)
+    # at a vertex the value is -0.2 + 1.2 Phi(z), z ~ N(mu, s^2) with the conditioned field's mean and standard
+    # deviation in units of the unconditioned field's: the spread shrinks towards the boundary
+    gauss, xyz = rng.gaussian(), vertices(coarse)
+    spreads = []
+    for target in ([0.5, 0.2], [0.5, 0.7]):
+        v = xyz[[np.argmin(np.linalg.norm(xyz - target, axis=1))]]
+        ref = rng._gaussian_at_points(gauss, points=v)
+        mu, s = (ref.mean[0] - ref.center[0]) / ref.std[0], \
+            rng._gaussian_at_points(gauss, points=v, standardize_by="own").std[0] / ref.std[0]
+        assert_law(basis_at(fes, v) @ u.T, lambda t, mu=mu, s=s: norm.cdf((norm.ppf((t + 0.2) / 1.2) - mu) / s),
+                   what=f"vertex {v[0]}")
+        spreads.append(s)
+    assert spreads[0] < spreads[1]
+    # next to the edge, every draw: a Bernstein value is a convex combination of the domain points' values, those on
+    # the Dirichlet edge fixed at the median, so |f - 0.4| <= 0.6 * (the Bernstein weight of the other points)
+    bern = rng.bernstein_form(gauss.space)
+    off_edge = (np.abs(bern.cf_values(ngs.y)) > 1e-12).astype(float)
+    weight = np.asarray(basis_at(fes, np.array([[0.5, 0.02]])) @ bern.to_coefficients(off_edge[:, None])[0]).item()
+    assert weight < 0.3
+    assert np.abs(basis_at(fes, np.array([[0.5, 0.02]])) @ u.T - 0.4).max() <= 0.6 * weight + 1e-12
     g = np.asarray(rng.uniform(-0.2, 1.0, size=20, representation="bernstein", bnd="left"))
     on_trace = np.setdiff1d(boundary_dofs(fes, "left", free_only=False), boundary_dofs(fes, "left"))
     assert on_trace.size and np.allclose(g[:, on_trace[on_trace < coarse.nv]], 0.4)

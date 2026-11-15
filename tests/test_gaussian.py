@@ -6,6 +6,7 @@ import pytest
 import torch
 from conftest import cuda_usable
 from ngsolve.meshes import Make1DMesh
+from stat_checks import assert_normal
 
 import ngsrng
 from ngsrng.reference import covariance_errors, exact_covariance, sampler_covariance
@@ -295,12 +296,11 @@ def test_posterior_out_buffer_uses_the_posterior_mean(device):
     rng.normal(out=buf)  # caches the prior mean on the device
     post = prior.condition(points=[[0.5, 0.5]], noise=1e-6, data=[5.0])
     g = ngsrng.observation_operator(fes, points=[[0.5, 0.5]])
-    for gauss, target in ((post, 5.0), (prior, 0.0)):
-        rng.normal(out=buf, correlation=gauss)
-        assert abs((g @ buf.double().cpu().numpy().T).mean() - target) < 0.05
     shifted = ngsrng.LinearObservations(prior, points=[[0.5, 0.5]], noise=1e-6).posterior(mean=ngs.CF(2.0))
-    rng.normal(out=buf, correlation=shifted)
-    assert abs((g @ buf.double().cpu().numpy().T).mean() - 2.0) < 0.05
+    for gauss in (post, prior, shifted):  # each batch has its own law at the point (posterior means ~5, 0, ~2)
+        rng.normal(out=buf, correlation=gauss)
+        sd = np.sqrt(ngsrng.functional_covariance(gauss, points=[[0.5, 0.5]])[0, 0])
+        assert_normal(g @ buf.double().cpu().numpy().T, (g @ gauss.mean)[0], sd)
 
 
 def test_apply_precision_by_specification():

@@ -4,6 +4,7 @@ import ngsolve as ngs
 import numpy as np
 import pytest
 import torch
+from stat_checks import assert_law, assert_normal
 
 import ngsrng
 from ngsrng.reference import exact_covariance
@@ -69,9 +70,8 @@ def test_normal_location_and_scale(rng, fes):
     one = np.ones(fes.ndof)
     w = (one @ m)[gauss.space.free]
     expect_var = 9.0 * w @ exact_covariance(gauss) @ w
-    f = x @ (m @ one)
-    assert abs(f.mean() - 0.5) < 5 * np.sqrt(expect_var / 4000)
-    assert abs(f.var() / expect_var - 1) < 5 * np.sqrt(2 / 4000)
+    f = x @ (m @ one)  # int u dx: N(int x dx = 1/2, 9 w^T Sigma w) exactly
+    assert_normal(f, 0.5, np.sqrt(expect_var))
 
 
 def test_matern_correlation_has_unit_variance_inside():
@@ -93,8 +93,8 @@ def test_spatially_varying_parameters(rng):
 def test_white_noise_is_projected_white_noise(rng, fes):
     c = rng.white_noise(size=4000)
     m = rng.gaussian(precision=rng._mass_precision()).space.mass
-    f = c @ (m @ np.ones(fes.ndof))  # <1, W_h> has variance |domain| = 1
-    assert abs(f.var() - 1) < 5 * np.sqrt(2 / 4000)
+    f = c @ (m @ np.ones(fes.ndof))  # <1, W_h> ~ N(0, 1^T M M^-1 M 1 = |domain| = 1) exactly
+    assert_normal(f, 0.0, 1.0)
 
 
 def test_distribution_objects_are_cached(rng):
@@ -112,7 +112,8 @@ def test_other_spatial_structures(fes):
     post = prior.condition(points=[(0.5, 0.5)], noise=1e-6, data=[2.0])
     rng = ngsrng.default_rng(fes, seed=0, correlation=post, dtype="float64")
     obs = ngsrng.observation_operator(fes, points=[(0.5, 0.5)])
-    assert abs((obs @ rng.normal(size=50).T).mean() - 2.0) < 0.05
+    sd = np.sqrt(ngsrng.functional_covariance(post, points=[(0.5, 0.5)])[0, 0])
+    assert_normal(obs @ rng.normal(size=2000).T, (obs @ post.mean)[0], sd)  # the posterior's law at the point
     assert rng.lognormal(size=2).shape[0] == 2
     sigma = exact_covariance(prior)
     cov = ngsrng.OperatorCovariance(lambda y: torch.from_numpy(sigma @ y.numpy()), tol=1e-2)
@@ -124,19 +125,23 @@ def test_other_spatial_structures(fes):
 
 def test_pointwise_families_on_posteriors_use_the_prior(fes):
     """The posterior of the prior's uniform field: Phi((g_post - m0) / sigma0), so at an exactly observed point the
-    value is Phi(y / sigma0), and far away the field stays (almost) uniform."""
+    value is Phi(y / sigma0), and elsewhere its law is that of Phi(z), z ~ N((m_post - m0) / sigma0, (sigma_post /
+    sigma0)^2) (almost uniform far away). With standardize_by="own" the posterior's own copula: uniform everywhere."""
     import scipy.stats as st
 
     prior = ngsrng.Gaussian(fes, ngsrng.matern_correlation(0.3).bind(fes), dtype="float64", seed=0)
     post = prior.condition(points=[(0.5, 0.5)], noise=1e-8, data=[1.5])
     rng = ngsrng.default_rng(fes, seed=1, correlation=post, dtype="float64")
     xy = np.array([[0.5, 0.5], [0.05, 0.05]])
-    u = rng.uniform(size=1000, points=xy)
-    sigma0 = rng._gaussian_at_points(post, points=xy).std[0]
+    u = rng.uniform(size=5000, points=xy)
+    by_prior = rng._gaussian_at_points(post, points=xy)
+    sigma0 = by_prior.std[0]
     np.testing.assert_allclose(u[:, 0], st.norm.cdf(1.5 / sigma0), atol=1e-3)
-    assert abs(u[:, 1].mean() - 0.5) < 0.05
-    own = rng.uniform(size=1000, points=xy, standardize_by="own")
-    assert abs(own[:, 0].mean() - 0.5) < 0.05  # the posterior's own copula: uniform everywhere
+    mu = (by_prior.mean[1] - by_prior.center[1]) / by_prior.std[1]
+    s = rng._gaussian_at_points(post, points=xy, standardize_by="own").std[1] / by_prior.std[1]
+    assert_law(u[:, 1], lambda t: st.norm.cdf((st.norm.ppf(t) - mu) / s), what="far from the data")
+    own = rng.uniform(size=5000, points=xy, standardize_by="own")
+    assert_law(own[:, 0], st.uniform().cdf, what="the posterior's own copula")
     with pytest.warns(UserWarning, match="independent copies"):
         rng.chisquare(3, size=2)
     with pytest.warns(UserWarning, match="elliptical"):
@@ -154,7 +159,7 @@ def test_values_at_arbitrary_points(rng, fes):
     g = rng.gamma(2.0, ngs.x + 1, size=2000, points=xy)  # spatially varying scale, evaluated at the points
     assert g.shape == (2000, 5)
     for i in range(5):
-        assert st.kstest(g[:, i], st.gamma(2.0, scale=1 + xy[i, 0]).cdf).pvalue > 1e-4
+        assert_law(g[:, i], st.gamma(2.0, scale=1 + xy[i, 0]).cdf, what=f"point {i}")
     assert rng.normal(size=3, points=xy).shape == (3, 5)
     assert rng.uniform(points=xy).shape == (5,)
 

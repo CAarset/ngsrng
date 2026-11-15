@@ -6,6 +6,7 @@ import ngsolve as ngs
 import numpy as np
 import pytest
 import torch
+from stat_checks import assert_gaussian
 
 import ngsrng
 from ngsrng.reference import exact_covariance
@@ -24,11 +25,6 @@ def prior(fes):
 PTS = np.random.default_rng(0).uniform(0.05, 0.95, (12, 2))
 
 
-def mc_close(y, cov, tol=0.08):
-    """Empirical covariance of draws y (m x n) against cov, relative to its largest entry."""
-    return np.abs(np.cov(y) - cov).max() < tol * np.abs(cov).max()
-
-
 @pytest.mark.parametrize("method", ["factor", "pathwise"])
 def test_law(prior, method):
     k = ngsrng.functional_covariance(prior, points=PTS)
@@ -36,8 +32,7 @@ def test_law(prior, method):
     assert o.method == method and o.m == 12
     np.testing.assert_allclose(o.covariance(), 4 * k, rtol=1e-9, atol=1e-12 * np.abs(k).max())
     torch.manual_seed(0)
-    y = o.sample(8000).numpy()
-    assert mc_close(y, 4 * k) and np.abs(y.mean(1) - 1.0).max() < 0.1 * np.sqrt(4 * np.diag(k).max())
+    assert_gaussian(o.sample(8000).numpy().T, np.ones(12), 4 * k)
 
 
 def test_pathwise_is_the_field_observed(prior):
@@ -74,7 +69,7 @@ def test_noise(prior, method):
         o = ngsrng.ObservedGaussian(prior, points=PTS, noise=noise, method=method)
         np.testing.assert_allclose(o.covariance(), want, rtol=1e-9, atol=1e-12 * np.abs(want).max())
         torch.manual_seed(2)
-        assert mc_close(o.sample(8000).numpy(), want)
+        assert_gaussian(o.sample(8000).numpy().T, np.zeros(12), want, what=f"noise {type(noise).__name__}")
 
 
 def test_fields_and_operators(prior, fes):
@@ -91,7 +86,8 @@ def test_fields_and_operators(prior, fes):
             o = ngsrng.ObservedGaussian(field, points=PTS, method=method)
             np.testing.assert_allclose(o.covariance(), want, rtol=1e-8, atol=1e-12 * np.abs(want).max())
             torch.manual_seed(3)
-            assert mc_close(o.sample(8000).numpy(), want), (type(field).__name__, method)
+            assert_gaussian(o.sample(8000).numpy().T, g @ field.mean[prior.space.free], want,
+                            what=f"{type(field).__name__}, {method}")
     cov = ngsrng.OperatorCovariance(lambda y: torch.from_numpy(exact_covariance(prior) @ y.numpy()))
     oc = ngsrng.ObservedGaussian(cov, fes=fes, points=PTS)
     assert oc.method == "factor"
@@ -110,7 +106,7 @@ def test_fields_and_operators(prior, fes):
             o = ngsrng.ObservedGaussian(prior, method=method, **kw)
             np.testing.assert_allclose(o.covariance(), want, rtol=1e-8, atol=1e-12 * np.abs(want).max())
             torch.manual_seed(4)
-            assert mc_close(o.sample(8000).numpy(), want), (list(kw), method)
+            assert_gaussian(o.sample(8000).numpy().T, np.zeros(want.shape[0]), want, what=f"{list(kw)}, {method}")
 
 
 def test_seeding_and_chunks(prior):

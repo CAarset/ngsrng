@@ -5,6 +5,7 @@ import pytest
 import scipy.special as sps
 import scipy.stats as st
 import torch
+from stat_checks import assert_law
 
 from ngsrng.distributions.inversion import TABLE_MIN_VALUES, Inversion, _q_exact, _q_newton
 from ngsrng.distributions.mixtures import torch_gamma, torch_inverse_gaussian
@@ -85,7 +86,7 @@ def test_auto_method_selection():
 def test_torch_gamma(a):
     gen = torch.Generator().manual_seed(1)
     x = torch_gamma(torch.full((50000,), a, dtype=torch.float64), gen).numpy()
-    assert st.kstest(x, st.gamma(a).cdf).pvalue > 1e-3
+    assert_law(x, st.gamma(a).cdf)
 
 
 @pytest.mark.parametrize("shape", [0.2, 3.0])
@@ -93,4 +94,4 @@ def test_torch_inverse_gaussian(shape):
     gen = torch.Generator().manual_seed(2)
     x = torch_inverse_gaussian(torch.ones(50000, dtype=torch.float64), torch.full((50000,), shape, dtype=torch.float64),
                                gen).numpy()
-    assert st.kstest(x, st.invgauss(1 / shape, scale=shape).cdf).pvalue > 1e-3
+    assert_law(x, st.invgauss(1 / shape, scale=shape).cdf)
