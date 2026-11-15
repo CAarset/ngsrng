@@ -261,6 +261,20 @@ def test_observation_syntaxes(space, rng, kind):
     assert isinstance(two, ngsrng.ObservedField) and two.m == 3 and two.dense().nout == 3
 
 
+def test_rounding_entries_of_observations(space, rng):
+    """A point evaluation at the vertices gives rounding-level weights (~1e-17) to basis functions that vanish there:
+    with zero= (default 1e-15) they are dropped and each vertex value reads its vertex point alone; zero=None keeps
+    them (a larger latent set, the same law to rounding)."""
+    d = rng.distribution("uniform", -1, 20, representation="bernstein")
+    xyz = np.array([v.point for v in space.mesh.vertices])[:12]
+    e = ngsrng.observation_operator(space, points=xyz)
+    a = d.dense(observe=e)
+    assert a.latent_points == len(xyz) and a.info["zero"] == 1e-15
+    b = d.dense(observe=e, zero=None)
+    assert b.latent_points >= a.latent_points and b.info["zero_drop"] == 0.0
+    assert st.kstest(a.sample(3000)[:, 3], st.uniform(-1, 21).cdf).pvalue > 1e-3
+
+
 def test_composition_drops_unread_values(space, rng):
     """E @ dense reading a few outputs keeps only the latent values they read, recompresses the factor, and keeps
     the law (a Gaussian field: covariance E O Sigma O^T E^T; a vertex value: the exact marginal)."""
@@ -286,10 +300,19 @@ def test_observed_gaussians(space, rng):
     cov = full_cov(gauss, space.ndof)
     e = ngsrng.observation_operator(space, points=LEFT[::5])
     d = rng.distribution("normal", 1.0, 2.0)
-    obs = e @ d
+    obs = e @ d  # the law, no set-up: pathwise draws until dense()
     assert isinstance(obs, ngsrng.ObservedGaussian) and isinstance(e @ gauss, ngsrng.ObservedGaussian)
+    assert obs.method == "pathwise" and obs.sample(3).shape == (len(LEFT[::5]), 3)
     a = obs.dense()
-    assert a.info.get("reused") and a.law["factor"].shape == tuple(obs._F64.shape)
+    assert a.law["factor"].shape[0] == len(LEFT[::5])  # fewer observations than the DoFs they read: at them
+    own = ngsrng.ObservedGaussian(gauss, points=LEFT[::5], noise=0.01)  # a factor of its own: reused
+    assert own.dense().info.get("reused") and own.dense().law["factor"].shape == tuple(own._F64.shape)
+    grid = ngsrng.observation_operator(space, points=np.random.default_rng(3).uniform(0, 1, (400, 2)))
+    many = (grid @ d).dense()  # more observations than DoFs read: the latent at the DoFs, the same law
+    assert many.latent_points < 400 and many.info["latent"] == "coefficients"
+    k3, _ = affine_law(many)
+    want = 4 * grid @ cov @ grid.T
+    np.testing.assert_allclose(k3, want, atol=1e-10 * np.abs(want).max())
     k, mean = affine_law(a)
     np.testing.assert_allclose(k, 4 * e @ cov @ e.T, atol=1e-10 * np.abs(4 * e @ cov @ e.T).max())
     np.testing.assert_allclose(mean, e @ d.field.loc, atol=1e-12)

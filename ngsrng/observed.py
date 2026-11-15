@@ -20,7 +20,9 @@ y exactly, on the field's device and in the requested dtype:
 without a sampler, e.g. :class:`ngsrng.OperatorCovariance`). The choice and its costs are in ``plan``.
 
 ``E @ obs`` observes the observations again (an ObservedGaussian of E G f + E e); ``E @ gaussian`` and ``E @ d`` for a
-Gaussian field distribution give one too. ``obs.dense()`` is a :class:`ngsrng.DenseSampler` of y (its factor reused).
+Gaussian field distribution give one too, without a set-up (``method="pathwise"``). ``obs.dense()`` is a
+:class:`ngsrng.DenseSampler` of y: at the observations (its own factor reused when it has one), or, without noise and
+with more observations than the DoFs they read, at those DoFs with a sparse output map (:mod:`ngsrng.dense`).
 """
 
 import time
