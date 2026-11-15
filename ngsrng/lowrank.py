@@ -17,6 +17,7 @@ from .backend import (
     resolve_device,
     sparse_to_torch,
 )
+from .dense import DenseOf
 from .inplace import InPlace
 from .observations import observation_operator, whiten, whitener
 from .randomized import gaussian_block, gram_orth, randomized_svd
@@ -24,7 +25,7 @@ from .seeding import as_source, inherit
 from .space import SpaceInfo, coefficient_columns, coefficient_vector
 
 
-class LowRankGaussian(InPlace):
+class LowRankGaussian(DenseOf, InPlace):
     """Finite-rank Gaussian N(mean, B K^-1 B*) on a FE space (B: ndof x r coefficient columns, K: r x r SPD).
 
     Samples are B K^-1/2 zeta with zeta ~ N(0, I_r). The function-space structure is carried by the columns of B, so

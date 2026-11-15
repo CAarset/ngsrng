@@ -126,6 +126,13 @@ class CorrelatedFields(InPlace):
         """Alias of ``sample``."""
         return self.sample(size, output, out)
 
+    def dense(self, dofs=None, observe=None, **kwargs):
+        """A :class:`ngsrng.DenseSampler` of the joint draw: (n, k, m) outputs at ``dofs`` or under ``observe``, the
+        joint factor L_R (x) F of the shared latent covariance (:mod:`ngsrng.dense`). Set up once per arguments."""
+        from .dense import dense
+
+        return dense(self, dofs, observe, **kwargs)
+
     def sample_into(self, rows):
         """Fill one (n, nvalues) buffer per component in place (:mod:`ngsrng.inplace`)."""
         rows = [as_tensor(r) for r in rows]

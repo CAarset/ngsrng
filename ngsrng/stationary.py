@@ -76,6 +76,7 @@ from scipy.optimize import brentq
 from scipy.special import kv
 
 from .backend import DeviceCache, Rebuildable, available_memory, device_copy, resolve_device, sparse_to_torch
+from .dense import DenseOf
 from .inplace import InPlace
 from .quadrature import QuadratureRule
 from .randomized import GRAM_JITTER, gram_regression, qr_fits
@@ -460,7 +461,7 @@ class _GridSource:
         return out
 
 
-class StationaryMatern(InPlace, Rebuildable):
+class StationaryMatern(DenseOf, InPlace, Rebuildable):
     """Matérn Gaussian random function on ``fes`` whose law does not depend on position (see the module docstring):
     unit pointwise variance up to the FE projection, correlation range ``length``, smoothness ``nu``.
 

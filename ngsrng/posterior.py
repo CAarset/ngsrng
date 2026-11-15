@@ -42,6 +42,7 @@ from .backend import (
     sparse_to_torch,
     torch_device_of,
 )
+from .dense import DenseOf
 from .inplace import InPlace
 from .observations import CHUNK, dense_if_full, observation_operator, whiten, whitener
 from .randomized import randomized_qr, stacked_qr
@@ -648,7 +649,7 @@ def downdate(prior, b, k, mean=None, seed=None, tol=1e-8):
 # ------------------------------------------------------------------ (3) pathwise (Matheron) conditioning
 
 
-class MatheronPosterior(InPlace):
+class MatheronPosterior(DenseOf, InPlace):
     """Exact posterior sampler by pathwise conditioning, independent of the noise-space construction:
 
         f_post = f0 + B K_d^-1 (y + e - G f0),   f0 ~ prior,  e ~ N(0, Gamma),

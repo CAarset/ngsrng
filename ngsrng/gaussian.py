@@ -28,6 +28,7 @@ from .backend import (
     same_device,
     sparse_to_torch,
 )
+from .dense import DenseOf
 from .inplace import InPlace, as_tensor, chunks, default_work_values, write
 from .seeding import as_source, inherit
 from .solvers import (
@@ -92,7 +93,7 @@ def check_method(method) -> dict:
     return dict(method)
 
 
-class Gaussian(InPlace, Rebuildable):
+class Gaussian(DenseOf, InPlace, Rebuildable):
     """N(mean, C) as a random function in ``fes``.
 
     Linear-algebra interface (public and stable, shared by ``LowRankGaussian`` and ``MatheronPosterior``): the

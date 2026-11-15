@@ -187,32 +187,7 @@ class ObservedGaussian(InPlace, Rebuildable):
 
     def _field_covariance(self):
         """G Sigma G^T (m x m, float64 torch) and how it was computed."""
-        f, gf = self.field, self._free_operator()
-        gt = gf.T.tocsc() if sp.issparse(gf) else gf.T
-
-        def block(i):
-            b = gt[:, i:i + CHUNK]
-            return torch.from_numpy(b.toarray() if sp.issparse(b) else np.ascontiguousarray(b))
-
-        if hasattr(f, "apply_t") and hasattr(f, "nrand"):
-            dev = torch_device_of(f) or torch.device("cpu")
-            if 8.0 * f.nrand * self.m < 0.25 * _free_memory(dev):  # Y = L^T G^T, then Y^T Y
-                y = torch.empty((f.nrand, self.m), dtype=torch.float64, device=dev)
-                for i in range(0, self.m, CHUNK):
-                    y[:, i:i + CHUNK] = f.apply_t(block(i).to(dev)).to(dev, torch.float64)
-                return y.T @ y, f"Y = L^T G^T ({f.nrand} x {self.m}), K = Y^T Y"
-            gdev = self._operator_torch(dev, torch.float64, free=True)
-            k = torch.empty((self.m, self.m), dtype=torch.float64, device=dev)
-            for i in range(0, self.m, CHUNK):
-                k[:, i:i + CHUNK] = gdev @ f.apply(f.apply_t(block(i).to(dev))).to(dev, torch.float64)
-            return 0.5 * (k + k.T), f"{self.m} applications of Sigma = L L^T"
-        from .covariance import as_covariance
-
-        src = as_covariance(f, self.space.fes)
-        k = np.empty((self.m, self.m))
-        for i in range(0, self.m, CHUNK):
-            k[:, i:i + CHUNK] = np.asarray(gf @ src.sigma(block(i).numpy()))
-        return torch.from_numpy(0.5 * (k + k.T)), f"{self.m} applications of Sigma"
+        return operator_covariance(self.field, self._free_operator(), self.space)
 
     # ------------------------------------------------------------------ draws
 
@@ -350,6 +325,47 @@ class ObservedGaussian(InPlace, Rebuildable):
 
     def __repr__(self):
         return "ObservedGaussian(\n" + "\n".join(f"  {k}: {v}" for k, v in self.plan.items() if k != "field") + "\n)"
+
+
+def operator_covariance(field, g, space=None):
+    """G Sigma G^T (m x m, float64 torch) of a Gaussian random function, for G given on its free dofs (m x nfree:
+    sparse, dense, or a torch tensor), and how it was computed.
+
+    With a factor Sigma = L L^T (``apply_t`` and ``nrand``: Gaussians, low-rank models, posteriors, stationary
+    fields): Y = L^T G^T (m applications of L^T, on the field's device) and K = Y^T Y, or m applications of Sigma when
+    Y does not fit in a quarter of the free memory. Otherwise (a covariance given as an operator, ``space`` needed): m
+    applications of Sigma with NumPy. Zero rows of G give exactly zero rows and columns of K."""
+    m = g.shape[0]
+    gt = g.T.tocsc() if sp.issparse(g) else g.T
+
+    def block(i):
+        b = gt[:, i:i + CHUNK]
+        if isinstance(b, torch.Tensor):
+            return b.to(torch.float64).contiguous()
+        return torch.from_numpy(b.toarray() if sp.issparse(b) else np.ascontiguousarray(b, dtype=np.float64))
+
+    if hasattr(field, "apply_t") and hasattr(field, "nrand"):
+        dev = torch_device_of(field) or torch.device("cpu")
+        if 8.0 * field.nrand * m < 0.25 * _free_memory(dev):  # Y = L^T G^T, then Y^T Y
+            y = torch.empty((field.nrand, m), dtype=torch.float64, device=dev)
+            for i in range(0, m, CHUNK):
+                y[:, i:i + CHUNK] = field.apply_t(block(i).to(dev)).to(dev, torch.float64)
+            return y.T @ y, f"Y = L^T G^T ({field.nrand} x {m}), K = Y^T Y"
+        gdev = (g.to(dev, torch.float64) if isinstance(g, torch.Tensor) else
+                sparse_to_torch(g, dev, torch.float64) if sp.issparse(g) else
+                torch.as_tensor(np.asarray(g), device=dev, dtype=torch.float64))
+        k = torch.empty((m, m), dtype=torch.float64, device=dev)
+        for i in range(0, m, CHUNK):
+            k[:, i:i + CHUNK] = gdev @ field.apply(field.apply_t(block(i).to(dev))).to(dev, torch.float64)
+        return 0.5 * (k + k.T), f"{m} applications of Sigma = L L^T"
+    from .covariance import as_covariance
+
+    src = as_covariance(field, None if space is None else space.fes)
+    gn = g.cpu().numpy() if isinstance(g, torch.Tensor) else g
+    k = np.empty((m, m))
+    for i in range(0, m, CHUNK):
+        k[:, i:i + CHUNK] = np.asarray(gn @ src.sigma(block(i).numpy()))
+    return torch.from_numpy(0.5 * (k + k.T)), f"{m} applications of Sigma"
 
 
 def _coefficients(loc, space, field_mean):
