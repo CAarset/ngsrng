@@ -1,13 +1,16 @@
 """Covariance operators as data: local covariances (pointwise variance k(x, x)), traces, covariance functions,
 sample (Wishart) covariances, operator covariances and Karhunen-Loeve fields with non-Gaussian coefficients."""
 
+import dataclasses
 import warnings
 
 import ngsolve as ngs
 import numpy as np
 import pytest
+import scipy.stats as st
 import torch
 from ngsolve.meshes import Make1DMesh, MakeStructured2DMesh, MakeStructured3DMesh
+from stat_checks import assert_bounded_mean, assert_law, assert_quadratic_form, assert_scaled_chi2
 
 import ngsrng
 from ngsrng.covariance import as_covariance, local_covariance, xnystrace
@@ -92,15 +95,26 @@ def test_posterior_variance_is_prior_plus_exact_update():
 
 
 def test_lowrank_and_monte_carlo_estimates_are_unbiased_with_valid_errors():
+    """Exact laws: a Monte Carlo variance from s Gaussian samples is the exact variance times chi^2_s / s; "lowrank"
+    adds to its exact low-rank part a Monte Carlo variance of the residual (its samples independent of the basis), so
+    (estimate - low-rank part) is (exact - low-rank part) times chi^2_s / s. The standard errors are the samples'
+    standard deviation over sqrt(s)."""
     fes = ngs.H1(ngs.Mesh(ngs.unit_square.GenerateMesh(maxh=0.12)), order=1)
     _, g = _setup(fes, length=0.4)
     pts = _points(fes)
     e = ngsrng.observation_operator(fes, points=pts)[:, g.space.free]
     ref = local_covariance(g, "exact").values(e)
     for method, kw in (("lowrank", dict(rank=40, samples=48)), ("mc", dict(samples=400))):
-        v, se = local_covariance(g, method, **kw).values(e, stderr=True)
-        z = (v - ref) / se
-        assert np.abs(z).max() < 5 and abs(z.mean()) < 1.0, method
+        lc = local_covariance(g, method, **kw)
+        v, se = lc.values(e, stderr=True)
+        base = dataclasses.replace(lc, mc=None).values(e)  # the exact part (none for "mc")
+        a, b = lc.mc
+        t = (e @ a) * (e @ b)
+        np.testing.assert_allclose(v - base, t.mean(axis=1), rtol=1e-10)
+        np.testing.assert_allclose(se, t.std(axis=1, ddof=1) / np.sqrt(kw["samples"]), rtol=1e-10)
+        resid = ref - base
+        assert resid.min() > 1e-10 * ref.max(), method  # a residual to estimate at every point
+        assert_scaled_chi2(v - base, resid, kw["samples"], what=method)
     # with a basis spanning everything, the low-rank part is exact and the residual vanishes
     small = ngs.H1(Make1DMesh(10), order=1)
     _, g1 = _setup(small)
@@ -193,15 +207,25 @@ def test_operator_covariances_conventions_and_forms():
 
 
 def test_trace_estimators():
-    fes = ngs.H1(ngs.Mesh(ngs.unit_square.GenerateMesh(maxh=0.12)), order=1)
+    """Hutchinson with p Gaussian probes is a Gaussian quadratic form with weights lambda_k / p (lambda: the
+    eigenvalues of C = Sigma M); Hutch++'s Hutchinson part (k = p / 3 probes, independent of its subspace) and the
+    "lowrank" variance's Monte Carlo residual are such forms too, with eigenvalues of a compression of C, bounded by
+    C's (Laurent-Massart with those bounds). XNysTrace has no tractable law: a deterministic check (fixed seed on a
+    structured mesh, so the same realisation on every machine)."""
+    fes = ngs.H1(MakeStructured2DMesh(quads=False, nx=10, ny=10), order=1)
     _, g = _setup(fes, length=0.4)
     exact = ngsrng.covariance_trace(g, "exact")
     assert exact.stderr == 0 and exact.applications == 2 * g.space.nfree
-    for method in ("hutchinson", "hutch++", "xnystrace"):
+    r = np.linalg.cholesky(g.space.mass_free.toarray())
+    lam = np.clip(np.linalg.eigvalsh(r.T @ _dense(g) @ r), 0.0, None)  # the eigenvalues of Sigma M
+    np.testing.assert_allclose(lam.sum(), exact.value, rtol=1e-10)
+    for method, p in (("hutchinson", 60), ("hutch++", 60 // 3)):
         est = ngsrng.covariance_trace(g, method, probes=60, seed=1)
-        assert abs(est.value - exact.value) < 5 * est.stderr + 1e-3 * exact.value, method
+        assert_quadratic_form(est.value, exact.value, (lam**2).sum() / p, lam.max() / p, what=method)
+    est = ngsrng.covariance_trace(g, "xnystrace", probes=60, seed=1)
+    assert abs(est.value - exact.value) < 5 * est.stderr + 1e-3 * exact.value
     est = ngsrng.covariance_trace(g, "variance", variance_method="lowrank", rank=30, samples=30)
-    assert abs(est.value - exact.value) < 5 * est.stderr
+    assert_quadratic_form(est.value, exact.value, (lam**2).sum() / 30, lam.max() / 30, what="lowrank variance")
     # finite rank: exact and free
     kl = ngsrng.karhunen_loeve(g, 20)
     assert abs(ngsrng.covariance_trace(kl).value / kl.eigenvalues.sum() - 1) < 1e-12
@@ -237,9 +261,14 @@ def test_sample_covariance_is_an_ensemble_gaussian():
     kl = ngsrng.karhunen_loeve(ens2)
     assert kl.nrand == 29  # centred samples span 29 dimensions
     assert abs(ngsrng.covariance_trace(ens2).value / kl.eigenvalues.sum() - 1) < 1e-10
-    # unbiased: E C_n = C (trace check over replicates)
+    # unbiased, with the exact law: an ensemble of n draws about the known mean has n tr(C_n M) = sum_k lambda_k
+    # chi^2_n (lambda: the eigenvalues of Sigma M), so the mean trace of 30 independent ensembles is a Gaussian
+    # quadratic form with weights lambda_k / (30 n), each 30 n times
+    n = ngsrng.sample_covariance(g, 10, seed=0).df
     t = np.mean([ngsrng.covariance_trace(ngsrng.sample_covariance(g, 10, seed=s)).value for s in range(30)])
-    assert abs(t / ngsrng.covariance_trace(g).value - 1) < 0.1
+    r = np.linalg.cholesky(g.space.mass_free.toarray())
+    lam = np.clip(np.linalg.eigvalsh(r.T @ _dense(g) @ r), 0.0, None)
+    assert_quadratic_form(t, lam.sum(), (lam**2).sum() / (30 * n), lam.max() / (30 * n))
 
 
 def test_karhunen_loeve_fields_have_exactly_the_covariance():
@@ -248,9 +277,22 @@ def test_karhunen_loeve_fields_have_exactly_the_covariance():
     ens = ngsrng.sample_covariance(g, 15, seed=1)
     rng = ngsrng.default_rng(fes, seed=4, covariance=ens, dtype="float64")
     cov = ens.b @ ens.b.T
+    kl = ngsrng.karhunen_loeve(ens)  # the expansion the generator samples (the same, exact construction)
+    mass = ngsrng.SpaceInfo(fes).mass
+    laws = {"uniform": st.uniform(-np.sqrt(3), 2 * np.sqrt(3)).cdf, "laplace": st.laplace(scale=np.sqrt(0.5)).cdf}
     for coefficients in ("uniform", "rademacher", "laplace"):
-        k = rng.karhunen_loeve(coefficients, size=40000)
-        assert np.abs(np.cov(k.T) - cov).max() < 0.05 * np.abs(cov).max(), coefficients
+        k = rng.karhunen_loeve(coefficients, size=20000)
+        # the coefficients back from the draws: exactly in the expansion's span, i.i.d. with the coefficient law,
+        # hence the covariance exactly cov
+        xi = ((k - ens.mean) @ (mass @ kl.modes)) / np.sqrt(kl.eigenvalues)
+        np.testing.assert_allclose(ens.mean + (xi * np.sqrt(kl.eigenvalues)) @ kl.modes.T, k,
+                                   atol=1e-10 * np.abs(k).max())
+        if coefficients == "rademacher":
+            np.testing.assert_allclose(np.abs(xi), 1.0, atol=1e-8)
+            assert_bounded_mean(xi > 0, 0.5, 0.0, 1.0, what=coefficients)
+        else:
+            assert_law(xi, laws[coefficients], what=coefficients)
+    np.testing.assert_allclose(kl.modes @ np.diag(kl.eigenvalues) @ kl.modes.T, cov, atol=1e-12 * np.abs(cov).max())
     # bounded coefficients: |f - m| <= sqrt(3) sum_k sqrt(lambda_k) |phi_k| at every dof (vertex values for P1)
     kl = ngsrng.karhunen_loeve(ens)
     bound = np.sqrt(3) * np.abs(kl.modes) @ np.sqrt(kl.eigenvalues)

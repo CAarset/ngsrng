@@ -18,7 +18,9 @@ import numpy as np
 import pytest
 import scipy.sparse as sp
 import scipy.sparse.linalg as sla
+import scipy.stats as st
 from conftest import cuda_usable
+from stat_checks import assert_law
 
 import ngsrng
 from ngsrng.boundary import BoundarySampler, boundary_covariance, boundary_dofs
@@ -283,14 +285,15 @@ def test_copula_marginal(mesh):
     fes = h1(mesh, 1)
     d = boundary_dofs(fes, "left")
     other = np.setdiff1d(np.arange(fes.ndof), d)
-    vals = rng_for(fes).uniform(size=800, representation="bernstein", bnd="left")
+    vals = rng_for(fes).uniform(size=4000, representation="bernstein", bnd="left")
     assert np.all(vals[:, d] >= 0) and np.all(vals[:, d] <= 1)
     assert np.all(vals[:, other] == 0.0)
-    assert np.abs(vals[:, d].mean(axis=0) - 0.5).max() < 0.1
-    assert np.abs(vals[:, d].std(axis=0) - 1 / np.sqrt(12)).max() < 0.05
-    plain = rng_for(fes).uniform(size=800, representation="bernstein")
-    tol = 8 * np.abs(np.cov(plain[:, d].T, bias=False)).max() / np.sqrt(800)
-    assert np.abs(np.cov(vals[:, d].T, bias=False) - np.cov(plain[:, d].T, bias=False)).max() < tol
+    plain = rng_for(fes).uniform(size=4000, representation="bernstein")
+    # the same draw, restricted: exactly the trace's law (to rounding: each generator factorises its own Bernstein mass
+    # matrix, and NGSolve's multithreaded sparse Cholesky rounds differently from one factorisation to the next)
+    np.testing.assert_allclose(vals[:, d], plain[:, d], rtol=0, atol=1e-12)
+    for j in d[[0, len(d) // 2]]:  # order 1: vertex dofs, whose values have the exact marginal
+        assert_law(vals[:, j], st.uniform().cdf, what=f"trace dof {j}")
 
 
 def test_projection_dofs_are_not_the_copula_marginal(mesh):

@@ -8,9 +8,11 @@ import numpy as np
 import pytest
 import scipy.stats as st
 import torch
+from stat_checks import assert_gaussian, assert_law
 
 import ngsrng
 from ngsrng.boundary import boundary_dofs
+from ngsrng.reference import exact_covariance
 from ngsrng.stationary import basis_at
 
 CORR = ngsrng.matern_correlation(0.3, nu=2)
@@ -45,16 +47,16 @@ def test_identity_gives_the_components_own_draws(space):
 @pytest.mark.parametrize("rho", [0.8, -0.5])
 def test_components_keep_their_laws_and_correlate(space, rho):
     """Exact marginals (uniform and lognormal components; a vertex value of a Bernstein field has the exact
-    marginal), latent correlation rho, and Spearman's (6 / pi) arcsin(rho / 2) for the values."""
+    marginal), and the two latents, back from the values, jointly N(0, [[1, rho], [rho, 1]]) (hence Spearman's
+    (6 / pi) arcsin(rho / 2) for the values)."""
     pair = ngsrng.correlated([dist(space, 3), dist(space, 4, "lognormal", 0.0, 0.5)], rho)
-    g1, g2 = pair.sample(4000)
+    g1, g2 = pair.sample(8000)
     i = centre_vertex(space)
     u, ln = g1[:, i], g2[:, i]
-    assert st.kstest(u, st.uniform(-1, 21).cdf).pvalue > 1e-3
-    assert st.kstest(ln, st.lognorm(0.5).cdf).pvalue > 1e-3
-    z1, z2 = st.norm.ppf((u + 1) / 21), np.log(ln) / 0.5  # the latents, back from the values
-    assert np.corrcoef(z1, z2)[0, 1] == pytest.approx(rho, abs=0.03)
-    assert st.spearmanr(u, ln).statistic == pytest.approx(6 / math.pi * math.asin(rho / 2), abs=0.03)
+    assert_law(u, st.uniform(-1, 21).cdf, what="uniform component")
+    assert_law(ln, st.lognorm(0.5).cdf, what="lognormal component")
+    z = np.column_stack([st.norm.ppf((u + 1) / 21), np.log(ln) / 0.5])  # the latents, back from the values
+    assert_gaussian(z, [0.0, 0.0], [[1.0, rho], [rho, 1.0]])
     assert pair.info["cross_correlation"] == [[1.0, rho], [rho, 1.0]]
 
 
@@ -112,15 +114,16 @@ def test_draw_conventions(space):
 
 
 def test_gaussian_fields(space):
-    """Gaussian FE fields (FE coefficients) with their own loc and scale: correlation rho, laws unchanged."""
-    a, b = ngsrng.correlated([dist(space, 13, "normal", representation=None),
-                              dist(space, 14, "normal", 2.0, 3.0, representation=None)], 0.9).sample(3000)
+    """Gaussian FE fields (FE coefficients) with their own loc and scale: at a vertex the pair is jointly Gaussian
+    with means (0, 2), the field's exact variance s^2 (and 9 s^2 for scale 3), and correlation rho = 0.9."""
+    da, db = dist(space, 13, "normal", representation=None), dist(space, 14, "normal", 2.0, 3.0, representation=None)
+    a, b = ngsrng.correlated([da, db], 0.9).sample(8000)
     i = centre_vertex(space)
-    assert a[:, i].std() == pytest.approx(1.0, rel=0.06) and b[:, i].std() == pytest.approx(3.0, rel=0.06)
-    # 5 standard errors of the mean of 3000 draws with standard deviation 3: the draws depend on the mesh, which
-    # netgen may build differently on another machine, so the tolerance must hold for any realisation
-    assert b[:, i].mean() == pytest.approx(2.0, abs=5 * 3.0 / np.sqrt(3000))
-    assert np.corrcoef(a[:, i], b[:, i])[0, 1] == pytest.approx(0.9, abs=0.02)
+    gauss = da.field.gauss
+    j = np.searchsorted(gauss.space.free, i)  # the vertex among the free dofs
+    s2 = exact_covariance(gauss)[j, j]
+    cov = s2 * np.array([[1.0, 0.9 * 3.0], [0.9 * 3.0, 9.0]])
+    assert_gaussian(np.column_stack([a[:, i], b[:, i]]), [gauss.mean[i], 2.0], cov)
 
 
 def test_errors(space):

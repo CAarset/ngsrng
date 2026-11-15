@@ -8,7 +8,6 @@ inversions and NumPy functions, and against a NumPy reference sampler), and set-
 
 import copy
 import json
-import math
 import pickle
 
 import ngsolve as ngs
@@ -19,6 +18,7 @@ import scipy.stats as st
 import torch
 from conftest import cuda_usable
 from scipy.special import ndtr
+from stat_checks import assert_gaussian, assert_law, assert_normal, assert_same_law
 
 import ngsrng
 import ngsrng.dense as dense_module
@@ -213,15 +213,15 @@ def test_range(space, rng):
 
 
 def test_marginals_match_the_route(space, rng):
-    """Moments and marginals of the dense draws against the route's (Kolmogorov-Smirnov at a trace vertex)."""
+    """End to end: the marginal at a trace vertex is uniform(-1, 20), as the route's (the joint law is checked exactly
+    above: latent covariance and the route's map)."""
     d = rng.distribution("uniform", -1, 20, representation="bernstein", bnd="left")
     a = d.dense()
     assert a.dofs[0] < space.mesh.nv  # a vertex DoF (H1 numbers them first): its value has the exact marginal
-    y = a.sample(4000)
-    assert st.kstest(y[:, 0], st.uniform(-1, 21).cdf).pvalue > 1e-4
-    ref = d.sample(4000)[:, a.dofs]
-    assert st.ks_2samp(y[:, 0], ref[:, 0]).pvalue > 1e-4
-    np.testing.assert_allclose(np.cov(y.T), np.cov(ref.T), atol=0.1 * np.cov(ref.T).max())
+    y = a.sample(20000)
+    assert_law(y[:, 0], st.uniform(-1, 21).cdf, what="dense")
+    assert_normal(st.norm.ppf((y[:, 0] + 1) / 21), 0.0, 1.0, what="the latent, back from the values")
+    assert_same_law(y[:, 0], d.sample(4000)[:, a.dofs[0]], what="dense against the route")
 
 
 # ------------------------------------------------------------------ observations: E @ d and E @ dense
@@ -272,7 +272,7 @@ def test_rounding_entries_of_observations(space, rng):
     assert a.latent_points == len(xyz) and a.info["zero"] == 1e-15
     b = d.dense(observe=e, zero=None)
     assert b.latent_points >= a.latent_points and b.info["zero_drop"] == 0.0
-    assert st.kstest(a.sample(3000)[:, 3], st.uniform(-1, 21).cdf).pvalue > 1e-4
+    assert_law(a.sample(10000)[:, 3], st.uniform(-1, 21).cdf)
 
 
 def test_composition_drops_unread_values(space, rng):
@@ -290,7 +290,8 @@ def test_composition_drops_unread_values(space, rng):
     np.testing.assert_allclose(k, o @ cov @ o.T, atol=1e-12)
     u = rng.distribution("uniform", -1, 20, representation="bernstein", bnd="left").dense()
     v = sp.csr_matrix((np.ones(1), ([0], [0])), shape=(1, len(u.dofs))) @ u  # a vertex coefficient: one point
-    assert v.latent_points == 1 and st.kstest(v.sample(3000)[:, 0], st.uniform(-1, 21).cdf).pvalue > 1e-4
+    assert v.latent_points == 1
+    assert_law(v.sample(10000)[:, 0], st.uniform(-1, 21).cdf)
 
 
 def test_observed_gaussians(space, rng):
@@ -325,16 +326,15 @@ def test_observed_gaussians(space, rng):
 
 
 def test_correlated(space, rng):
-    """Correlated components: the latent correlation is R, Spearman's (6 / pi) arcsin(R / 2) for uniform values,
+    """Correlated components: at a vertex the two latents (back from the values) are jointly N(0, [[1, R], [R, 1]]);
     every component keeps its own conditioning (posteriors with different data), and E @ fields observes each."""
     d = rng.distribution("uniform", -1, 20, representation="bernstein", bnd="left")
     pair = ngsrng.correlated([d, d], 0.8)
     c = pair.dense()
-    y = c.sample(4000)
-    assert y.shape == (4000, 2, len(c.dofs)) and c.components == 2
+    y = c.sample(8000)
+    assert y.shape == (8000, 2, len(c.dofs)) and c.components == 2
     z = st.norm.ppf((y[:, :, 0] + 1) / 21)  # a vertex: the value is the latent's map
-    assert np.corrcoef(z.T)[0, 1] == pytest.approx(0.8, abs=0.03)
-    assert st.spearmanr(y[:, 0, 0], y[:, 1, 0]).statistic == pytest.approx(6 / math.pi * math.asin(0.4), abs=0.03)
+    assert_gaussian(z, [0.0, 0.0], [[1.0, 0.8], [0.8, 1.0]])
     e = ngsrng.observation_operator(space, points=LEFT)
     obs = e @ pair
     assert isinstance(obs, ngsrng.ObservedField) and obs.dense().sample(3).shape == (3, 2, len(LEFT))
