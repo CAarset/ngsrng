@@ -28,7 +28,10 @@ Every family it covers is a pointwise map of one latent Gaussian, followed by li
   the Bernstein domain points in that node's closure (a trace: the domain points on the boundary). For values at
   points (the default ``"quadrature"`` representation, ``points=``) and for Gaussian FE fields, S is the set the output
   map reads; the L2 projection (``"projection"``) reads every point. A Gaussian field observed by fewer observations
-  than the DoFs they read has the observations themselves as its latent.
+  than the DoFs they read has the observations themselves as its latent. Entries of the output map (an observation,
+  an evaluation, projection rows) at most ``zero`` (default 1e-15) times their row's largest are taken as rounding of
+  exact zeros (a point evaluation gives ~1e-17 to basis functions that vanish at the point; ``info["zero_drop"]``
+  records the largest dropped); ``zero=None`` keeps every stored entry.
 - **The latent covariance** K = G Sigma G^T at S (G the evaluation at S, standardised as the family standardises its
   latent; Sigma the coefficient covariance, conditioning included) is the exact discrete covariance of what
   ``d.sample()`` draws. It is never formed: a QR of Y = L^T G^T (|S| applications of the factor L^T) gives R with
@@ -132,6 +135,10 @@ __all__ = ["DenseSampler", "ObservedField"]
 FORMAT = "ngsrng.dense/1"
 MAX_POINTS = 10_000  # latent points of a dense factor by default (|S|^2 float64: 0.8 GB at the limit)
 RTOL = 1e-12  # the default cut: eigenvalues of K below rtol times the largest
+# Entries of an output map at most ZERO times their row's largest are taken as rounding of exact zeros (a point
+# evaluation gives ~1e-17 to basis functions that vanish at the point); configurable per call (zero=). To do: decide
+# whether a threshold belongs here at all (docs: "Look into later").
+ZERO = 1e-15
 BLOCK_NORMALS = 2**22  # standard normals per keyed block of device noise (performance, not accuracy)
 DENSE_OUT = 2**22  # output maps up to this many entries are dense on the device, larger ones sparse (performance)
 
@@ -640,7 +647,8 @@ class DenseOf:
         """``E @ gaussian``: the observations E f (an :class:`ngsrng.ObservedGaussian`)."""
         from .observed import ObservedGaussian, _as_operator
 
-        return ObservedGaussian(self, operator=_as_operator(operator, self.space.ndof), seed=inherit(None, self))
+        return ObservedGaussian(self, operator=_as_operator(operator, self.space.ndof), seed=inherit(None, self),
+                                method="pathwise")
 
 
 class ObservedField(InPlace):
@@ -745,7 +753,8 @@ def _nvalues(source) -> int:
 
 def observe_distribution(d, operator):
     """``E @ d`` for a distribution: an :class:`ngsrng.ObservedGaussian` for a Gaussian FE field (E composed with the
-    field's ``bnd=`` restriction and ``points=`` evaluation), an :class:`ObservedField` otherwise."""
+    field's ``bnd=`` restriction and ``points=`` evaluation), an :class:`ObservedField` otherwise. Either is the law
+    of the observations without a set-up: its draws are pathwise (a draw of d, then E) until ``.dense()``."""
     from .generator import _NormalField
     from .observed import ObservedGaussian
 
@@ -756,12 +765,12 @@ def observe_distribution(d, operator):
         rows, _ = part.output_rows(None, operator)
         g = part.latent_rows(rows)
         return ObservedGaussian(field.gauss, operator=g, loc=part.loc, scale=part.scale, seed=d.generator._seed(),
-                                dtype=d.generator.dtype)
+                                dtype=d.generator.dtype, method="pathwise")
     return ObservedField(d, operator)
 
 
-def dense(source, dofs=None, observe=None, *, rank=None, tol=None, rtol=RTOL, pin=None, max_points=MAX_POINTS,
-          device=None, dtype=None, noise=None, seed=None, output=None) -> DenseSampler:
+def dense(source, dofs=None, observe=None, *, rank=None, tol=None, rtol=RTOL, pin=None, zero=ZERO,
+          max_points=MAX_POINTS, device=None, dtype=None, noise=None, seed=None, output=None) -> DenseSampler:
     """The dense sampler of ``source`` (a distribution, ``ngsrng.correlated(...)``, an observed law or a Gaussian);
     see :mod:`ngsrng.dense`. The set-up is made once per source and law arguments and kept (on the source; for
     distributions also on their generator, so that ``spawn`` children share it); the sampler once per further
@@ -779,6 +788,8 @@ def dense(source, dofs=None, observe=None, *, rank=None, tol=None, rtol=RTOL, pi
         variance (Karhunen-Loeve; ``info["exact"]`` is then False).
     pin : latent values whose variance is at most pin times the largest are set to their mean (default None: only
         those with exactly zero variance).
+    zero : entries of the output map at most zero times their row's largest are rounding of exact zeros, dropped
+        (default 1e-15; None or 0: none).
     max_points : the largest number of latent values (a clear error beyond).
     device, dtype, noise, seed, output : where and how it samples (default: as the source's own draws; ``noise``
         "host" or "device", see the module docstring; ``seed`` default: a child of the source's randomness).
@@ -788,7 +799,7 @@ def dense(source, dofs=None, observe=None, *, rank=None, tol=None, rtol=RTOL, pi
     from .observed import ObservedGaussian
 
     if isinstance(source, ObservedField):
-        return source.dense(dofs, observe, rank=rank, tol=tol, rtol=rtol, pin=pin, max_points=max_points,
+        return source.dense(dofs, observe, rank=rank, tol=tol, rtol=rtol, pin=pin, zero=zero, max_points=max_points,
                             device=device, dtype=dtype, noise=noise, seed=seed, output=output)
     if dofs is not None and observe is not None:
         raise ValueError("give dofs= or observe=, not both")
@@ -817,7 +828,8 @@ def dense(source, dofs=None, observe=None, *, rank=None, tol=None, rtol=RTOL, pi
         raise TypeError(f"dense samplers are made from distributions, correlated fields, observed laws or "
                         f"Gaussians, not {type(source).__name__}")
     rtol = None if not rtol else float(rtol)
-    law_key = (_digest(dofs), _digest(observe), rank, tol, rtol, pin, int(max_points))
+    zero = None if not zero else float(zero)
+    law_key = (_digest(dofs), _digest(observe), rank, tol, rtol, pin, zero, int(max_points))
     cache = owned_cache(owner, "_ngsrng_dense")
     laws, samplers = cache.setdefault("laws", {}), cache.setdefault("samplers", {})
     if law_key not in laws:
@@ -828,7 +840,7 @@ def dense(source, dofs=None, observe=None, *, rank=None, tol=None, rtol=RTOL, pi
                                                                               pin):
             law = _law_from_observed(source)
         if law is None:
-            law = _build_law(parts, mix, dofs, observe, rank, tol, rtol, pin, int(max_points))
+            law = _build_law(parts, mix, dofs, observe, rank, tol, rtol, pin, zero, int(max_points))
         if shared is not None:
             shared[0]._dense_laws[shared[1] + (law_key,)] = (shared[2] + (law_key,), law)
         laws[law_key] = law
@@ -843,10 +855,13 @@ def dense(source, dofs=None, observe=None, *, rank=None, tol=None, rtol=RTOL, pi
 
 
 def _reusable(obs, dofs, observe, rank, tol, rtol, pin) -> bool:
-    """Whether an ObservedGaussian's own factor is the dense sampler's: the same cut, no selection or truncation, and
-    its noise folded into it (or none)."""
-    return (obs.method == "factor" and dofs is None and observe is None and rank is None and tol is None and pin is None
-            and rtol == obs.rtol and (obs._folded or obs._noise_sampler is None))
+    """Whether an ObservedGaussian's own factor is the dense sampler's: it has one, with the same cut, no selection or
+    truncation, its noise folded into it (or none), and the observations as the cheaper latent (noise, or no more
+    observations than the DoFs they read)."""
+    if not (obs.method == "factor" and dofs is None and observe is None and rank is None and tol is None and
+            pin is None and rtol == obs.rtol and (obs._folded or obs._noise_sampler is None)):
+        return False
+    return obs._noise_factor() is not None or obs.m <= np.unique(sp.csr_matrix(obs.G).indices).size
 
 
 def _law_from_observed(obs) -> dict:
@@ -949,7 +964,15 @@ class _Part:
 
     @classmethod
     def of_observed(cls, obs):
-        """An ObservedGaussian: its observations y = G (loc + scale (f - mean)) + e are the values."""
+        """An ObservedGaussian: its observations y = G (loc + scale (f - mean)) + e are the values. Without noise, of a
+        field with a factor, it is the field observed by G: a Gaussian field part (the latent at the DoFs G reads, or
+        at the observations when there are fewer of them, as for ``d.dense(observe=G)``)."""
+        if obs._noise_factor() is None and hasattr(obs.field, "apply_t"):
+            p = cls()
+            p.name, p.field, p.bnd, p.kind, p.gauss, p.points = "observed", None, None, "coefficients", obs.field, None
+            p.representation = "observations"
+            p.loc, p.scale, p.evaluation, p.nvalues = obs._loc, obs.scale, sp.csr_matrix(obs.G), obs.m
+            return p
         p = cls()
         p.name, p.field, p.bnd, p.kind, p.gauss, p.points = "observed", obs, None, "observed", obs.field, None
         p.representation = "observations"
@@ -1105,14 +1128,23 @@ def _projection_rows(part, rows):
     return sp.vstack(pieces).tocsr()
 
 
-def _build_law(parts, mix, dofs, observe, rank, tol, rtol, pin, max_points) -> dict:
+def _build_law(parts, mix, dofs, observe, rank, tol, rtol, pin, zero, max_points) -> dict:
     from .observed import covariance_factor
 
     t0 = time.perf_counter()
     k = len(parts)
     p0 = parts[0]
-    outs = [p.output_rows(dofs, observe) for p in parts]
-    lat = [p.latent_rows(o) for p, (o, _) in zip(parts, outs)]
+    outs, lat, dropped = [], [], 0.0
+    for p in parts:
+        o, out_dofs = p.output_rows(dofs, observe)
+        o, x = _drop_rounding(o, zero)
+        outs.append((o, out_dofs))
+        a = p.latent_rows(o)
+        if not (p.kind == "points" and p.representation == "bernstein"):  # Bernstein: an exact pattern
+            a, y = _drop_rounding(a, zero)
+            x = max(x, y)
+        lat.append(a)
+        dropped = max(dropped, x)
     support = np.unique(np.concatenate([sp.csr_matrix(a).indices for a in lat] + [np.zeros(0, dtype=np.int64)]))
     m0 = outs[0][0].shape[0]
     at_outputs = p0.kind == "observed" or (k == 1 and p0.kind == "coefficients" and m0 < support.size)
@@ -1171,6 +1203,8 @@ def _build_law(parts, mix, dofs, observe, rank, tol, rtol, pin, max_points) -> d
                       f"trace of '{p0.bnd.name}'" if p0.bnd is not None else "all"),
         "latent": "outputs" if at_outputs else ("coefficients" if p0.kind == "coefficients" else "points"),
         **finfo,
+        "zero": zero,
+        "zero_drop": dropped,
         "provenance": _provenance(p0),
     }
     law = {"factor": f.cpu().numpy(), "mix": np.asarray(mix, dtype=float), "components": comps, "work64": work64,
@@ -1185,14 +1219,36 @@ def _build_law(parts, mix, dofs, observe, rank, tol, rtol, pin, max_points) -> d
 
 
 def _compose(law, e) -> dict:
-    """The law of E @ (the outputs of ``law``), compiled (:func:`_compile`)."""
-    comps = []
+    """The law of E @ (the outputs of ``law``), compiled (:func:`_compile`); entries of the composed map at most
+    ``zero`` (the law's) times their row's largest are dropped as rounding."""
+    comps, zero, dropped = [], law["info"].get("zero", ZERO), law["info"].get("zero_drop", 0.0)
     for c in law["components"]:
-        a = e.copy() if c["out"] is None else (e @ sp.csr_matrix(c["out"])).tocsr()
-        a.eliminate_zeros()
+        a, x = _drop_rounding(e if c["out"] is None else e @ sp.csr_matrix(c["out"]), zero)
+        dropped = max(dropped, x)
         comps.append({**c, "out": a, "nout": e.shape[0]})
-    info = {**law["info"], "selection": "observe (composed)", "outputs": int(e.shape[0])}
+    info = {**law["info"], "selection": "observe (composed)", "outputs": int(e.shape[0]), "zero_drop": dropped}
     return _compile({**law, "components": comps, "dofs": None, "info": info})
+
+
+def _drop_rounding(a, zero):
+    """(CSR copy of ``a`` without the entries at most ``zero`` times their row's largest, the largest dropped
+    relative entry). ``zero`` None: only exact zeros are dropped."""
+    a = sp.csr_matrix(a, dtype=np.float64, copy=True)
+    a.eliminate_zeros()
+    if not zero or a.nnz == 0:
+        return a, 0.0
+    size = np.abs(a.data)
+    rows = np.repeat(np.arange(a.shape[0]), np.diff(a.indptr))
+    top = np.zeros(a.shape[0])
+    np.maximum.at(top, rows, size)
+    rel = size / top[rows]
+    small = rel <= zero
+    if not small.any():
+        return a, 0.0
+    worst = float(rel[small].max())
+    a.data[small] = 0.0
+    a.eliminate_zeros()
+    return a, worst
 
 
 def _compile(law) -> dict:
