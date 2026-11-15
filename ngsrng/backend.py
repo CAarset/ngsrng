@@ -3,6 +3,7 @@
 import os
 import threading
 import warnings
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 
@@ -462,6 +463,43 @@ class Rebuildable:
         new = object.__new__(type(self))
         new.__dict__.update(self.__dict__)
         return new
+
+
+class OwnedCache:
+    """Results computed for one object, kept in its ``__dict__`` (see :func:`owned_cache`). ``copy.copy`` shares
+    ``__dict__`` values, and ngsrng derives samplers by shallow copies (posteriors from priors, spawned children), so a
+    cache must not be taken over by such a copy: it records its owner, weakly while in use and strongly when pickled,
+    so that it survives pickling with its owner (who keeps it) but not shallow copying (the copy starts its own)."""
+
+    def __init__(self, owner):
+        self._owner = weakref.ref(owner)
+        self.data = {}
+
+    def owned_by(self, owner) -> bool:
+        return self._owner() is owner
+
+    def __getstate__(self):
+        return {"owner": self._owner(), "data": self.data}
+
+    def __setstate__(self, state):
+        self._owner = weakref.ref(state["owner"]) if state["owner"] is not None else _no_owner
+        self.data = state["data"]
+
+
+def _no_owner():
+    return None
+
+
+def owned_cache(owner, name) -> dict:
+    """The dict of results kept on ``owner`` under ``name`` for ``owner`` alone (an :class:`OwnedCache`): a shallow
+    copy gets a new one, an unpickled owner keeps its own. Objects without a ``__dict__`` (pybind) get a throwaway."""
+    try:
+        stored = owner.__dict__.get(name)
+        if not isinstance(stored, OwnedCache) or not stored.owned_by(owner):
+            stored = owner.__dict__[name] = OwnedCache(owner)
+    except (AttributeError, TypeError):  # no __dict__, or not weak-referenceable
+        return {}
+    return stored.data
 
 
 class Scratch:

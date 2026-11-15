@@ -300,7 +300,10 @@ class _NormalField(InPlace, Rebuildable):  # pickles; the NGSolve evaluation mat
 
 
 class FieldDistribution:
-    """A frozen random-field distribution: ``sample(size=None)`` (alias ``rvs``) and ``info``."""
+    """A frozen random-field distribution: ``sample(size=None)`` (alias ``rvs``), ``info``, ``dense()``, and ``E @ d``
+    (the draws observed by a matrix E: :mod:`ngsrng.dense`)."""
+
+    __array_ufunc__ = None  # E @ d: NumPy (and SciPy, torch) leave the product to __rmatmul__
 
     def __init__(self, generator, name, field):
         self.generator, self.name, self.field = generator, name, field
@@ -325,6 +328,13 @@ class FieldDistribution:
         from .dense import dense
 
         return dense(self, dofs, observe, **kwargs)
+
+    def __rmatmul__(self, operator):
+        """``E @ d``: the values of the draws observed by E (m x nvalues): an :class:`ngsrng.ObservedGaussian` for a
+        Gaussian FE field, an :class:`ngsrng.ObservedField` otherwise; ``(E @ d).dense()`` is ``d.dense(observe=E)``."""
+        from .dense import observe_distribution
+
+        return observe_distribution(self, operator)
 
     def __repr__(self):
         return f"FieldDistribution({self.name}, {self.info})"
@@ -385,6 +395,7 @@ class Generator:
         self._gaussians, self._points, self._fields, self._bernstein = {}, {}, {}, {}
         self._boundary = {}  # (id(Gaussian), boundary name) -> (Gaussian, BoundarySampler)
         self._factors = {}  # (id(Gaussian), observation key) -> (Gaussian, factor of an ObservedGaussian)
+        self._dense_laws = {}  # (field keys, extra, law key) -> (rebuild info, dense set-up); spawn shares it
 
     # ------------------------------------------------------------------ plumbing
 
@@ -398,6 +409,8 @@ class Generator:
         self._fields = {_field_key(k[0], *v[0]): v for k, v in self._fields.items()}
         self._boundary = {(id(v[0]), k[1]): v for k, v in self.__dict__.get("_boundary", {}).items()}
         self._factors = {(id(v[0]), *k[1:]): v for k, v in self.__dict__.get("_factors", {}).items()}
+        self._dense_laws = {(tuple(_field_key(*i) for i in info[0]), *info[1:]): (info, law)
+                            for info, law in self.__dict__.get("_dense_laws", {}).values()}
 
     @property
     def seed_sequence(self):
@@ -460,6 +473,14 @@ class Generator:
         for key, (g, factor) in parent._factors.items():
             if key[0] in own:
                 self._factors[(id(own[key[0]]), *key[1:])] = (own[key[0]], factor)
+        self._dense_laws.update(parent._dense_laws)  # dense set-ups: keyed by the fields' arguments, deterministic
+
+    def _key_of(self, field):
+        """(key, (name, args, kwargs, corr, opts)) of one of this generator's fields, or None."""
+        for key, (spec, f) in self._fields.items():
+            if f is field:
+                return key, (key[0], *spec)
+        return None
 
     def gaussian(self, correlation=None, precision=None, covariance=None):
         """The (cached) Gaussian random function behind a correlation specification."""

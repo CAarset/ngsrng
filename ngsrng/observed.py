@@ -6,17 +6,21 @@ random function f, plus noise e ~ N(0, Gamma): white, coloured (a covariance mat
 another random field (an :class:`ObservedGaussian`, e.g. a PDE-driven disturbance). :class:`ObservedGaussian` samples
 y exactly, on the field's device and in the requested dtype:
 
-- ``"factor"``: the m x m covariance K = scale^2 G Sigma G^T (+ Gamma) once, its eigendecomposition, and
-  F = V diag(sqrt(w)) over the eigenvalues w > rtol max(w); a draw is F z, one dense product per batch. Exact up to
-  the cutoff: ||K - F F^T||_2 <= rtol max(w) (default rtol 1e-12; ``plan["dropped_trace"]`` records the fraction of
-  the trace left out). K comes from Y = L^T G^T (m applications of the field's factor L^T, on its device, so with
-  cuDSS on NVIDIA GPUs) and one product Y^T Y, or from m applications of Sigma when Y does not fit in memory. For m up
-  to about 10^4, when many draws amortise the set-up.
+- ``"factor"``: a factor F of the m x m covariance K = scale^2 G Sigma G^T (+ Gamma) once; a draw is F z, one dense
+  product per batch. K is not formed: Y = L^T G^T (m applications of the field's factor L^T, on its device, so with
+  cuDSS on NVIDIA GPUs) and the noise's square root are stacked and factorised by a QR, whose R is cut by its SVD at
+  the eigenvalues of K below rtol times the largest (:func:`covariance_factor`). Exact up to the cut:
+  ||K - F F^T||_2 <= rtol max eig K (default rtol 1e-12; ``plan["dropped_trace"]`` records the fraction of the trace
+  left out). When Y does not fit in memory, K comes from m applications of Sigma and is diagonalised. For m up to
+  about 10^4, when many draws amortise the set-up.
 - ``"pathwise"``: a draw of f, then G applied to it (on the device as a torch sparse or dense matrix; on the CPU engine
   in the sampling threads). Exact, no set-up; one field draw per sample. For large m, or few draws.
 
 ``"auto"`` takes the factor up to ``FACTOR_LIMIT`` observations and pathwise beyond (the factor also for covariances
 without a sampler, e.g. :class:`ngsrng.OperatorCovariance`). The choice and its costs are in ``plan``.
+
+``E @ obs`` observes the observations again (an ObservedGaussian of E G f + E e); ``E @ gaussian`` and ``E @ d`` for a
+Gaussian field distribution give one too. ``obs.dense()`` is a :class:`ngsrng.DenseSampler` of y (its factor reused).
 """
 
 import time
@@ -88,8 +92,8 @@ class ObservedGaussian(InPlace, Rebuildable):
         self.dtype = resolve_dtype(dtype) if dtype is not None else getattr(field, "dtype", torch.float64)
         self.source = as_source(seed)
         self._torch_cache = {}
-        loc_coeffs = _coefficients(loc, space, getattr(field, "mean", None))
-        self._mean = np.asarray(self.G @ loc_coeffs, dtype=float).ravel()
+        self._loc = _coefficients(loc, space, getattr(field, "mean", None))  # the coefficients' mean
+        self._mean = np.asarray(self.G @ self._loc, dtype=float).ravel()
         self._noise_sampler, self._noise_cov, self._noise_chol, self._noise_std = None, None, None, None
         self._set_noise(noise)
         can_sample = hasattr(field, "sample")
@@ -131,7 +135,13 @@ class ObservedGaussian(InPlace, Rebuildable):
             self._noise_std, self._noise_cov = np.sqrt(arr), np.diag(arr)
         elif arr.shape == (self.m, self.m):
             self._noise_cov = 0.5 * (arr + arr.T)
-            self._noise_chol = np.linalg.cholesky(self._noise_cov)
+            try:
+                self._noise_chol = np.linalg.cholesky(self._noise_cov)
+            except np.linalg.LinAlgError:  # semidefinite (e.g. E Gamma E^T with more rows than Gamma): a square root
+                w, v = np.linalg.eigh(self._noise_cov)
+                if w.min() < -1e-12 * max(w.max(), 0.0):
+                    raise ValueError("the noise covariance is not positive semidefinite") from None
+                self._noise_chol = v * np.sqrt(np.clip(w, 0.0, None))
         else:
             raise ValueError(f"noise covariance has shape {arr.shape}, expected ({self.m}, {self.m})")
 
@@ -152,33 +162,36 @@ class ObservedGaussian(InPlace, Rebuildable):
     # ------------------------------------------------------------------ the factor
 
     def _factorize(self, factor):
-        """F with F F^T = K up to the cutoff; ``factor``: a precomputed :meth:`factor_data` (shared set-up)."""
+        """F with F F^T = K up to the cutoff (:func:`covariance_factor`; white or matrix noise folded in, one product
+        per draw); ``factor``: a precomputed :meth:`factor_data` (shared set-up)."""
         t0 = time.perf_counter()
         if factor is None:
-            k, route = self._field_covariance()
-            k = self.scale**2 * k
-            noise = self._noise_cov if self._noise_sampler is None else None  # folded in: one product per draw
-            if noise is not None:
-                k = k + torch.as_tensor(noise, dtype=torch.float64, device=k.device)
-            w, v = torch.linalg.eigh(k.to(self.device))
-            wmax = float(w.max()) if w.numel() else 0.0
-            keep = w > self.rtol * wmax if wmax > 0 else torch.zeros_like(w, dtype=torch.bool)
-            f = v[:, keep] * torch.sqrt(w[keep])
-            total = float(w.clamp(min=0).sum())
-            dropped = float(w[~keep].clamp(min=0).sum()) / total if total > 0 else 0.0
-            factor = {"F": f, "K": k.cpu().numpy(), "dropped_trace": dropped, "route": route,
+            noise = self._noise_factor() if self._noise_sampler is None else None
+            f, info = covariance_factor(self.field, self._free_operator(), self.space, scale=self.scale, noise=noise,
+                                        rtol=self.rtol)
+            factor = {"F": f, "dropped_trace": info["dropped_trace"], "route": info["covariance"],
                       "noise_folded": noise is not None, "setup_s": time.perf_counter() - t0}
         self._F64 = factor["F"].to(self.device, torch.float64)
         self._F = self._F64.to(self.dtype)
-        self._K = factor["K"]
         self._folded = factor["noise_folded"]
         self._factor = factor
         self.rank = int(self._F.shape[1])
         self.plan.update(rank=self.rank, rtol=self.rtol, dropped_trace=factor["dropped_trace"],
                          covariance=factor["route"], setup_s=round(factor["setup_s"], 3))
 
+    def _noise_factor(self):
+        """N (m x q) with N N^T = Gamma, or None without noise."""
+        if self._noise_std is not None:
+            return np.diag(self._noise_std)
+        if self._noise_chol is not None:
+            return self._noise_chol
+        if self._noise_sampler is not None:
+            w, v = np.linalg.eigh(self._noise_sampler.covariance())
+            return v * np.sqrt(np.clip(w, 0.0, None))
+        return None
+
     def factor_data(self) -> dict:
-        """The factor's set-up (F, K and their description), to share with another sampler of the same law."""
+        """The factor's set-up (F and its description), to share with another sampler of the same law."""
         return self._factor
 
     def _free_operator(self):
@@ -197,13 +210,33 @@ class ObservedGaussian(InPlace, Rebuildable):
         return self._mean.copy()
 
     def covariance(self) -> np.ndarray:
-        """The exact covariance of y, scale^2 G Sigma G^T + Gamma (m x m; for the factor route, before its cutoff)."""
-        if self._K is None:
-            k = self.scale**2 * self._field_covariance()[0].cpu().numpy()
-            self._K = k
-            self._folded = False
+        """The exact covariance of y, scale^2 G Sigma G^T + Gamma (m x m; for the factor route, before its cutoff;
+        computed on first request)."""
+        if self._K is None:  # the field's part
+            self._K = self.scale**2 * self._field_covariance()[0].cpu().numpy()
         noise = self._noise_covariance()
-        return self._K.copy() if (noise is None or self._folded) else self._K + noise
+        return self._K.copy() if noise is None else self._K + noise
+
+    # ------------------------------------------------------------------ composition and dense samplers
+
+    __array_ufunc__ = None  # E @ obs: NumPy (and SciPy, torch) leave the product to __rmatmul__
+
+    def __rmatmul__(self, operator):
+        """E @ y: the observations E G f + E e of the same field (an ObservedGaussian; noise E Gamma E^T)."""
+        e = _as_operator(operator, self.m)
+        noise = self._noise_covariance()
+        g = e @ self.G
+        return ObservedGaussian(self.field, operator=g.toarray() if sp.issparse(g) and _dense_enough(g) else g,
+                                fes=self.space.fes, noise=None if noise is None else e @ noise @ e.T.toarray(),
+                                loc=self._loc, scale=self.scale, method=self.method, rtol=self.rtol,
+                                seed=self.source.spawn(), device=self.device, dtype=self.dtype)
+
+    def dense(self, dofs=None, observe=None, **kwargs):
+        """A :class:`ngsrng.DenseSampler` of these observations (``dofs``: some of them; ``observe``: a linear map of
+        them); see :mod:`ngsrng.dense`. Reuses this sampler's factor when the arguments allow it."""
+        from .dense import dense
+
+        return dense(self, dofs, observe, **kwargs)
 
     def sample(self, n=None):
         """n draws as an (m x n) tensor (n=None: one, (m,)), on ``device`` in ``dtype``."""
@@ -327,15 +360,8 @@ class ObservedGaussian(InPlace, Rebuildable):
         return "ObservedGaussian(\n" + "\n".join(f"  {k}: {v}" for k, v in self.plan.items() if k != "field") + "\n)"
 
 
-def operator_covariance(field, g, space=None):
-    """G Sigma G^T (m x m, float64 torch) of a Gaussian random function, for G given on its free dofs (m x nfree:
-    sparse, dense, or a torch tensor), and how it was computed.
-
-    With a factor Sigma = L L^T (``apply_t`` and ``nrand``: Gaussians, low-rank models, posteriors, stationary
-    fields): Y = L^T G^T (m applications of L^T, on the field's device) and K = Y^T Y, or m applications of Sigma when
-    Y does not fit in a quarter of the free memory. Otherwise (a covariance given as an operator, ``space`` needed): m
-    applications of Sigma with NumPy. Zero rows of G give exactly zero rows and columns of K."""
-    m = g.shape[0]
+def _columns(g):
+    """The columns of G^T in blocks of CHUNK (float64 CPU tensors), for G (m x nfree) sparse, dense or torch."""
     gt = g.T.tocsc() if sp.issparse(g) else g.T
 
     def block(i):
@@ -344,13 +370,40 @@ def operator_covariance(field, g, space=None):
             return b.to(torch.float64).contiguous()
         return torch.from_numpy(b.toarray() if sp.issparse(b) else np.ascontiguousarray(b, dtype=np.float64))
 
+    return block
+
+
+def factor_columns(field, g):
+    """Y = L^T G^T (nrand x m, float64 torch on the field's device) for a field with a factor Sigma = L L^T (``apply_t``
+    and ``nrand``: Gaussians, low-rank models, posteriors, stationary fields) and G (m x nfree) on its free dofs: m
+    applications of L^T. None without a factor, or when Y does not fit in a quarter of the free memory."""
+    if not (hasattr(field, "apply_t") and hasattr(field, "nrand")):
+        return None
+    m = g.shape[0]
+    dev = torch_device_of(field) or torch.device("cpu")
+    if 8.0 * field.nrand * m >= 0.25 * _free_memory(dev):
+        return None
+    block = _columns(g)
+    y = torch.empty((field.nrand, m), dtype=torch.float64, device=dev)
+    for i in range(0, m, CHUNK):
+        y[:, i:i + CHUNK] = field.apply_t(block(i).to(dev)).to(dev, torch.float64)
+    return y
+
+
+def operator_covariance(field, g, space=None):
+    """G Sigma G^T (m x m, float64 torch) of a Gaussian random function, for G given on its free dofs (m x nfree:
+    sparse, dense, or a torch tensor), and how it was computed.
+
+    With a factor Sigma = L L^T: K = Y^T Y with Y = :func:`factor_columns`, or m applications of Sigma when Y does not
+    fit. Otherwise (a covariance given as an operator, ``space`` needed): m applications of Sigma with NumPy. Zero rows
+    of G give exactly zero rows and columns of K."""
+    m = g.shape[0]
+    y = factor_columns(field, g)
+    if y is not None:
+        return y.T @ y, f"Y = L^T G^T ({field.nrand} x {m}), K = Y^T Y"
+    block = _columns(g)
     if hasattr(field, "apply_t") and hasattr(field, "nrand"):
         dev = torch_device_of(field) or torch.device("cpu")
-        if 8.0 * field.nrand * m < 0.25 * _free_memory(dev):  # Y = L^T G^T, then Y^T Y
-            y = torch.empty((field.nrand, m), dtype=torch.float64, device=dev)
-            for i in range(0, m, CHUNK):
-                y[:, i:i + CHUNK] = field.apply_t(block(i).to(dev)).to(dev, torch.float64)
-            return y.T @ y, f"Y = L^T G^T ({field.nrand} x {m}), K = Y^T Y"
         gdev = (g.to(dev, torch.float64) if isinstance(g, torch.Tensor) else
                 sparse_to_torch(g, dev, torch.float64) if sp.issparse(g) else
                 torch.as_tensor(np.asarray(g), device=dev, dtype=torch.float64))
@@ -366,6 +419,110 @@ def operator_covariance(field, g, space=None):
     for i in range(0, m, CHUNK):
         k[:, i:i + CHUNK] = np.asarray(gn @ src.sigma(block(i).numpy()))
     return torch.from_numpy(0.5 * (k + k.T)), f"{m} applications of Sigma"
+
+
+def covariance_factor(field, g, space=None, *, scale=1.0, noise=None, rtol=RTOL, rank=None, tol=None, pin=None):
+    """F (m x r, float64 torch on the field's device) with F F^T = K = scale^2 G Sigma G^T + N N^T up to the cut, and
+    its description. G (m x nfree) is given on the field's free dofs; ``noise`` N (m x q) or None.
+
+    K is not formed when Y = :func:`factor_columns` fits: a Householder QR [scale Y; N^T] = Q R (Q not kept) gives
+    R^T R = K to the rounding of that block, not of K, so small variances keep their relative accuracy.
+
+    - ``rtol`` None (or 0), ``rank`` and ``tol`` None: no truncation, F = R^T (one dense triangular matrix).
+    - Otherwise the SVD R = U s V^T: modes with s_i^2 <= rtol s_0^2 (eigenvalues of K at most rtol times the largest)
+      are dropped, then all but the leading ``rank`` modes, or all but the fewest that keep a fraction 1 - ``tol`` of
+      the variance (trace). F = R^T U_r = V_r s_r: the Karhunen-Loeve modes, in decreasing order (one thin matrix).
+      ||K - F F^T||_2 <= rtol max eig K without rank / tol.
+
+    Rows whose variance is exactly zero (points or observations that are deterministic: Dirichlet dofs, points a
+    family standardises to a constant) are exactly zero in F. ``pin``: also rows with variance at most pin times the
+    largest (they are then exactly their mean; this moves each such value by at most its standard deviation, but the
+    covariance by up to sqrt(pin) of the largest variance in the off-diagonal entries).
+
+    Without room for Y: K from applications of Sigma (:func:`operator_covariance`) and its eigendecomposition with the
+    same cuts (no truncation: the negative rounding of its eigenvalues clipped)."""
+    m = g.shape[0]
+    cut = rtol is not None and rtol > 0
+    truncate = cut or rank is not None or tol is not None
+    y = factor_columns(field, g) if m else None
+    dev = y.device if y is not None else (torch_device_of(field) or torch.device("cpu"))
+    nt = None if noise is None else torch.as_tensor(np.asarray(noise, dtype=np.float64), device=dev)
+    if y is not None:
+        if scale != 1.0:
+            y.mul_(scale)
+        if nt is not None:
+            y = torch.cat([y, nt.T])
+        diag = (y * y).sum(dim=0)
+    else:
+        k, route = operator_covariance(field, g, space) if m else (torch.zeros((0, 0), dtype=torch.float64), "")
+        k = scale**2 * k.to(dev)
+        if nt is not None:
+            k = k + nt @ nt.T
+        diag = torch.diagonal(k).clamp_min(0.0)
+    top = float(diag.max()) if m else 0.0
+    zero = diag <= (pin * top if pin else 0.0)
+    rows = torch.nonzero(~zero).ravel()
+    total = float(diag.sum())
+    lam = None
+    if rows.numel() == 0:
+        f_rows, route = torch.zeros((0, 0), dtype=torch.float64, device=dev), "deterministic"
+    elif y is not None:
+        r = torch.linalg.qr(y[:, rows], mode="r").R
+        route = f"QR of {'[scale L^T G^T; N^T]' if nt is not None else 'L^T G^T'} ({y.shape[0]} x {rows.numel()})"
+        if not truncate:
+            f_rows = r.T
+        else:
+            u, sv, _ = torch.linalg.svd(r, full_matrices=False)
+            lam, f_rows = sv**2, None
+            route += ", SVD of R"
+    else:
+        lam, v = torch.linalg.eigh(k[rows][:, rows])
+        lam, v = lam.flip(0).clamp_min(0.0), v.flip(1)
+        route += ", eigendecomposition"
+    if lam is not None:
+        keep = int((lam > rtol * float(lam[0])).sum()) if cut and lam.numel() and float(lam[0]) > 0 else \
+            int((lam > 0).sum())
+        if rank is not None:
+            keep = min(keep, int(rank))
+        if tol is not None and keep:
+            frac = torch.cumsum(lam[:keep], 0) / max(total, 1e-300)
+            keep = min(keep, int(torch.searchsorted(frac, torch.tensor(1.0 - float(tol), dtype=frac.dtype,
+                                                                        device=frac.device))) + 1)
+        if y is not None:
+            f_rows = r.T @ u[:, :keep]
+        else:
+            f_rows = v[:, :keep] * torch.sqrt(lam[:keep])
+        big = f_rows.abs().argmax(dim=0)  # a fixed sign per mode: the factor does not depend on the solver's choice
+        sign = torch.sign(f_rows[big, torch.arange(f_rows.shape[1], device=dev)])
+        f_rows = f_rows * torch.where(sign == 0, torch.ones_like(sign), sign)
+    f = torch.zeros((m, f_rows.shape[1]), dtype=torch.float64, device=dev)
+    f[rows] = f_rows
+    kept = float((f_rows * f_rows).sum())
+    exact_rank = None if lam is None else (int((lam > rtol * float(lam[0])).sum()) if cut and lam.numel() and
+                                           float(lam[0]) > 0 else int((lam > 0).sum()))
+    info = {"rank": int(f.shape[1]), "covariance": route,
+            "exact": rank is None and tol is None or (exact_rank is not None and f.shape[1] == exact_rank),
+            "captured_variance": kept / total if total > 0 else 1.0,
+            "dropped_trace": max(0.0, 1.0 - kept / total) if total > 0 else 0.0,
+            "truncation": {"rtol": rtol if cut else None, "rank": rank, "tol": tol, "pin": pin},
+            "deterministic": int(zero.sum())}
+    return f, info
+
+
+def _as_operator(operator, ncols) -> sp.csr_matrix:
+    """A linear map given as a NumPy array, SciPy sparse matrix or torch tensor, as CSR float64 with ``ncols``
+    columns."""
+    if isinstance(operator, torch.Tensor):
+        operator = operator.detach().cpu()
+        operator = operator.to_dense().numpy() if operator.layout != torch.strided else operator.numpy()
+    e = sp.csr_matrix(operator, dtype=np.float64)
+    if e.shape[1] != ncols:
+        raise ValueError(f"the operator has {e.shape[1]} columns; it acts on {ncols} values")
+    return e
+
+
+def _dense_enough(a) -> bool:
+    return a.nnz > 0.25 * a.shape[0] * a.shape[1]
 
 
 def _coefficients(loc, space, field_mean):

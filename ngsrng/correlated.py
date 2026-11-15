@@ -75,6 +75,8 @@ def correlated(components, cross_correlation):
 class CorrelatedFields(InPlace):
     """Several fields drawn jointly with cross-correlation ``cross_correlation`` (see :func:`correlated`)."""
 
+    __array_ufunc__ = None  # E @ fields: NumPy (and SciPy, torch) leave the product to __rmatmul__
+
     def __init__(self, components, cross_correlation):
         from .generator import FieldDistribution
 
@@ -132,6 +134,12 @@ class CorrelatedFields(InPlace):
         from .dense import dense
 
         return dense(self, dofs, observe, **kwargs)
+
+    def __rmatmul__(self, operator):
+        """``E @ fields``: every component's values observed by E (an :class:`ngsrng.ObservedField`)."""
+        from .dense import ObservedField
+
+        return ObservedField(self, operator)
 
     def sample_into(self, rows):
         """Fill one (n, nvalues) buffer per component in place (:mod:`ngsrng.inplace`)."""
