@@ -163,6 +163,10 @@ DISTRIBUTION_CASES = {
     "gamma-table-host": ("gamma", (2.0,), {"method": "table", "compute": "host"}),
     "karhunen-loeve-r50": ("karhunen_loeve", (), {"rank": 50}),
     "karhunen-loeve-r50-host": ("karhunen_loeve", (), {"rank": 50, "compute": "host"}),
+    # dense samplers (d.dense(observe=...)): the field at "dense" mesh vertices by dense products after a one-time
+    # set-up (setup_s includes it, also in dense_setup_s)
+    "uniform-bernstein-dense": ("uniform", (), {"representation": "bernstein", "dense": 256}),
+    "normal-dense": ("normal", (), {"dense": 256}),
 }
 
 # Truncated Karhunen-Loeve expansions of the default Matern prior (power 2): randomised subspace iteration on the

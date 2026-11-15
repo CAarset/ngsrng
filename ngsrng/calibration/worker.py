@@ -459,6 +459,8 @@ def run_distributions(task: Task, fes, rec: dict):
 
     name, args, opts = DISTRIBUTION_CASES[task.method]
     args = _dist_args(args)
+    opts = dict(opts)
+    dense = opts.pop("dense", None)  # a dense sampler of the field at this many mesh vertices
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         gauss = ngsrng.Gaussian(
@@ -475,6 +477,13 @@ def run_distributions(task: Task, fes, rec: dict):
         rng = ngsrng.default_rng(fes, seed=1, correlation=gauss, device=task.device, dtype=task.dtype)
         t = time.perf_counter()
         dist = rng.distribution(name, *args, **opts)
+        if dense is not None:
+            xyz = np.array([v.point for v in fes.mesh.vertices])
+            xyz = xyz[np.linspace(0, len(xyz) - 1, min(int(dense), len(xyz))).astype(int)]
+            t_dense = time.perf_counter()
+            dist = dist.dense(observe=ngsrng.observation_operator(fes, points=xyz))
+            rec["dense_setup_s"] = time.perf_counter() - t_dense
+            rec["latent_points"], rec["rank"] = dist.latent_points, dist.rank
         rec["setup_s"] = time.perf_counter() - t
         dist.sample(1)  # first call: lazy set-up (inversion tables)
         rec["per_sample_s"], _ = timeit(lambda: dist.sample(8), sync, min_time=0.2, max_reps=3)
@@ -492,7 +501,7 @@ def run_distributions(task: Task, fes, rec: dict):
                 rec[key] = info[key]
         rec.setdefault("compute", opts.get("compute", "auto"))
         x = dist.sample(DIST_SAMPLES, output="numpy")
-    if opts.get("representation") in ("projection", "bernstein"):
+    if opts.get("representation") in ("projection", "bernstein") and dense is None:  # dense: values at vertices
         rec["check"] = "FE coefficients: marginals not checked"  # the tests compare these with the host route
         return
     _dist_check(task.method, name, args, x, gauss, rec)
