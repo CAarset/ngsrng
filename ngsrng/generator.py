@@ -318,6 +318,14 @@ class FieldDistribution:
 
     rvs = sample
 
+    def dense(self, dofs=None, observe=None, **kwargs):
+        """A :class:`ngsrng.DenseSampler` of this distribution: its draws at ``dofs`` (default: the trace DoFs with
+        ``bnd=``, else all) or ``observe @`` its draws, as dense matrix products on any device, with the same law
+        (:mod:`ngsrng.dense`). Set up once per arguments and kept with the distribution; ``save`` stores it."""
+        from .dense import dense
+
+        return dense(self, dofs, observe, **kwargs)
+
     def __repr__(self):
         return f"FieldDistribution({self.name}, {self.info})"
 

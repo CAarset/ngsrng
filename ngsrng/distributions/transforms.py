@@ -13,103 +13,16 @@ import scipy.stats as st
 import torch
 
 from ..backend import DeviceCache, device_copy
+from ..quantiles import (  # noqa: F401  (the closed forms live in an NGSolve-free module)
+    CLOSED,
+    INF,
+    POSITIVE,
+    REAL,
+    UNIT,
+    _exceeds,
+)
 from .inversion import Inversion
 from .pointwise import XP, GaussianAtPoints, PointwiseField, is_conditioned, warn_copies_of_posterior
-
-
-def _cauchy(z, xp, loc=0.0, scale=1.0):
-    # tan(pi (u - 1/2)) written as -cot(pi Phi(z)) / cot(pi Phi(-z)) to keep both tails accurate
-    lower = -1.0 / xp.m.tan(np.pi * xp.ndtr(z))
-    upper = 1.0 / xp.m.tan(np.pi * xp.ndtr(-z))
-    return loc + scale * xp.where(z < 0, lower, upper)
-
-
-def _triangular(z, xp, left, mode, right):
-    u, s = xp.ndtr(z), xp.ndtr(-z)
-    width = right - left
-    c = (mode - left) / width
-    return xp.where(u < c, left + xp.m.sqrt(u * width * (mode - left)), right - xp.m.sqrt(s * width * (right - mode)))
-
-
-INF = np.inf
-
-def _normal(z, xp, loc, scale):
-    return loc + scale * z
-
-
-def _uniform(z, xp, low, high):
-    return low + (high - low) * xp.ndtr(z)
-
-
-def _lognormal(z, xp, mean, sigma):
-    return xp.m.exp(mean + sigma * z)
-
-
-def _exponential(z, xp, scale):
-    return -scale * xp.log_ndtr(-z)
-
-
-def _weibull(z, xp, a):
-    return (-xp.log_ndtr(-z)) ** (1.0 / a)
-
-
-def _laplace(z, xp, loc, scale):
-    return xp.where(z < 0, loc + scale * (np.log(2.0) + xp.log_ndtr(z)), loc - scale * (np.log(2.0) + xp.log_ndtr(-z)))
-
-
-def _gumbel(z, xp, loc, scale):
-    return loc - scale * xp.m.log(-xp.log_ndtr(z))
-
-
-def _logistic(z, xp, loc, scale):
-    return loc + scale * (xp.log_ndtr(z) - xp.log_ndtr(-z))
-
-
-def _rayleigh(z, xp, scale):
-    return scale * xp.m.sqrt(-2.0 * xp.log_ndtr(-z))
-
-
-def _lomax(z, xp, a):  # numpy's pareto is the Lomax distribution
-    return xp.m.expm1(-xp.log_ndtr(-z) / a)
-
-
-def _power(z, xp, a):
-    return xp.m.exp(xp.log_ndtr(z) / a)
-
-
-def _halfnormal(z, xp, scale):
-    return -scale * xp.ndtri(0.5 * xp.ndtr(-z))
-
-
-def _between_low_high(low, high):
-    return low, high
-
-
-def _between_left_right(left, mode, right):
-    return left, right
-
-
-REAL, POSITIVE, UNIT = (-INF, INF), (0.0, INF), (0.0, 1.0)
-
-# name -> (quantile map of z, parameters with defaults (None = required), support: (lo, hi), or a function of the
-# parameters returning it). Upper tails use Phi(-z) (log_ndtr(-z)) so that they keep full relative accuracy. Named
-# functions, not lambdas: fields store the map, and stored functions must pickle.
-CLOSED = {
-    "normal": (_normal, {"loc": 0.0, "scale": 1.0}, REAL),
-    "uniform": (_uniform, {"low": 0.0, "high": 1.0}, _between_low_high),
-    "lognormal": (_lognormal, {"mean": 0.0, "sigma": 1.0}, POSITIVE),
-    "exponential": (_exponential, {"scale": 1.0}, POSITIVE),
-    "weibull": (_weibull, {"a": None}, POSITIVE),
-    "laplace": (_laplace, {"loc": 0.0, "scale": 1.0}, REAL),
-    "gumbel": (_gumbel, {"loc": 0.0, "scale": 1.0}, REAL),
-    "logistic": (_logistic, {"loc": 0.0, "scale": 1.0}, REAL),
-    "rayleigh": (_rayleigh, {"scale": 1.0}, POSITIVE),
-    "pareto": (_lomax, {"a": None}, POSITIVE),
-    "power": (_power, {"a": None}, UNIT),
-    "standard_cauchy": (_cauchy, {}, REAL),
-    "triangular": (_triangular, {"left": None, "mode": None, "right": None}, _between_left_right),
-    "halfnormal": (_halfnormal, {"scale": 1.0}, POSITIVE),
-}
 
 
 def _hypergeom(ngood, nbad, nsample):
@@ -288,10 +201,6 @@ def transformed(points, func, standardize=False, representation="quadrature", to
     is written for torch tensors (see :class:`PointMap`; None: recognised for NumPy ufuncs and torch functions)."""
     return MarginalField(points, PointMap(func, torch), standardize=standardize, representation=representation,
                          label="transformed")
-
-
-def _exceeds(g, xp, level):
-    return (g > level) * 1.0
 
 
 class PointMap:

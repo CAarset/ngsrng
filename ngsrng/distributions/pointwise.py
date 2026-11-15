@@ -9,7 +9,6 @@ import warnings
 
 import ngsolve as ngs
 import numpy as np
-import scipy.special as sps
 import torch
 
 from ..backend import (
@@ -25,35 +24,9 @@ from ..covariance import EXACT_LIMIT
 from ..inplace import InPlace
 from ..observations import observation_operator
 from ..quadrature import QuadratureRule
+from ..quantiles import XP  # noqa: F401  (NumPy / torch switch of the transforms)
 from ..solvers import NGSolveDirect
 from ..space import mass_form
-
-_SQRT1_2 = float(np.sqrt(0.5))
-
-
-class XP:
-    """Minimal array-module switch so each transform is written once for NumPy (CPU) and torch (GPU)."""
-
-    def __init__(self, torch_mode: bool):
-        self.torch = torch_mode
-        self.m = torch if torch_mode else np
-
-    def ndtr(self, x):
-        if not self.torch:
-            return sps.ndtr(x)
-        # torch.special.ndtr computes (1 + erf) / 2, which cancels in the lower tail (4% relative error at x = -8,
-        # zero below -10); the erfc form keeps full relative accuracy in both tails
-        tail = 0.5 * torch.special.erfc(x.abs() * _SQRT1_2)
-        return torch.where(x < 0, tail, 1.0 - tail)
-
-    def log_ndtr(self, x):
-        return torch.special.log_ndtr(x) if self.torch else sps.log_ndtr(x)
-
-    def ndtri(self, x):
-        return torch.special.ndtri(x) if self.torch else sps.ndtri(x)
-
-    def where(self, c, a, b):
-        return torch.where(c, a, b) if self.torch else np.where(c, a, b)
 
 
 def prior_of(gauss):
