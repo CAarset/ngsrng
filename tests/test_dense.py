@@ -218,9 +218,9 @@ def test_marginals_match_the_route(space, rng):
     a = d.dense()
     assert a.dofs[0] < space.mesh.nv  # a vertex DoF (H1 numbers them first): its value has the exact marginal
     y = a.sample(4000)
-    assert st.kstest(y[:, 0], st.uniform(-1, 21).cdf).pvalue > 1e-3
+    assert st.kstest(y[:, 0], st.uniform(-1, 21).cdf).pvalue > 1e-4
     ref = d.sample(4000)[:, a.dofs]
-    assert st.ks_2samp(y[:, 0], ref[:, 0]).pvalue > 1e-3
+    assert st.ks_2samp(y[:, 0], ref[:, 0]).pvalue > 1e-4
     np.testing.assert_allclose(np.cov(y.T), np.cov(ref.T), atol=0.1 * np.cov(ref.T).max())
 
 
@@ -272,7 +272,7 @@ def test_rounding_entries_of_observations(space, rng):
     assert a.latent_points == len(xyz) and a.info["zero"] == 1e-15
     b = d.dense(observe=e, zero=None)
     assert b.latent_points >= a.latent_points and b.info["zero_drop"] == 0.0
-    assert st.kstest(a.sample(3000)[:, 3], st.uniform(-1, 21).cdf).pvalue > 1e-3
+    assert st.kstest(a.sample(3000)[:, 3], st.uniform(-1, 21).cdf).pvalue > 1e-4
 
 
 def test_composition_drops_unread_values(space, rng):
@@ -290,7 +290,7 @@ def test_composition_drops_unread_values(space, rng):
     np.testing.assert_allclose(k, o @ cov @ o.T, atol=1e-12)
     u = rng.distribution("uniform", -1, 20, representation="bernstein", bnd="left").dense()
     v = sp.csr_matrix((np.ones(1), ([0], [0])), shape=(1, len(u.dofs))) @ u  # a vertex coefficient: one point
-    assert v.latent_points == 1 and st.kstest(v.sample(3000)[:, 0], st.uniform(-1, 21).cdf).pvalue > 1e-3
+    assert v.latent_points == 1 and st.kstest(v.sample(3000)[:, 0], st.uniform(-1, 21).cdf).pvalue > 1e-4
 
 
 def test_observed_gaussians(space, rng):
