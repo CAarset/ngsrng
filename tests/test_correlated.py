@@ -117,7 +117,9 @@ def test_gaussian_fields(space):
                               dist(space, 14, "normal", 2.0, 3.0, representation=None)], 0.9).sample(3000)
     i = centre_vertex(space)
     assert a[:, i].std() == pytest.approx(1.0, rel=0.06) and b[:, i].std() == pytest.approx(3.0, rel=0.06)
-    assert b[:, i].mean() == pytest.approx(2.0, abs=0.15)
+    # 5 standard errors of the mean of 3000 draws with standard deviation 3: the draws depend on the mesh, which
+    # netgen may build differently on another machine, so the tolerance must hold for any realisation
+    assert b[:, i].mean() == pytest.approx(2.0, abs=5 * 3.0 / np.sqrt(3000))
     assert np.corrcoef(a[:, i], b[:, i])[0, 1] == pytest.approx(0.9, abs=0.02)
 
 
