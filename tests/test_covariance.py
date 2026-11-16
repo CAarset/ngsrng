@@ -346,6 +346,49 @@ def test_explicit_exact_posterior_stays_exact_beyond_the_auto_limit(monkeypatch)
     np.testing.assert_allclose(exact.values(e), _variance(fes, _dense(post), _points(fes)), rtol=1e-9)
 
 
+def test_variance_at_points_costs_the_points(monkeypatch):
+    """(E Sigma E^T)_ii at m points: one application of L^T per point (factor) or of Sigma (operator), not one per
+    free dof (the full local covariance is never computed); from a cached exact local covariance or a finite-rank
+    factor at no cost; all routes exact against dense Sigma."""
+    import ngsrng.covariance as cv
+    from ngsrng.covariance import variance_at_points
+
+    fes = ngs.H1(ngs.Mesh(ngs.unit_square.GenerateMesh(maxh=0.2)), order=2, dirichlet="bottom")
+    _, prior = _setup(fes)
+    post = prior.condition(points=_points(fes, 4), noise=0.01)
+    pts = _points(fes, 7)
+    e = ngsrng.observation_operator(fes, points=pts)[:, prior.space.free]
+    u, v = fes.TnT()
+    a = ngs.BilinearForm(ngs.grad(u) * ngs.grad(v) * ngs.dx + 10 * u * v * ngs.dx).Assemble()
+    mass = ngs.BilinearForm(u * v * ngs.dx).Assemble()
+    ainv = a.mat.Inverse(fes.FreeDofs())
+    op = ainv @ mass.mat @ ainv
+    sigma_op = as_covariance(op, fes=fes).sigma(np.eye(prior.space.nfree))
+    real_columns = cv._columns
+    monkeypatch.setattr(cv, "_columns", lambda src: pytest.fail("the full local covariance was computed"))
+    for source, sigma, kw, how in ((prior, _dense(prior), {}, "L^T"), (post, _dense(post), {}, "L^T"),
+                                   (op, sigma_op, {"fes": fes}, "Sigma")):
+        r = variance_at_points(source, e, **kw)
+        np.testing.assert_allclose(r.values, _variance(fes, sigma, pts), rtol=1e-10)
+        assert r.applications == len(pts) and how in r.method
+        if source is not op:  # cached on the Gaussian per evaluation matrix (a bare operator has nowhere to keep it)
+            assert variance_at_points(source, e.copy(), **kw) is r
+    kl = ngsrng.karhunen_loeve(prior, 20)
+    r = variance_at_points(kl, e)
+    np.testing.assert_allclose(r.values, _variance(fes, _dense(kl), pts), rtol=1e-10)
+    assert r.applications == 0
+    # as many points as free dofs: the full local covariance (cached, shared by every point set of the source)
+    monkeypatch.setattr(cv, "_columns", real_columns)
+    many = _points(fes, prior.space.nfree, seed=3)
+    em = ngsrng.observation_operator(fes, points=many)[:, prior.space.free]
+    r = variance_at_points(prior, em)
+    np.testing.assert_allclose(r.values, _variance(fes, _dense(prior), many), rtol=1e-10)
+    assert "all columns" in r.method
+    other = _points(fes, 5, seed=4)
+    eo = ngsrng.observation_operator(fes, points=other)[:, prior.space.free]
+    assert variance_at_points(prior, eo).applications == 0  # from the now cached local covariance
+
+
 def test_functional_covariance_is_g_sigma_gt():
     fes = ngs.H1(ngs.Mesh(ngs.unit_square.GenerateMesh(maxh=0.2)), order=2, dirichlet="left")
     _, g = _setup(fes)

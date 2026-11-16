@@ -357,7 +357,8 @@ def _check_shared(parts):
                              "for a Gaussian component among pointwise ones")
         if key[2] is not first[2] or key[1] != first[1]:
             raise ValueError(f"{p.name}: the components must live on the same space, with the same representation "
-                             "(or the same points=)")
+                             "(or the same points=); a Bernstein field with bnd= lives at the domain points of its "
+                             "trace, so its partners need the same bnd=")
         if p.kind == "points" and p.points is not parts[0].points:
             a, b = p.points.eval_full, parts[0].points.eval_full
             if a.shape != b.shape or (a != b).nnz:

@@ -296,6 +296,37 @@ def test_copula_marginal(mesh):
         assert_law(vals[:, j], st.uniform().cdf, what=f"trace dof {j}")
 
 
+def test_trace_fields_live_at_the_trace_points(mesh, monkeypatch):
+    """A Bernstein field with bnd= lives at the domain points its trace DoFs depend on (those on the boundary): its
+    exact standardisation costs one application of L^T per trace point, never the full local covariance, and "auto"
+    is exact wherever the trace is small. Same draws as the unrestricted field at the trace DoFs (to rounding);
+    standard deviations and parameters given at every domain point are taken at the trace's."""
+    import ngsrng.covariance as cv
+    from ngsrng.distributions.pointwise import GaussianAtPoints
+
+    fes = h1(mesh, 3)
+    trace = boundary_dofs(fes, "left", free_only=False)
+    lo = np.linspace(-1.0, 0.0, fes.ndof)  # a lower bound at every domain point
+    full = rng_for(fes, std="exact").distribution("uniform", lo, 20, representation="bernstein")
+    real_columns = cv._columns
+    monkeypatch.setattr(cv, "_columns", lambda src: pytest.fail("the full local covariance was computed"))
+    rng = rng_for(fes, std="exact")
+    d = rng.distribution("uniform", lo, 20, representation="bernstein", bnd="left")
+    p = d.field.points
+    assert p.npoints == trace.size < fes.ndof and rng.info("uniform", lo, 20, bnd="left")["points"] == trace.size
+    np.testing.assert_allclose(p.bernstein.cf_values(ngs.x), 0.0, atol=1e-12)  # all on x = 0
+    monkeypatch.setattr(cv, "_columns", real_columns)
+    fp = full.field.points
+    np.testing.assert_allclose(p.std, fp.std[p.bernstein.rows], rtol=1e-12)
+    np.testing.assert_allclose(d.sample(20)[:, trace], full.sample(20)[:, trace], rtol=0, atol=1e-11)
+    given = rng_for(fes, std=fp.std).distribution("uniform", bnd="left").field.points
+    assert given.std_method == "given" and np.array_equal(given.std, fp.std[p.bernstein.rows])
+    monkeypatch.setattr(GaussianAtPoints, "EXACT_STD_LIMIT", trace.size)  # the space is "large", its trace is not
+    assert rng_for(fes).info("uniform", bnd="left")["standardisation"] == "exact"
+    with pytest.raises(ValueError, match="same bnd="):  # correlated components share their points
+        ngsrng.correlated([d, full], 0.5)
+
+
 def test_projection_dofs_are_not_the_copula_marginal(mesh):
     """Documented asymmetry: the L2 projection of a copula field leaves the support at its DoFs."""
     fes = h1(mesh, 1)

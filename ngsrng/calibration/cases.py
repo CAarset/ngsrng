@@ -179,9 +179,11 @@ LOWRANK_DENSE_LIMIT = 4000
 
 # Covariance diagnostics (ngsrng.covariance) of the default Matern prior and of its posterior under 40 point
 # observations: pointwise-variance methods (method, options) and trace estimators (probes), against the exact local
-# covariance where it is affordable (COVARIANCE_EXACT_LIMIT free dofs).
+# covariance where it is affordable (COVARIANCE_EXACT_LIMIT free dofs). "points" is the exact variance at m of the
+# quadrature points only (ngsrng.covariance.variance_at_points: what std="exact" costs at few points or a trace).
 COVARIANCE_VARIANCE = {
     "exact": ("exact", {}),
+    "exact-100-points": ("points", {"m": 100}),
     "lowrank-r100-s32": ("lowrank", {"rank": 100, "samples": 32}),
     "lowrank-r400-s64": ("lowrank", {"rank": 400, "samples": 64}),
     "mc-400": ("mc", {"samples": 400}),
