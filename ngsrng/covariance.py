@@ -934,13 +934,22 @@ def covariance_function(source, point, *, correlation=False, fes=None, conventio
 def functional_covariance(source, operator=None, *, fes=None, convention=None, **observations) -> np.ndarray:
     """The covariance matrix G Sigma G^T of finitely many linear functionals of the field: point values, local
     averages, LinearForms, matrices or matrix-free maps (``operator`` and ``observations`` as in
-    :func:`ngsrng.observation_operator`). Exact, one application of Sigma per functional. Its diagonal is the exact
-    variance at points; for a posterior it is the predictive covariance of noise-free observations."""
+    :func:`ngsrng.observation_operator`). Exact. With a factor Sigma = L L^T (Gaussians, low-rank models, posteriors,
+    stationary fields): Y^T Y with Y = L^T G^T, one application of L^T per functional, on the field's device
+    (:func:`ngsrng.observed.operator_covariance`; m applications of Sigma when Y does not fit in memory). For a
+    covariance given as an operator: one application of Sigma per functional. Its diagonal is the exact variance at
+    points; for a posterior it is the predictive covariance of noise-free observations."""
     from .observations import dense_if_full, observation_operator
 
     src = as_covariance(source, fes, convention)
     s = src.space
     g = dense_if_full(observation_operator(s.fes, operator, **observations))[:, s.free]
+    if src.has_factor and hasattr(source, "apply_t") and hasattr(source, "nrand"):
+        from .observed import operator_covariance
+
+        with numpy_blas_threads(src.blas):
+            k, _ = operator_covariance(source, g, s)
+        return k.cpu().numpy()
     gt = g.T.tocsc() if sp.issparse(g) else g.T
     out = np.empty((g.shape[0], g.shape[0]))
     with numpy_blas_threads(src.blas):
