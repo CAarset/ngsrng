@@ -91,6 +91,31 @@ def test_range_and_boundary_restriction(space):
         assert -1.0 <= vals.min() and vals.max() <= 20.0
 
 
+@pytest.mark.parametrize("bnds", [("left", None), (None, "left"), ("left", "bottom")])
+def test_components_at_different_points_are_the_restricted_joint_law(space, bnds):
+    """bnd= puts a Bernstein field at its trace's points only; mixed with a field at other points (the whole field,
+    another trace) the joint law is that of the unrestricted fields, restricted afterwards (a marginal): the same
+    numbers as correlating the unrestricted fields and zeroing the off-trace DoFs, to rounding. Also for the dense
+    sampler of the pair."""
+    pair = ngsrng.correlated([dist(space, 1 + k, std="exact", bnd=b) for k, b in enumerate(bnds)], 0.8)
+    plain = ngsrng.correlated([dist(space, 1 + k, std="exact") for k in range(2)], 0.8)
+    for got, ref, b in zip(pair.sample(20), plain.sample(20), bnds):
+        if b is not None:
+            off = np.setdiff1d(np.arange(space.ndof), boundary_dofs(space, b, free_only=False))
+            assert not got[:, off].any()
+            ref = ref.copy()
+            ref[:, off] = 0.0
+        np.testing.assert_allclose(got, ref, rtol=0, atol=1e-10 * np.abs(ref).max())
+    left = boundary_dofs(space, "left", free_only=False)
+    y = pair.dense(dofs=left).sample(3)
+    assert y.shape == (3, 2, left.size)
+    g = np.zeros((3, space.ndof))
+    for k in range(2):  # as functions on the left edge (the left DoFs alone carry them): inside the range
+        g[:, left] = y[:, k]
+        vals = basis_at(space, LEFT) @ g.T
+        assert -1.0 <= vals.min() and vals.max() <= 20.0
+
+
 def test_draw_conventions(space):
     """Shapes, single samples, torch output, in-place fills and chunking (seed None: torch's global state)."""
     pair = ngsrng.correlated([dist(space, None), dist(space, None)], 0.5)

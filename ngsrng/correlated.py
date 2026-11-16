@@ -28,7 +28,9 @@ of the latents, m_i their means and R = L L^T the k x k cross-correlation (Chole
   transformation of the data is needed, and copies of one posterior are fine.
 - **What the components must share**: the latent covariance (after the pointwise standardisation), and the points
   where the latents live (the same space and representation, or the same ``points=``); for Gaussian fields, the
-  covariance of the coefficients. The constructor checks both (the covariance with two random probes).
+  covariance of the coefficients. The constructor checks both (the covariance with two random probes). Bernstein
+  fields of one space that live at different domain points (``bnd=`` puts one at its trace's points only) are
+  rebuilt at the union of the points first: the joint law is that of the unrestricted fields, restricted afterwards.
 - **Cost**: the components' own draws plus a k x k mix per point and sample.
 
 Which fields: the pointwise families (``uniform``, ``lognormal``, ``gamma``, ``beta``, ..., ``normal`` with a
@@ -91,7 +93,8 @@ class CorrelatedFields(InPlace):
         self.cross_correlation = _correlation_matrix(cross_correlation, len(comps))
         self._mix = _factor(self.cross_correlation)
         self._identity = bool(np.array_equal(self._mix, np.eye(len(comps))))
-        self._parts = [_Part(d) for d in comps]
+        self._parts = _on_common_points([_Part(d) for d in comps])
+        self.components = tuple(p.dist for p in self._parts)
         _check_shared(self._parts)
         self.space = self._parts[0].field.space
 
@@ -346,6 +349,39 @@ def _factor(r) -> np.ndarray:
         return (v * np.sqrt(np.clip(w, 0.0, None))) @ v.T
 
 
+def _on_common_points(parts):
+    """The components, those that are Bernstein fields of one space living at fewer domain points than the others
+    rebuilt at the union of the points.
+
+    A Bernstein field with ``bnd=`` lives at the domain points of its trace only
+    (:class:`~ngsrng.distributions.bernstein.BernsteinPart`): its trace DoFs depend on no others. Mixed with a field
+    at other points (the whole field, another trace), the latents of all components are needed at every point
+    of any of them, so such a component is rebuilt there through its own generator: the same family, Gaussian,
+    randomness and ``bnd=`` restriction, standardised at the new points by its own ``std``. Its law is unchanged,
+    and the joint law is that of the components' unrestricted fields, restricted afterwards."""
+    from .generator import FieldDistribution
+
+    sets = []
+    for p in parts:
+        form = p.points.bernstein if p.kind == "points" else None
+        if form is None or p.field.space.fes is not parts[0].field.space.fes:
+            return parts
+        sets.append(getattr(form, "dofs", None))  # None: every domain point of the form
+    if all(s is None for s in sets) or all(s is not None and np.array_equal(s, sets[0]) for s in sets):
+        return parts
+    common = None if any(s is None for s in sets) else np.unique(np.concatenate(sets))
+    out = []
+    for p, s in zip(parts, sets):
+        found = p.gen._key_of(p.field)
+        if (s is None if common is None else s is not None and np.array_equal(s, common)) or found is None:
+            out.append(p)  # already there (or not a generator's field: _check_shared reports it)
+            continue
+        _, (name, args, kwargs, corr, opts) = found
+        field = p.gen._field(name, args, {**kwargs, **corr, **opts, "_bernstein_dofs": common})
+        out.append(_Part(FieldDistribution(p.gen, p.dist.name, field)))
+    return out
+
+
 def _check_shared(parts):
     """The components must have their latents at the same places with the same covariance."""
     keys = [p.latent_key() for p in parts]
@@ -357,8 +393,7 @@ def _check_shared(parts):
                              "for a Gaussian component among pointwise ones")
         if key[2] is not first[2] or key[1] != first[1]:
             raise ValueError(f"{p.name}: the components must live on the same space, with the same representation "
-                             "(or the same points=); a Bernstein field with bnd= lives at the domain points of its "
-                             "trace, so its partners need the same bnd=")
+                             "(or the same points=)")
         if p.kind == "points" and p.points is not parts[0].points:
             a, b = p.points.eval_full, parts[0].points.eval_full
             if a.shape != b.shape or (a != b).nnz:

@@ -105,7 +105,9 @@ ALIASES = {
 
 CORRELATION_KEYS = ("correlation", "precision", "covariance")
 FIELD_KEYS = ("representation", "method", "tol", "std", "order", "construction", "points", "standardize_by",
-              "bnd", "bnd_values", "compute")  # [bnd] boundary (trace) sampling: see ngsrng/boundary.py
+              "bnd", "bnd_values", "compute",  # [bnd] boundary (trace) sampling: see ngsrng/boundary.py
+              "_bernstein_dofs")  # internal (ngsrng.correlated): the DoFs whose Bernstein points a field lives at
+_TRACE = object()  # default of _bernstein_dofs: the trace's DoFs with bnd= (restriction), every point otherwise
 
 
 def _canonical(name: str) -> str:
@@ -365,7 +367,8 @@ class Generator:
         Bernstein-Bezier convex hull property; float64 coefficients) or "projection" (L2 projection; no range
         guarantee). With ``bnd=`` the default is "bernstein" ("projection" where it is unsupported: mixed element
         types or variable order); a "bernstein" field with ``bnd=`` lives at the domain points on the boundary only
-        (the trace DoFs depend on no others), so its standardisation and map cost the trace, not the space.
+        (the trace DoFs depend on no others), so its standardisation, map and conversion to FE coefficients cost the
+        trace, not the space.
         Per call, ``points=`` (m x dim coordinates) gives values at any points instead
     order : quadrature order of the "quadrature" representation (use the order your forms integrate with)
     std : pointwise standardisation of copula families ("auto" | "exact" | "lowrank" | "mc" | array), see
@@ -516,16 +519,19 @@ class Generator:
         return self._gaussians[key][1]
 
     def _gaussian_at_points(self, gauss, std=None, order=None, points=None, standardize_by=None,
-                            bernstein=False, bnd=None) -> GaussianAtPoints:
+                            bernstein=False, part=None) -> GaussianAtPoints:
+        """``part``: with ``bernstein``, the DoFs whose domain points the values are taken at
+        (:meth:`BernsteinForm.restricted`, e.g. a trace's); None: every domain point."""
         std = self.std if std is None else std
         order = self.order if order is None else order
         standardize_by = self.standardize_by if standardize_by is None else standardize_by
+        part = None if part is None else np.unique(np.asarray(part, dtype=np.int64))
         key = (id(gauss), order, std if isinstance(std, str) or std is None else id(std), _freeze(points),
-               standardize_by, bernstein, None if bnd is None else str(bnd))
+               standardize_by, bernstein, _freeze(part))
         if key not in self._points:
             form = self.bernstein_form(gauss.space) if bernstein else None
-            if form is not None and bnd is not None:  # [bnd] only the domain points the trace DoFs depend on
-                form = form.restricted(boundary_sampler(gauss, bnd, cache=self._boundary).trace_dofs)
+            if form is not None and part is not None:  # only the domain points these DoFs depend on
+                form = form.restricted(part)
             pts = GaussianAtPoints(gauss, order=order, std=std, points=points, standardize_by=standardize_by,
                                    bernstein=form)
             self._points[key] = (gauss, std, pts)
@@ -592,10 +598,15 @@ class Generator:
         bernstein = rep == "bernstein" and points is None
         # [bnd] restricting a Bernstein field to a trace needs its values at the trace's domain points only
         trace = opts.get("bnd") if bernstein and opts.get("bnd_values") is None else None
+        part_dofs = opts.pop("_bernstein_dofs", _TRACE)  # ngsrng.correlated: other points (None: all)
 
         def pts(**extra):
-            return self._gaussian_at_points(self.gaussian(**corr, **extra), std, order, points, standardize_by,
-                                            bernstein=bernstein, bnd=trace)
+            gauss = self.gaussian(**corr, **extra)
+            dofs = part_dofs
+            if dofs is _TRACE:  # [bnd]
+                dofs = None if trace is None else boundary_sampler(gauss, trace, cache=self._boundary).trace_dofs
+            return self._gaussian_at_points(gauss, std, order, points, standardize_by, bernstein=bernstein,
+                                            part=dofs if bernstein else None)
 
         def params(defaults):
             names = list(defaults)

@@ -323,8 +323,26 @@ def test_trace_fields_live_at_the_trace_points(mesh, monkeypatch):
     assert given.std_method == "given" and np.array_equal(given.std, fp.std[p.bernstein.rows])
     monkeypatch.setattr(GaussianAtPoints, "EXACT_STD_LIMIT", trace.size)  # the space is "large", its trace is not
     assert rng_for(fes).info("uniform", bnd="left")["standardisation"] == "exact"
-    with pytest.raises(ValueError, match="same bnd="):  # correlated components share their points
-        ngsrng.correlated([d, full], 0.5)
+
+
+def test_trace_conversion_is_local_and_exact(mesh):
+    """A trace field's FE coefficients come element by element from the trace's Bernstein coefficients: the same as
+    the global conversion of the whole field at the trace DoFs (to rounding), zero elsewhere, with a rounding
+    bound far below the range margin."""
+    from ngsrng.distributions.bernstein import BernsteinForm
+
+    fes = ngs.H1(mesh, order=3, dirichlet="bottom")
+    form = BernsteinForm(SpaceInfo(fes))
+    trace = boundary_dofs(fes, "left", free_only=False)
+    part = form.restricted(trace)
+    b = np.random.default_rng(0).uniform(-1, 20, (part.npoints, 4))
+    c, bound = part.to_coefficients(b)
+    full = np.zeros((form.npoints, 4))
+    full[part.rows] = b
+    ref, _ = form.to_coefficients(full)
+    np.testing.assert_allclose(c[trace], ref[trace], rtol=0, atol=1e-11 * np.abs(ref).max())
+    assert not np.delete(c, trace, axis=0).any()
+    assert np.all(bound < 1e-3 * 1e-9 * np.abs(b).max(axis=0))  # within the margin's 1000x safety factor
 
 
 def test_projection_dofs_are_not_the_copula_marginal(mesh):
