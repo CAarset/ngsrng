@@ -27,6 +27,7 @@ from .backend import (
     resolve_dtype,
     same_device,
     sparse_to_torch,
+    task_manager,
 )
 from .dense import DenseOf
 from .inplace import InPlace, as_tensor, chunks, default_work_values, write
@@ -628,7 +629,7 @@ class Gaussian(DenseOf, InPlace, Rebuildable):
             if self._threadsafe:  # one sample per thread, single-threaded kernels: bit for bit, any thread count
                 parallel_ranges(n, work, self._threads)
             else:
-                with ngs.TaskManager():  # one sample at a time with NGSolve's task parallelism inside (BDDC): repeats
+                with task_manager():  # one sample at a time with NGSolve's task parallelism inside (BDDC): repeats
                     work(0, n)           # to rounding, its threads add in a varying order
         return out
 

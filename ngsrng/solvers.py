@@ -17,6 +17,7 @@ from .backend import (
     parallel_ranges,
     retry_after_release,
     sparse_to_torch,
+    task_manager,
 )
 from .space import SpaceInfo, mass_form
 
@@ -79,7 +80,7 @@ class _NGSolveBase(Solver, Rebuildable):
         if self.threadsafe:
             parallel_ranges(xs.shape[1], work)
         else:
-            with ngs.TaskManager():
+            with task_manager():
                 work(0, xs.shape[1])
         res = torch.from_numpy(out.T).to(device=x.device, dtype=x.dtype)
         return res[:, 0] if squeeze else res
@@ -105,7 +106,7 @@ class NGSolveDirect(_NGSolveBase):
 
     def _assemble(self):
         a = self._bilinear_form()
-        with ngs.TaskManager():
+        with task_manager():
             a.Assemble()
             self.inv = a.mat.Inverse(self.space.freedofs, inverse=self.inverse)  # the SpaceInfo's free dofs
         self.mat = a.mat
@@ -146,7 +147,7 @@ class NGSolveCG(_NGSolveBase):
     def _assemble(self):
         a = self._bilinear_form()
         self.pre = ngs.Preconditioner(a, self.precond)
-        with ngs.TaskManager():
+        with task_manager():
             a.Assemble()
         self.mat = a.mat
 

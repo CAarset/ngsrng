@@ -8,6 +8,8 @@ import ngsolve.comp as comp
 import numpy as np
 import scipy.sparse as sp
 
+from .backend import task_manager
+
 
 def to_scipy(mat) -> sp.csr_matrix:
     vals, cols, ptr = mat.CSR()
@@ -32,7 +34,7 @@ def assemble(fes, form) -> sp.csr_matrix:
 def _assemble(fes, terms) -> sp.csr_matrix:
     a = ngs.BilinearForm(fes)
     a += terms
-    with ngs.TaskManager():
+    with task_manager():
         a.Assemble()
     return to_scipy(a.mat)
 

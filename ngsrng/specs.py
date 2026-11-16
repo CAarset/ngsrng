@@ -12,6 +12,8 @@ import ngsolve as ngs
 import numpy as np
 import torch
 
+from .backend import task_manager
+
 
 @dataclass
 class PDEPrecision:
@@ -267,7 +269,7 @@ class BaseMatrixApply:
         v = v[:, None] if v.ndim == 1 else v
         out = np.empty((len(free), v.shape[1]))
         xn = x.FV().NumPy()
-        with ngs.TaskManager():
+        with task_manager():
             for k in range(v.shape[1]):
                 xn[:] = 0.0
                 xn[free] = v[:, k]

@@ -252,18 +252,17 @@ class NormalStream:
     @classmethod
     def pool(cls):
         if cls._pool is None:
-            import os
-            from concurrent.futures import ThreadPoolExecutor
-
-            cls._pool = ThreadPoolExecutor(os.cpu_count())
+            cls._pool = ThreadPoolExecutor(available_threads(), thread_name_prefix="ngsrng-normal")
         return cls._pool
 
     def fill(self, out: np.ndarray):
-        """One sample's numbers (one key), chunks filled in parallel threads."""
+        """One sample's numbers (one key), chunks filled in parallel threads (at most ``available_threads()``; the
+        numbers do not depend on how many)."""
         ticket = self.reserve(1)
         nchunks = -(-len(out) // self.chunk)
-        if nchunks == 1:
-            self._job(out, ticket, 0, 0)
+        if nchunks == 1 or available_threads() == 1:
+            for j in range(nchunks):
+                self._job(out, ticket, 0, j)
         else:
             list(self.pool().map(lambda j: self._job(out, ticket, 0, j), range(nchunks)))
         return out
@@ -321,7 +320,7 @@ def numpy_blas_threads(n):
     if sel is None:
         yield
         return
-    with sel.limit(limits=int(n)):
+    with sel.limit(limits=min(int(n), available_threads())):
         yield
 
 
@@ -342,7 +341,7 @@ def blas_threads(n):
     if _ALL_BLAS[0] is None:
         yield
         return
-    with _ALL_BLAS[0].limit(limits=int(n)):
+    with _ALL_BLAS[0].limit(limits=min(int(n), available_threads())):
         yield
 
 
@@ -362,11 +361,108 @@ def _numpy_blas_controller():
 # ------------------------------------------------------------------ threads (CPU engine)
 
 
-def available_threads() -> int:
+NUM_THREADS_ENV = "NGSRNG_NUM_THREADS"
+_LIMIT = [None]  # set by set_num_threads
+
+
+def cpu_threads() -> int:
+    """The CPUs this process may run on (its affinity)."""
     try:
         return len(os.sched_getaffinity(0))
     except AttributeError:
         return os.cpu_count() or 1
+
+
+def _env_limit():
+    """The limit of NGSRNG_NUM_THREADS, or else of OMP_NUM_THREADS (its first entry), or None."""
+    for name in (NUM_THREADS_ENV, "OMP_NUM_THREADS"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            try:
+                n = int(value.split(",")[0])
+            except ValueError:
+                continue
+            if n > 0:
+                return n
+    return None
+
+
+def thread_limit():
+    """The configured thread limit: :func:`set_num_threads`, else NGSRNG_NUM_THREADS, else OMP_NUM_THREADS; None
+    without one."""
+    return _LIMIT[0] if _LIMIT[0] is not None else _env_limit()
+
+
+def available_threads() -> int:
+    """The threads ngsrng may use: the CPU affinity, capped by the configured limit (:func:`thread_limit`)."""
+    limit = thread_limit()
+    return max(1, min(cpu_threads(), limit)) if limit is not None else cpu_threads()
+
+
+def set_num_threads(n):
+    """Limit ngsrng to ``n`` threads, process-wide: its own thread pools (CPU-engine batches, normal numbers), NGSolve's
+    task manager in ngsrng's assembly and solves, and the BLAS, OpenMP and torch thread pools, which are lowered to
+    ``n`` where they use more (never raised: a smaller setting of their own stays). ``n=None`` removes ngsrng's own
+    limit (NGSRNG_NUM_THREADS or OMP_NUM_THREADS apply again, else the CPU affinity); the libraries keep their
+    lowered counts. Results do not depend on the number of threads (samples bit for bit on the CPU engine; set-ups
+    to rounding). The environment variable NGSRNG_NUM_THREADS has the same effect when set before ngsrng is imported.
+    """
+    if n is not None:
+        n = int(n)
+        if n < 1:
+            raise ValueError("the number of threads must be at least 1")
+    _LIMIT[0] = n
+    _reset_pools()
+    if n is not None:
+        limit_libraries(n)
+
+
+def get_num_threads() -> int:
+    """The number of threads ngsrng uses (:func:`available_threads`)."""
+    return available_threads()
+
+
+def limit_libraries(n):
+    """Lower the thread pools of the libraries ngsrng calls to at most n threads: every BLAS and OpenMP library
+    threadpoolctl finds (NumPy's and NGSolve's OpenBLAS, MKL, torch's OpenMP), torch's intra-op threads and
+    NGSolve's task manager (whose own setting cannot be read outside a task manager, so it is set to n)."""
+    n = int(n)
+    try:
+        from threadpoolctl import ThreadpoolController
+
+        for lib in ThreadpoolController().lib_controllers:
+            if lib.num_threads > n:
+                lib.set_num_threads(n)
+    except ImportError:
+        pass
+    if torch.get_num_threads() > n:
+        torch.set_num_threads(n)
+    import ngsolve as ngs
+
+    ngs.SetNumThreads(n)
+
+
+@contextmanager
+def task_manager():
+    """NGSolve's task manager for ngsrng's own parallel kernels (assembly, factorisations, BDDC), with at most
+    ``available_threads()`` threads when a limit is configured (:func:`thread_limit`). Inside a caller's task manager
+    it changes nothing: the caller's threads are used."""
+    import ngsolve as ngs
+
+    if thread_limit() is not None:
+        ngs.SetNumThreads(available_threads())  # no effect inside an active task manager
+    with ngs.TaskManager():
+        yield
+
+
+def _reset_pools():
+    """Shut down ngsrng's thread pools; they are made again on first use, with the current limit."""
+    for pool in _POOL:
+        pool.shutdown(wait=True)
+    _POOL.clear()
+    if NormalStream._pool is not None:
+        NormalStream._pool.shutdown(wait=True)
+        NormalStream._pool = None
 
 
 def available_memory() -> float | None:
@@ -416,7 +512,7 @@ def parallel_ranges(n: int, work, threads: int | None = None):
     if getattr(_IN_WORKER, "active", False):
         work(0, n)
         return
-    threads = min(available_threads() if threads is None else int(threads), n)
+    threads = min(available_threads() if threads is None else min(int(threads), available_threads()), n)
 
     def run(lo, hi):
         _IN_WORKER.active = True

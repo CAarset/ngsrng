@@ -22,7 +22,7 @@ import numpy as np
 import scipy.sparse as sp
 from ngsolve.comp import IntegrationRuleSpace
 
-from .backend import Rebuildable
+from .backend import Rebuildable, task_manager
 from .space import SpaceInfo, to_scipy
 
 
@@ -48,7 +48,7 @@ class QuadratureRule(Rebuildable):
         b += ngs.SymbolicBFI(self.irs.TrialFunction() * fes.TestFunction(), intrule=self.rule, simd_evaluate=False)
         lf = ngs.LinearForm(self.irs)
         lf += ngs.SymbolicLFI(self.irs.TestFunction(), intrule=self.rule, simd_evaluate=False)
-        with ngs.TaskManager():
+        with task_manager():
             b.Assemble()
             lf.Assemble()
         self.weights = lf.vec.FV().NumPy().copy()
