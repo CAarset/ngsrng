@@ -353,9 +353,8 @@ class BernsteinPart:
     The points are ``rows = form.dependence(dofs)``: exact, from the mesh topology. So a function sum_j b_j B_j has
     at ``dofs`` the coefficients of sum_{j in rows} b_j B_j, whatever the b_j at the other points: for the DoFs of a
     trace (``bnd=``), ``rows`` are the domain points on the boundary, and a pointwise field restricted to that
-    trace needs its values (and its standardisation) only there. :meth:`to_coefficients` returns every coefficient of
-    sum_{j in rows} b_j B_j; only those at ``dofs`` are the restricted field's (the others are those of a function
-    with zero Bernstein coefficients off ``rows``: the caller zeroes them, as ``bnd=`` does).
+    trace needs its values (and its standardisation) only there. :meth:`to_coefficients` gives the coefficients at
+    ``dofs`` (zero elsewhere, as ``bnd=`` keeps them) element by element, at the cost of the part, not of the space.
     """
 
     def __init__(self, form: BernsteinForm, dofs):
@@ -363,6 +362,8 @@ class BernsteinPart:
         self.rows = np.flatnonzero(np.asarray(form.dependence(self.dofs).sum(axis=0)).ravel())
         self.npoints = int(self.rows.size)
         self.evaluation = form.evaluation[self.rows].tocsr()  # (npoints x ndof): rows of the form's evaluation
+        self._map = None  # (T, resid): the conversion, made on first use (_local_map)
+        self._device = DeviceCache()
 
     @property
     def full_npoints(self) -> int:
@@ -374,22 +375,98 @@ class BernsteinPart:
         return values[self.rows]
 
     def dependence(self, dofs) -> sp.csr_matrix:
-        """As :meth:`BernsteinForm.dependence`, on this part's points (len(dofs) x npoints)."""
-        return self.form.dependence(dofs)[:, self.rows].tocsr()
+        """As :meth:`BernsteinForm.dependence`, on this part's points (len(dofs) x npoints); dofs outside the part's
+        depend on nothing (their coefficients are zero)."""
+        dofs = np.asarray(dofs, dtype=np.int64).ravel()
+        dep = self.form.dependence(dofs)[:, self.rows]
+        dep = (sp.diags(np.isin(dofs, self.dofs).astype(float)) @ dep).tocsr()
+        dep.eliminate_zeros()
+        return dep
 
     def cf_values(self, cf) -> np.ndarray:
         return self.form.cf_values(cf)[self.rows]
 
+    def _local_map(self):
+        """(T, resid), made on first use: T (len(dofs) x npoints, CSR) maps the Bernstein coefficients at this part's
+        points to the NGSolve coefficients at ``dofs``; resid (npoints,) bounds the conversion's rounding per unit
+        Bernstein coefficient (at the rule points of the elements used).
+
+        A coefficient of an FE function is that of its restriction to any element containing the coefficient's node,
+        and there the function is the polynomial sum_j b_j B_j: its local coefficients are the exact least-squares fit
+        of its values at the element's rule points (unisolvent for P_p / Q_p; the curved geometry enters through the
+        basis values at the points, as in the global conversion). One element per node of ``dofs``: the set-up costs
+        the boundary, not the space. Entries outside ``form.dependence`` (exact zeros, computed as rounding) are
+        dropped, and their size is added to resid."""
+        if self._map is not None:
+            return self._map
+        form = self.form
+        fes = form.space.fes
+        nodes, _ = form._nodes()
+        e = form.rule.evaluation_full
+        nq = form.bq.shape[1]
+        pos = np.full(form.npoints, -1)
+        pos[self.rows] = np.arange(self.npoints)
+        dep = form.dependence(self.dofs)  # (len(dofs) x npoints of the form), exact
+        verts = form.verts
+        flat = np.argsort(verts.ravel(), kind="stable")
+        starts = np.searchsorted(verts.ravel()[flat], np.arange(verts.max() + 2))
+        by_element, owner = {}, {}
+        for r, d in enumerate(self.dofs):
+            node = nodes[d]
+            if node not in owner:
+                if node[0] == "element":
+                    owner[node] = node[1]
+                else:  # an element having every vertex of the node
+                    cands = flat[starts[node[0]]:starts[node[0] + 1]] // verts.shape[1]
+                    owner[node] = next(int(t) for t in cands if set(node) <= set(verts[t].tolist()))
+            by_element.setdefault(owner[node], []).append(r)
+        rows, cols, vals = [], [], []
+        resid = np.zeros(self.npoints)
+        for t, members in by_element.items():
+            dn = np.asarray(fes.GetDofNrs(ngs.ElementId(ngs.VOL, t)), dtype=np.int64)
+            if (dn < 0).any():
+                raise NotImplementedError("a Bernstein part needs every element dof to be a dof of the space")
+            phi = e[t * nq:(t + 1) * nq][:, dn].toarray()  # (nq x nloc): the element's basis at its rule points
+            conv = np.linalg.lstsq(phi, form.bq.T, rcond=None)[0]  # local Bernstein -> local NGSolve coefficients
+            glob = form.local_to_global[t]
+            inside = pos[glob] >= 0
+            resid[pos[glob[inside]]] = np.maximum(resid[pos[glob[inside]]],
+                                                  np.abs(phi @ conv - form.bq.T).max(axis=0)[inside])
+            scale = np.abs(phi).max()
+            local = {int(g): k for k, g in enumerate(dn)}
+            for r in members:
+                row = conv[local[int(self.dofs[r])]]
+                keep = np.isin(glob, dep.indices[dep.indptr[r]:dep.indptr[r + 1]])
+                rows.append(np.full(int(keep.sum()), r))
+                cols.append(pos[glob[keep]])
+                vals.append(row[keep])
+                drop = ~keep & inside
+                resid[pos[glob[drop]]] += scale * np.abs(row[drop])
+        t_map = sp.csr_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
+                              shape=(self.dofs.size, self.npoints))
+        self._map = (t_map, resid)
+        return self._map
+
     def to_coefficients(self, b):
-        """Bernstein coefficients at this part's points (npoints, k) -> NGSolve coefficients (ndof, k) of
-        sum_{j in rows} b_j B_j, and the conversion's rounding measure (as :meth:`BernsteinForm.to_coefficients`)."""
+        """Bernstein coefficients at this part's points (npoints, k) -> NGSolve coefficients (ndof, k): those of
+        sum_{j in rows} b_j B_j at ``dofs``, zero elsewhere; and per column a bound of the conversion's rounding,
+        sum_j |b_j| resid_j (the role of the measured deviation in :meth:`BernsteinForm.to_coefficients`)."""
+        t_map, resid = self._local_map()
         if isinstance(b, torch.Tensor):
-            full = torch.zeros((self.form.npoints, b.shape[1]), dtype=torch.float64, device=b.device)
-            full[torch.from_numpy(self.rows).to(b.device)] = b.to(torch.float64)
-        else:
-            full = np.zeros((self.form.npoints, b.shape[1]))
-            full[self.rows] = b
-        return self.form.to_coefficients(full)
+            key = str(b.device)
+            if key not in self._device:
+                self._device[key] = (sparse_to_torch(t_map, b.device, torch.float64),
+                                     torch.from_numpy(resid).to(b.device),
+                                     torch.from_numpy(self.dofs).to(b.device))
+            tt, rt, dofs = self._device[key]
+            b = b.to(torch.float64)
+            c = torch.zeros((self.space.ndof, b.shape[1]), dtype=torch.float64, device=b.device)
+            c[dofs] = tt @ b
+            return c, rt @ b.abs()
+        b = np.asarray(b, dtype=float)
+        c = np.zeros((self.space.ndof, b.shape[1]))
+        c[self.dofs] = t_map @ b
+        return c, resid @ np.abs(b)
 
 
 class SymmetricFactor(Rebuildable):

@@ -45,7 +45,9 @@ Restricting and conditioning
     ``Gamma``, i.e. a usable random Dirichlet datum, and its law is the exact marginal for every family. A pointwise
     family in the Bernstein representation is built at the domain points on ``Gamma`` only: the trace DoFs depend on
     no others (:class:`~ngsrng.distributions.bernstein.BernsteinPart`), so its standardisation (``std="exact"``: one
-    application of the factor per point) and its pointwise map cost the trace, not the space.
+    application of the factor per point), its pointwise map and its conversion to FE coefficients (element by
+    element) cost the trace, not the space; the Gaussian draw itself is of the whole field.
+    ``ngsrng.correlated`` rebuilds it at the union of the points when its partners live elsewhere.
 ``bnd="name", bnd_values=g``
     The whole field conditioned on its trace being ``g``: ``u* = u - P (R u - g)``. Since ``(u, Ru)`` is jointly
     Gaussian and ``Cov(u - P R u, R u) = Sigma_{.,B} - P Sigma_BB = 0``, ``u - P R u`` is independent of the trace,
