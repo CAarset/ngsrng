@@ -129,6 +129,11 @@ class BernsteinForm:
     def __getstate__(self):  # the operators are rebuilt on first use (P is about as large as the rule's matrices)
         return {**self.__dict__, "_ops": None}
 
+    def restricted(self, dofs) -> "BernsteinPart":
+        """The part of this form that the NGSolve coefficients ``dofs`` depend on (e.g. the DoFs of a trace): see
+        :class:`BernsteinPart`. Not kept here (the part refers to the form: no reference cycle); callers cache it."""
+        return BernsteinPart(self, np.unique(np.asarray(dofs, dtype=np.int64)))
+
     # ---------------------------------------------------------------- reference element
 
     def _lattice(self):
@@ -339,6 +344,52 @@ class BernsteinForm:
         resid = torch.cat([(evaluation @ c[:, j:j + step] - p @ b[:, j:j + step]).abs().amax(dim=0)
                            for j in range(0, b.shape[1], step)])
         return c, resid
+
+
+class BernsteinPart:
+    """The domain points of a :class:`BernsteinForm` that the NGSolve coefficients ``dofs`` depend on, with the
+    form's interface on those points only (a field built on it lives at them).
+
+    The points are ``rows = form.dependence(dofs)``: exact, from the mesh topology. So a function sum_j b_j B_j has
+    at ``dofs`` the coefficients of sum_{j in rows} b_j B_j, whatever the b_j at the other points: for the DoFs of a
+    trace (``bnd=``), ``rows`` are the domain points on the boundary, and a pointwise field restricted to that
+    trace needs its values (and its standardisation) only there. :meth:`to_coefficients` returns every coefficient of
+    sum_{j in rows} b_j B_j; only those at ``dofs`` are the restricted field's (the others are those of a function
+    with zero Bernstein coefficients off ``rows``: the caller zeroes them, as ``bnd=`` does).
+    """
+
+    def __init__(self, form: BernsteinForm, dofs):
+        self.form, self.dofs, self.space = form, np.asarray(dofs, dtype=np.int64), form.space
+        self.rows = np.flatnonzero(np.asarray(form.dependence(self.dofs).sum(axis=0)).ravel())
+        self.npoints = int(self.rows.size)
+        self.evaluation = form.evaluation[self.rows].tocsr()  # (npoints x ndof): rows of the form's evaluation
+
+    @property
+    def full_npoints(self) -> int:
+        """The number of domain points of the whole form."""
+        return self.form.npoints
+
+    def at_rows(self, values):
+        """Values at every domain point of the form (full_npoints, ...) restricted to this part's points."""
+        return values[self.rows]
+
+    def dependence(self, dofs) -> sp.csr_matrix:
+        """As :meth:`BernsteinForm.dependence`, on this part's points (len(dofs) x npoints)."""
+        return self.form.dependence(dofs)[:, self.rows].tocsr()
+
+    def cf_values(self, cf) -> np.ndarray:
+        return self.form.cf_values(cf)[self.rows]
+
+    def to_coefficients(self, b):
+        """Bernstein coefficients at this part's points (npoints, k) -> NGSolve coefficients (ndof, k) of
+        sum_{j in rows} b_j B_j, and the conversion's rounding measure (as :meth:`BernsteinForm.to_coefficients`)."""
+        if isinstance(b, torch.Tensor):
+            full = torch.zeros((self.form.npoints, b.shape[1]), dtype=torch.float64, device=b.device)
+            full[torch.from_numpy(self.rows).to(b.device)] = b.to(torch.float64)
+        else:
+            full = np.zeros((self.form.npoints, b.shape[1]))
+            full[self.rows] = b
+        return self.form.to_coefficients(full)
 
 
 class SymmetricFactor(Rebuildable):

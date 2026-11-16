@@ -53,7 +53,7 @@ from .backend import (
     same_device,
     sparse_to_torch,
 )
-from .boundary import attach_boundary  # [bnd] boundary (trace) sampling: ngsrng/boundary.py
+from .boundary import attach_boundary, boundary_sampler  # [bnd] boundary (trace) sampling: ngsrng/boundary.py
 from .correlation import MaternCorrelation, matern
 from .distributions.bernstein import BernsteinForm, default_ok
 from .distributions.expansion import KLField
@@ -364,11 +364,13 @@ class Generator:
         marginals there), "bernstein" (an FE function whose values stay inside the family's range at every point:
         Bernstein-Bezier convex hull property; float64 coefficients) or "projection" (L2 projection; no range
         guarantee). With ``bnd=`` the default is "bernstein" ("projection" where it is unsupported: mixed element
-        types or variable order).
+        types or variable order); a "bernstein" field with ``bnd=`` lives at the domain points on the boundary only
+        (the trace DoFs depend on no others), so its standardisation and map cost the trace, not the space.
         Per call, ``points=`` (m x dim coordinates) gives values at any points instead
     order : quadrature order of the "quadrature" representation (use the order your forms integrate with)
     std : pointwise standardisation of copula families ("auto" | "exact" | "lowrank" | "mc" | array), see
-        GaussianAtPoints and :func:`ngsrng.local_covariance`
+        GaussianAtPoints and :func:`ngsrng.local_covariance`. "exact" costs one application of the covariance's
+        factor per point (or per free dof, if there are fewer), so it is cheap at few points (``points=``, ``bnd=``)
     standardize_by : "prior" (default) or "own": for a conditioned Gaussian (posterior), pointwise families
         standardise with the prior's mean and std, so that e.g. ``uniform(correlation=post)`` is the posterior of the
         prior's uniform field; "own" uses the posterior's copula only
@@ -514,14 +516,16 @@ class Generator:
         return self._gaussians[key][1]
 
     def _gaussian_at_points(self, gauss, std=None, order=None, points=None, standardize_by=None,
-                            bernstein=False) -> GaussianAtPoints:
+                            bernstein=False, bnd=None) -> GaussianAtPoints:
         std = self.std if std is None else std
         order = self.order if order is None else order
         standardize_by = self.standardize_by if standardize_by is None else standardize_by
         key = (id(gauss), order, std if isinstance(std, str) or std is None else id(std), _freeze(points),
-               standardize_by, bernstein)
+               standardize_by, bernstein, None if bnd is None else str(bnd))
         if key not in self._points:
             form = self.bernstein_form(gauss.space) if bernstein else None
+            if form is not None and bnd is not None:  # [bnd] only the domain points the trace DoFs depend on
+                form = form.restricted(boundary_sampler(gauss, bnd, cache=self._boundary).trace_dofs)
             pts = GaussianAtPoints(gauss, order=order, std=std, points=points, standardize_by=standardize_by,
                                    bernstein=form)
             self._points[key] = (gauss, std, pts)
@@ -585,9 +589,13 @@ class Generator:
         if points is not None:
             points = np.atleast_2d(np.asarray(points, dtype=float))
 
+        bernstein = rep == "bernstein" and points is None
+        # [bnd] restricting a Bernstein field to a trace needs its values at the trace's domain points only
+        trace = opts.get("bnd") if bernstein and opts.get("bnd_values") is None else None
+
         def pts(**extra):
             return self._gaussian_at_points(self.gaussian(**corr, **extra), std, order, points, standardize_by,
-                                            bernstein=rep == "bernstein" and points is None)
+                                            bernstein=bernstein, bnd=trace)
 
         def params(defaults):
             names = list(defaults)
@@ -802,7 +810,8 @@ class Generator:
 
         ``bnd="name"`` restricts the draw to the DoFs of the named boundary: the sample is zero at every DoF whose
         basis function vanishes there, and its trace is an exact draw of the boundary marginal of the field, for
-        every family and representation (ngsrng/boundary.py). With ``bnd_values=g`` it instead draws the whole field
+        every family and representation (ngsrng/boundary.py). A pointwise family in the "bernstein" representation
+        then works at the boundary's domain points only. With ``bnd_values=g`` it instead draws the whole field
         conditioned on the prescribed trace g (affine Gaussian fields), exactly.
         """
         name = _canonical(name)

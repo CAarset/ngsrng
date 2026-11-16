@@ -7,6 +7,7 @@ fails cleanly before the kernel OOM killer picks a victim.
 """
 
 import argparse
+import copy
 import json
 import math
 import os
@@ -608,7 +609,21 @@ def run_covariance(task: Task, ctx: CovarianceContext, rec: dict):
     t = time.perf_counter()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        if kind == "variance":
+        if kind == "variance" and COVARIANCE_VARIANCE[name][0] == "points":
+            from ngsrng.covariance import variance_at_points
+
+            idx = np.unique(np.linspace(0, ctx.eval.shape[0] - 1, COVARIANCE_VARIANCE[name][1]["m"]).astype(int))
+            # a shallow copy has its own (empty) cache: measured are the m applications, not the reference's cached
+            # local covariance
+            r = variance_at_points(copy.copy(sources[source]), ctx.eval[idx], compute=compute)
+            if sync:
+                sync()
+            rec.update(setup_s=time.perf_counter() - t, applications=r.applications, method_used=r.method,
+                       compute=compute)
+            if ref is not None:
+                rel = np.abs(r.values / ref[0][idx] - 1)
+                rec.update(rel_err_rms=float(np.sqrt(np.mean(rel**2))), rel_err_max=float(rel.max()))
+        elif kind == "variance":
             method, opts = COVARIANCE_VARIANCE[name]
             lc = ngsrng.local_covariance(sources[source], method, seed=1, compute=compute, **opts)
             if sync:

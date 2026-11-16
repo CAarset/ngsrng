@@ -378,6 +378,8 @@ def covariance_section(df):
     out = [
         "## 3d. Covariance diagnostics: pointwise variance k(x, x) and trace tr(C) (Matern A^-2 prior, posterior)\n",
         "Variance: exact = local covariance from all columns (prior) or prior + exact low-rank update (posterior); "
+        "exact-100-points = the exact variance at 100 of the quadrature points only (one application of L^T per "
+        "point: what std='exact' costs at few points or on a trace); "
         "lowrank = exact randomised low-rank part + Monte Carlo residual; mc = Monte Carlo. Relative errors at the "
         "quadrature points against the exact local covariance. Trace: relative error against the exact trace; "
         "applications = applications of L or L^T. On a GPU, '-host' = the variance set-up with NumPy on the host "

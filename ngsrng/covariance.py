@@ -486,6 +486,90 @@ def _local_covariance(src, method, prior_method, rank, samples, power_iterations
     return lc
 
 
+@dataclass
+class PointVariances:
+    """Exact variances (E Sigma E^T)_ii at m points (see :func:`variance_at_points`), and how they were obtained."""
+
+    values: np.ndarray
+    method: str
+    applications: int
+
+
+def variance_at_points(source, e, *, fes=None, convention=None, compute="auto") -> PointVariances:
+    """The exact variances k_h(x_i, x_i) = (E Sigma E^T)_ii at m points, from their evaluation matrix ``e`` (m x
+    nfree, on the free dofs), at the cost of the points rather than of the space:
+
+    - finite rank, or an exact local covariance already computed (cached on the source): from it, no applications;
+    - fewer points than free dofs: with a factor Sigma = L L^T, the squared norms of the columns of L^T E^T (one
+      application of L^T per point); otherwise the columns Sigma E^T (one application of Sigma per point). Batched,
+      and on the source's device with ``compute`` as in :func:`local_covariance` (only the m values come back);
+    - otherwise the exact local covariance (n_free applications, cached on the source, so other point sets of the
+      same source reuse it).
+
+    The routes agree to rounding. Results are cached on the source per evaluation matrix."""
+    src = as_covariance(source, fes, convention, compute)
+    e = sp.csr_matrix(e, dtype=np.float64, copy=True)  # canonicalised below, in place
+    if e.shape[1] != src.space.nfree:
+        raise ValueError(f"the evaluation matrix has {e.shape[1]} columns, the source {src.space.nfree} free dofs")
+    e.sum_duplicates()
+    e.sort_indices()
+    key = ("at points", e.shape, _digest(e), str(src.device) if src.device is not None else "host")
+    if key in src.cache:
+        return src.cache[key]
+    m, n = e.shape
+    known = _cached_exact(src)
+    if known is None and (src.lowrank is not None or m >= n):
+        known = local_covariance(src, "exact")
+    if known is not None:
+        out = PointVariances(known.values(e), known.method, 0)
+    else:
+        with numpy_blas_threads(src.blas):
+            out = PointVariances(_columns_at(src, e), f"exact ({'L^T' if src.has_factor else 'Sigma'} E^T at {m} "
+                                 "points)", m)
+    src.cache[key] = out
+    return out
+
+
+def _digest(e: sp.csr_matrix) -> str:
+    import hashlib
+
+    h = hashlib.blake2b(digest_size=20)
+    for a in (e.indptr, e.indices, e.data):
+        h.update(np.ascontiguousarray(a).tobytes())
+    return h.hexdigest()
+
+
+def _cached_exact(src):
+    """An exact local covariance of ``src`` that is already computed (any device), or None."""
+    for key, lc in src.cache.items():
+        if isinstance(lc, LocalCovariance) and lc.exact and (key[0] == "exact" or key[:2] == ("update", "exact")):
+            return lc
+    return None
+
+
+def _columns_at(src, e) -> np.ndarray:
+    """diag(E Sigma E^T), a block of points at a time: with a factor Sigma = L L^T the squared column norms of
+    L^T E^T (one application of L^T per point, sums of squares); otherwise from the columns Sigma E^T, of which only
+    the rows the block's points read are kept (and, on a device, come back)."""
+    m, n = e.shape
+    et = e.T.tocsc()
+    v = np.empty(m)
+    dev = src.device
+    step = block_columns(n, src.nrand or 0)
+    for i0 in range(0, m, step):
+        i1 = min(i0 + step, m)
+        blk = et[:, i0:i1].toarray()
+        if src.has_factor:
+            y = src.tlt(_up(blk, dev)) if dev is not None else src.lt(blk)
+            v[i0:i1] = _np((y * y).sum(0)) if dev is not None else np.einsum("ij,ij->j", y, y)
+            continue
+        rows = e[i0:i1]
+        read = np.unique(rows.indices)
+        cols = np.asarray(src.sigma(blk))[read]  # operator covariances act on NumPy blocks (no device)
+        v[i0:i1] = np.asarray(rows[:, read].multiply(cols.T).sum(axis=1)).ravel()
+    return v
+
+
 def pointwise_variance(source, method="auto", **kwargs) -> ngs.GridFunction:
     """The pointwise variance k_h(x, x) of a random function as a GridFunction of L2(order 2p) (exact for the
     exact methods; see :func:`local_covariance` for the methods and options)."""

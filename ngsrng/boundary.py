@@ -42,7 +42,10 @@ Restricting and conditioning
 ----------------------------
 ``bnd="name"``
     Sample, then keep the trace (DoFs off ``Gamma`` zeroed). The result is a finite element function supported on
-    ``Gamma``, i.e. a usable random Dirichlet datum, and its law is the exact marginal for every family.
+    ``Gamma``, i.e. a usable random Dirichlet datum, and its law is the exact marginal for every family. A pointwise
+    family in the Bernstein representation is built at the domain points on ``Gamma`` only: the trace DoFs depend on
+    no others (:class:`~ngsrng.distributions.bernstein.BernsteinPart`), so its standardisation (``std="exact"``: one
+    application of the factor per point) and its pointwise map cost the trace, not the space.
 ``bnd="name", bnd_values=g``
     The whole field conditioned on its trace being ``g``: ``u* = u - P (R u - g)``. Since ``(u, Ru)`` is jointly
     Gaussian and ``Cov(u - P R u, R u) = Sigma_{.,B} - P Sigma_BB = 0``, ``u - P R u`` is independent of the trace,
@@ -216,6 +219,11 @@ class BoundarySampler(Rebuildable):
         self._q = None
         self._qblocks = None
         self.info = {"name": self.name, "n_bnd": self.n_bnd, "dofs": self.dofs.copy()}
+
+    @property
+    def trace_dofs(self) -> np.ndarray:
+        """Every DoF with a trace on the boundary, free or fixed by ``dirichlet=``: those that restriction keeps."""
+        return np.setdiff1d(np.arange(self.fes.ndof), self._off)
 
     @property
     def _small(self) -> bool:
@@ -520,6 +528,18 @@ def _latent(field):
                               "whose DoFs are the sample's finite element coefficients")
 
 
+def boundary_sampler(gauss, name, cache=None) -> BoundarySampler:
+    """The :class:`BoundarySampler` of ``gauss`` on the boundary ``name``, from ``cache`` if it has one.
+
+    ``cache``: {(id(gauss), name): (gauss, sampler)} -- a sampler's set-up (trace DoFs, and for conditioning the n_B
+    applications of Sigma behind Sigma_BB) depends on the law only, so fields of one Gaussian share it."""
+    hit = None if cache is None else cache.get((id(gauss), str(name)))
+    sampler = hit[1] if hit is not None else BoundarySampler(gauss, name)
+    if cache is not None:
+        cache[(id(gauss), str(name))] = (gauss, sampler)
+    return sampler
+
+
 def attach_boundary(field, name, values=None, cache=None):
     """Attach the ``bnd=`` specification of a freshly built field (called by :class:`ngsrng.Generator`).
 
@@ -537,12 +557,7 @@ def attach_boundary(field, name, values=None, cache=None):
                          "quadrature points, which have no DoF trace. Use representation='bernstein' (or "
                          "'projection'), which returns coefficients.")
     gauss, affine = _latent(field)
-    # ``cache``: {(id(gauss), name): (gauss, sampler)} -- a sampler's set-up (trace DoFs, and for conditioning the
-    # n_B applications of Sigma behind Sigma_BB) depends on the law only, so fields of one Gaussian share it
-    hit = None if cache is None else cache.get((id(gauss), str(name)))
-    sampler = hit[1] if hit is not None else BoundarySampler(gauss, name)
-    if cache is not None:
-        cache[(id(gauss), str(name))] = (gauss, sampler)
+    sampler = boundary_sampler(gauss, name, cache)
     if values is not None:
         if not affine:
             raise NotImplementedError(

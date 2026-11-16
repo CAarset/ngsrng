@@ -102,7 +102,7 @@ def point_values(gauss) -> str:
 class GaussianAtPoints(Rebuildable):  # pickles; the NGSolve evaluation matrix is made on first use
     """Values of a Gaussian random function at points: the quadrature points of its space (default), any physical
     ``points`` (m x dim), or the domain points of a :class:`~ngsrng.distributions.bernstein.BernsteinForm`
-    (``bernstein=``).
+    (``bernstein=``; or of a :class:`~ngsrng.distributions.bernstein.BernsteinPart`, e.g. those of a trace).
 
     ``standardize_by``: whose pointwise mean and standard deviation standardise the values,
     z = (g - m_ref) / std_ref:
@@ -114,10 +114,12 @@ class GaussianAtPoints(Rebuildable):  # pickles; the NGSolve evaluation matrix i
 
     ``std``: how std_ref is obtained (all through :func:`ngsrng.covariance.local_covariance`, cached on the
     reference Gaussian):
-    - "auto": "exact" when that is cheap (finite-rank Gaussians, up to ``EXACT_STD_LIMIT`` free dofs), "lowrank"
-      beyond;
-    - "exact": sqrt(diag(E Sigma E^T)) from the entries of Sigma in the pattern of M: exact. Free for finite-rank
-      Gaussians; otherwise one application of L and L^T per free dof (batched), so meant for moderate problems;
+    - "auto": "exact" when that is cheap (finite-rank Gaussians; up to ``EXACT_STD_LIMIT`` points or free dofs),
+      "lowrank" beyond;
+    - "exact": sqrt(diag(E Sigma E^T)), exact (:func:`ngsrng.covariance.variance_at_points`). Free for finite-rank
+      Gaussians; otherwise one application of L^T per point when there are fewer points than free dofs (a few user
+      points, the domain points of a trace), else one of L and L^T per free dof (the entries of Sigma in the pattern
+      of M); batched either way;
     - "lowrank": the exact variance of a randomised rank-200 part plus a 64-sample Monte Carlo estimate of the rest
       (unbiased, with an error estimate; ~1400 applications, far more accurate than "mc" for smooth fields);
     - "mc": estimated from ``mc_samples`` samples (relative error of the standard deviation ~ 1/sqrt(2 mc_samples));
@@ -159,7 +161,8 @@ class GaussianAtPoints(Rebuildable):  # pickles; the NGSolve evaluation matrix i
         self.device_capable = self.torch_device is not None and self.torch_device.type != "cpu"
         self._device = DeviceCache()  # evaluation matrices, the projection's operators, per device and dtype
         if isinstance(std, str) and std == "auto":
-            cheap = hasattr(self.reference, "rinv") or self.reference.space.nfree <= self.EXACT_STD_LIMIT
+            applications = min(self.npoints, self.reference.space.nfree)  # of Sigma, for "exact"
+            cheap = hasattr(self.reference, "rinv") or applications <= self.EXACT_STD_LIMIT
             std = "exact" if cheap else "lowrank"
         self.std_method = std if isinstance(std, str) or std is None else "given"
         self.std = self._std(std, mc_samples)
@@ -186,15 +189,27 @@ class GaussianAtPoints(Rebuildable):  # pickles; the NGSolve evaluation matrix i
         arr = np.asarray(value, dtype=float)
         if arr.ndim == 0:
             return float(arr)
+        arr = self._own_points(arr)
         if arr.shape[0] != self.npoints:
             raise ValueError(f"spatially varying parameters need one value per point ({self.npoints})")
         return arr.reshape(self.npoints, 1)
+
+    def _own_points(self, arr):
+        """Values given at every domain point of the Bernstein form, restricted to this object's (fewer) points when
+        it lives on a part of the form (a trace); other arrays as they are."""
+        part = self.bernstein
+        if getattr(part, "full_npoints", self.npoints) != self.npoints and arr.shape[0] == part.full_npoints:
+            return part.at_rows(arr)
+        return arr
 
     def _std(self, std, mc_samples):
         if std is None:
             return None
         if isinstance(std, str) and std == "exact":
-            return np.sqrt(np.clip(self._local("exact").values(self._free_eval()), 0.0, None))
+            from ..covariance import variance_at_points
+
+            v = variance_at_points(self.reference, self._free_eval()).values
+            return np.sqrt(np.clip(v, 0.0, None))
         if isinstance(std, str) and std == "lowrank":
             lc = self._local("lowrank", rank=200, samples=64)
             v, se = lc.values(self._free_eval(), stderr=True)
@@ -230,7 +245,7 @@ class GaussianAtPoints(Rebuildable):  # pickles; the NGSolve evaluation matrix i
                 x = self.eval_full @ full - self.center[:, None]
                 acc += (x**2).sum(axis=1)
             return np.sqrt(acc / mc_samples)
-        std = np.asarray(std, dtype=float)
+        std = self._own_points(np.asarray(std, dtype=float))
         if std.shape != (self.npoints,):
             raise ValueError("std must have one entry per point")
         return std
