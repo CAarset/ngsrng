@@ -389,19 +389,44 @@ def test_variance_at_points_costs_the_points(monkeypatch):
     assert variance_at_points(prior, eo).applications == 0  # from the now cached local covariance
 
 
-def test_functional_covariance_is_g_sigma_gt():
+def test_functional_covariance_is_g_sigma_gt(monkeypatch):
+    """Exact for Gaussians, posteriors and finite-rank models (with a factor: Y^T Y, Y = L^T G^T, one application
+    of L^T per functional, never Sigma itself) and for covariances given as operators (Sigma G^T)."""
+    import ngsrng.covariance as cv
+
     fes = ngs.H1(ngs.Mesh(ngs.unit_square.GenerateMesh(maxh=0.2)), order=2, dirichlet="left")
     _, g = _setup(fes)
     sigma = _dense(g)
     pts = _points(fes, 12)
     gmat = ngsrng.observation_operator(fes, points=pts)[:, g.space.free].toarray()
-    np.testing.assert_allclose(ngsrng.functional_covariance(g, points=pts), gmat @ sigma @ gmat.T, rtol=1e-10,
-                               atol=1e-14)
     post = g.condition(points=pts[:5], noise=0.01)
     lf = ngs.LinearForm(ngs.x * fes.TestFunction() * ngs.dx).Assemble()
-    c = ngsrng.functional_covariance(post, functionals=[lf], averages=(pts[5:8], 0.1))
     gp = ngsrng.observation_operator(fes, functionals=[lf], averages=(pts[5:8], 0.1))[:, g.space.free].toarray()
+    kl = ngsrng.karhunen_loeve(g, 20)
+    real = cv.as_covariance
+
+    def no_sigma(*args, **kwargs):  # the factor route never applies Sigma
+        src = real(*args, **kwargs)
+        if src.has_factor:
+            src.sigma = lambda y: pytest.fail("Sigma was applied")
+        return src
+
+    monkeypatch.setattr(cv, "as_covariance", no_sigma)
+    np.testing.assert_allclose(ngsrng.functional_covariance(g, points=pts), gmat @ sigma @ gmat.T, rtol=1e-10,
+                               atol=1e-14)
+    c = ngsrng.functional_covariance(post, functionals=[lf], averages=(pts[5:8], 0.1))
     np.testing.assert_allclose(c, gp @ _dense(post) @ gp.T, rtol=1e-9)
+    np.testing.assert_allclose(ngsrng.functional_covariance(kl, points=pts), gmat @ _dense(kl) @ gmat.T, rtol=1e-10,
+                               atol=1e-14)
+    monkeypatch.setattr(cv, "as_covariance", real)
+    u, v = fes.TnT()
+    a = ngs.BilinearForm(ngs.grad(u) * ngs.grad(v) * ngs.dx + 10 * u * v * ngs.dx).Assemble()
+    mass = ngs.BilinearForm(u * v * ngs.dx).Assemble()
+    ainv = a.mat.Inverse(fes.FreeDofs())
+    op = ainv @ mass.mat @ ainv
+    sigma_op = as_covariance(op, fes=fes).sigma(np.eye(g.space.nfree))
+    np.testing.assert_allclose(ngsrng.functional_covariance(op, fes=fes, points=pts), gmat @ sigma_op @ gmat.T,
+                               rtol=1e-10, atol=1e-14)
 
 
 @pytest.mark.parametrize("kind", ["H1", "L2"])
