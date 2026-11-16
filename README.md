@@ -204,6 +204,10 @@ generator reports its choices: `rng.info(...)` and `Gaussian(...).plan`.
 - **A `BilinearForm` is a precision, not a covariance.** ngsrng warns if you pass one as a covariance.
 - **Stationary Matérn fields** need a scalar space with one element type. Their correlations use Euclidean
   distance, also across holes.
+- **Threads.** ngsrng uses every CPU the process may run on. `NGSRNG_NUM_THREADS=n` (set before the import) or
+  `ngsrng.set_num_threads(n)` limits ngsrng, NGSolve, torch and BLAS to n threads, for example 1 in each of
+  several worker processes. `OMP_NUM_THREADS` is honoured too. Results are the same for any number of threads,
+  up to rounding.
 - **Reproducibility.**
   - Same seed on the same machine: identical up to rounding.
   - Across machines, solvers or versions: the same law, but different numbers.
