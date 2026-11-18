@@ -212,6 +212,22 @@ def test_range(space, rng):
     assert -1.0 <= vals.min() and vals.max() <= 20.0
 
 
+def test_a_float32_sampler_multiplies_in_float32_and_draws_the_float64_samplers_values(space, rng):
+    """A Bernstein (log-normal) law: the float32 sampler's dense product is float32 (no float64 factor on the device),
+    its map and conversion float64, so from the same noise it draws the float64 sampler's values up to the product's
+    float32 rounding, and stays in the support."""
+    d = rng.distribution("lognormal", 0.0, 1.0, representation="bernstein")
+    s64, s32 = d.dense(dtype="float64", seed=3), d.dense(dtype="float32", seed=3)
+    y64, y32 = s64.sample(400), s32.sample(400)
+    assert y32.dtype == np.float32
+    np.testing.assert_allclose(y32, y64, rtol=1e-4, atol=1e-5 * np.abs(y64).max())
+    full = np.zeros((400, space.ndof))
+    full[:, s32.dofs] = y32
+    assert (basis_at(space, np.random.default_rng(1).uniform(0, 1, (500, 2))) @ full.T).min() > 0  # the field's values
+    linear = [v for k, v in s32._device.items() if k[0] == "linear"]
+    assert [lin["factor"].dtype for lin in linear] == [torch.float32]
+
+
 def test_marginals_match_the_route(space, rng):
     """End to end: the marginal at a trace vertex is uniform(-1, 20), as the route's (the joint law is checked exactly
     above: latent covariance and the route's map)."""

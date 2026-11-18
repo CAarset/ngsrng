@@ -51,6 +51,10 @@ Every family it covers is a pointwise map of one latent Gaussian, followed by li
 - **The Bernstein range guarantee** holds as in ``d.sample()``: the map comes before the linear conversion, and the
   values are pulled inside the family's range by a relative margin of at least 1000 times the conversion's measured
   rounding (summed over S, so it bounds every sample) before it.
+- **Precision**: the dense product w = m + F z, the cost of a draw, runs in the sampler's dtype. Point values in the
+  projection and Bernstein representations, whose conversions to coefficients are ill-conditioned (the margin above
+  is measured in float64), are drawn from float64 noise and mapped and converted in float64: a float32 sampler's
+  draws are then the float64 sampler's up to the float32 rounding of the product.
 
 The law is that of ``d.sample()`` (its marginal at the chosen DoFs, or its image under the observation), up to the
 cut and rounding; the draws themselves differ (another random stream). Data drawn by either route can be mixed. Not
@@ -354,17 +358,21 @@ class DenseSampler(InPlace):
         return self._device[key]
 
     def _transform(self, z):
-        """Samples (one (n, m) tensor per component) from standard normals z (n, k r) on the device."""
+        """Samples (one (n, m) tensor per component) from standard normals z (n, k r) on the device: the dense
+        product w = m + F z, the cost of a draw, in the sampler's dtype; the family's map and the representation's
+        conversion in z's, the work dtype (_work_dtype: float64 for point values in the projection and Bernstein
+        representations, whose conversions to coefficients are ill-conditioned)."""
         k, r = self.components, self.rank
         n = z.shape[0]
-        ops = self._ops(z.dtype)
-        z = z.reshape(n, k, r)
+        lin, comps = self._linear(self.dtype), self._conversions(z.dtype)
+        x = z.to(self.dtype).reshape(n, k, r)
         if k > 1:
-            z = torch.einsum("ij,njr->nir", ops["mix"], z)
+            x = torch.einsum("ij,njr->nir", lin["mix"], x)
         out = []
-        for i, c in enumerate(ops["components"]):
-            w = torch.addmm(c["mean"], z[:, i], ops["factor"].T) if r else c["mean"].expand(n, -1).clone()
-            v = self._map(i, c, w)
+        for i, c in enumerate(comps):
+            mean = lin["means"][i]
+            w = torch.addmm(mean, x[:, i], lin["factor"].T) if r else mean.expand(n, -1).clone()
+            v = self._map(i, c, w.to(z.dtype))
             a = c["out"]
             if a is None:
                 y = v
@@ -393,27 +401,36 @@ class DenseSampler(InPlace):
                 v = torch.maximum(v, bound + margin) if sign > 0 else torch.minimum(v, bound - margin)
         return v
 
-    def _ops(self, wd):
-        """The law's arrays on the device in the work dtype (made once per device and dtype)."""
-        key = (str(self.device), wd)
-        if key in self._device:
-            return self._device[key]
+    def _tensor(self, dt):
         dev = self.device
+        return lambda x: torch.as_tensor(np.asarray(x, dtype=np.float64)).to(dev, dt)
 
-        def t(x):
-            return torch.as_tensor(np.asarray(x, dtype=np.float64)).to(dev, wd)
+    def _linear(self, dt):
+        """The dense product's arrays on the device in dtype dt (made once per device and dtype): the factor, the
+        mixing of correlated components and the components' means."""
+        key = ("linear", str(self.device), dt)
+        if key not in self._device:
+            t = self._tensor(dt)
+            self._device[key] = {"factor": t(self.law["factor"]), "mix": t(self.law["mix"]),
+                                 "means": [t(spec["mean"]) for spec in self.law["components"]]}
+        return self._device[key]
 
-        comps = []
-        for spec in self.law["components"]:
-            a = spec["out"]
-            if a is not None:
-                a = sp.csr_matrix(a)
-                a = t(a.toarray()) if a.shape[0] * a.shape[1] <= DENSE_OUT else sparse_to_torch(a, dev, wd)
-            params = {k: (t(v) if isinstance(v, np.ndarray) else v) for k, v in spec["params"].items()}
-            comps.append({"mean": t(spec["mean"]), "params": params, "out": a,
-                          "clamp": _clamp_bounds(spec.get("support"), self.dtype, t),
-                          "pull": _pull_bounds(spec.get("pull"), t)})
-        self._device[key] = {"factor": t(self.law["factor"]), "mix": t(self.law["mix"]), "components": comps}
+    def _conversions(self, dt):
+        """The components' maps and conversions on the device in dtype dt (made once per device and dtype): the
+        maps' parameters, the output maps, the clamps and the Bernstein pulls."""
+        key = ("conversions", str(self.device), dt)
+        if key not in self._device:
+            dev, t = self.device, self._tensor(dt)
+            comps = []
+            for spec in self.law["components"]:
+                a = spec["out"]
+                if a is not None:
+                    a = sp.csr_matrix(a)
+                    a = t(a.toarray()) if a.shape[0] * a.shape[1] <= DENSE_OUT else sparse_to_torch(a, dev, dt)
+                params = {k: (t(v) if isinstance(v, np.ndarray) else v) for k, v in spec["params"].items()}
+                comps.append({"params": params, "out": a, "clamp": _clamp_bounds(spec.get("support"), self.dtype, t),
+                              "pull": _pull_bounds(spec.get("pull"), t)})
+            self._device[key] = comps
         return self._device[key]
 
     def _deliver(self, rows, n, output):
