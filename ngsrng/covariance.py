@@ -38,13 +38,37 @@ from .backend import compute_device, numpy_blas_threads, owned_cache, sparse_to_
 from .randomized import euclidean_orth, gram_orth, randomized_svd
 from .space import SpaceInfo, coefficient_vector
 
-# Largest free-dof count for which "auto" computes the local covariance exactly from all columns of Sigma (one
-# application per free dof) when nothing cheaper is known.
-EXACT_LIMIT = 4000
+# "auto" takes the exact method while it costs at most AUTO_RATIO times the applications (of L, L^T or Sigma) of the
+# estimate it would otherwise use: counted, not timed, so the choice (and the law of what depends on it, e.g. the
+# standardisation of pointwise families) is the same on every machine.
+AUTO_RATIO = 10
 CHUNK = 256
 # Values per dense temporary when Sigma is applied to many columns (256 MB in float64). Applying Sigma = L L^T to
 # CHUNK columns at once made noise-space blocks of nrand x 256 values, several GB for 1e5-1e6 dofs.
 BLOCK_VALUES = 2**25
+
+
+def exact_applications(src, points=None) -> int:
+    """Applications of L, L^T or Sigma the exact pointwise variances take: at ``points`` points when fewer than the free
+    dofs (one application of L^T, or of Sigma, per point), otherwise from all columns of Sigma (one application of
+    Sigma per free dof)."""
+    n = src.space.nfree
+    if points is not None and points < n:
+        return int(points)
+    return n * (2 if src.has_factor else 1)
+
+
+def lowrank_applications(src, rank, samples, power_iterations) -> int:
+    """Applications of L, L^T or Sigma of the "lowrank" local covariance (:func:`_basis`, plus the samples)."""
+    k = min(rank, src.space.nfree)
+    if src.has_factor and (src.nrand or 0) <= src.space.nfree:
+        return (2 * power_iterations + 3) * k + samples
+    return (2 if src.has_factor else 1) * (power_iterations + 2) * k + samples
+
+
+def auto_exact(exact, estimate) -> bool:
+    """Whether "auto" takes the exact method: its applications at most AUTO_RATIO times the estimate's."""
+    return exact <= AUTO_RATIO * estimate
 
 
 def block_columns(*rows) -> int:
@@ -423,8 +447,8 @@ def local_covariance(source, method="auto", *, fes=None, convention=None, rank=1
 
     ``method``:
 
-    - "auto": "exact" when that is cheap (finite rank; prior plus low-rank update, with the prior by "auto"; up to
-      ``EXACT_LIMIT`` free dofs), "lowrank" otherwise;
+    - "auto": "exact" when that is cheap (finite rank; prior plus low-rank update, with the prior by "auto"; at most
+      ``AUTO_RATIO`` times the applications of "lowrank"), "lowrank" otherwise;
     - "exact": exact. Finite rank: from the factor. Prior plus update: the prior's local covariance (exact, cached on
       the prior) plus the exact update. Otherwise all columns Sigma e_j: n_free applications of Sigma, batched;
     - "lowrank": a randomised basis Q of the dominant range (``rank`` columns, ``power_iterations`` subspace
@@ -445,7 +469,9 @@ def local_covariance(source, method="auto", *, fes=None, convention=None, rank=1
     src = as_covariance(source, fes, convention, compute)
     requested = method
     if method == "auto":
-        cheap = src.lowrank is not None or src.update is not None or src.space.nfree <= EXACT_LIMIT
+        cheap = src.lowrank is not None or src.update is not None or auto_exact(
+            exact_applications(src), lowrank_applications(src, rank, 32 if samples is None else samples,
+                                                          power_iterations))
         method = "exact" if cheap else "lowrank"
     if method not in ("exact", "lowrank", "mc"):
         raise ValueError("method must be 'auto', 'exact', 'lowrank' or 'mc'")
@@ -813,8 +839,9 @@ def covariance_trace(source, method="auto", *, fes=None, convention=None, probes
         if not src.has_factor:
             raise ValueError("a weighted trace needs a source with a factor Sigma = L L^T (a Gaussian, a low-rank "
                              "model or a posterior), not an apply-only covariance")
-    if method == "auto":
-        cheap = src.lowrank is not None or src.update is not None or src.space.nfree <= EXACT_LIMIT
+    if method == "auto":  # exact when the local covariance would be (it costs the same: the trace integrates it)
+        cheap = src.lowrank is not None or src.update is not None or auto_exact(
+            exact_applications(src), lowrank_applications(src, rank=100, samples=32, power_iterations=2))
         method = "exact" if cheap else "xnystrace"
     if method in ("exact", "variance"):
         lc = local_covariance(src, "exact" if method == "exact" else variance_method, seed=seed, **local_options)
