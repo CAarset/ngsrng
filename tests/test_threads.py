@@ -16,6 +16,8 @@ import pytest
 BUILD = r"""
 import json, os, sys, threading, time
 import ngsrng
+import ngsrng.resolution
+ngsrng.resolution.RESOLUTION_TOL = None  # a coarse mesh on purpose, as in conftest
 import ngsolve as ngs
 import numpy as np
 from netgen.geom2d import SplineGeometry

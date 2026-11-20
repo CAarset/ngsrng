@@ -112,9 +112,9 @@ import ngsrng                                  # import before ngsolve (see Good
 import ngsolve as ngs
 import numpy as np
 
-mesh = ngs.Mesh(ngs.unit_square.GenerateMesh(maxh=0.05))
+mesh = ngs.Mesh(ngs.unit_square.GenerateMesh(maxh=0.035))
 X = ngs.H1(mesh, order=2)
-rng = ngsrng.default_rng(X, seed=0, correlation=ngsrng.matern_correlation(0.2, nu=1))  # device="cuda" too
+rng = ngsrng.default_rng(X, seed=0, correlation=ngsrng.matern_correlation(0.3, nu=1))  # device="cuda" too
 
 u = rng.normal()                               # one sample: a GridFunction
 U = rng.normal(1.0, 0.5, size=100)             # (100, ndof) FE coefficients

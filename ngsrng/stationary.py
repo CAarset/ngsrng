@@ -483,7 +483,8 @@ class StationaryMatern(DenseOf, InPlace, Rebuildable):
     """
 
     def __init__(self, fes, length, nu=1.0, *, construction=None, method="auto", mean=None, seed=None, tol=1e-3,
-                 resolution=None, max_dense=MAX_DENSE, rtol=1e-7, method_options=None, device="cpu", engine=None):
+                 resolution=None, max_dense=MAX_DENSE, rtol=1e-7, method_options=None, device="cpu", engine=None,
+                 resolution_tol="default"):
         if construction not in CONSTRUCTIONS:
             raise ValueError("construction has no default: 'torus' (the Matérn SPDE on a periodic box around the "
                              "domain: exactly stationary, periodised Matérn, sparse) or 'restrict' (the Matérn "
@@ -521,6 +522,9 @@ class StationaryMatern(DenseOf, InPlace, Rebuildable):
         xyz = np.array([mesh.vertices[int(v)].point for v in corners], dtype=float)[:, :d]
         lo, hi = np.minimum(lo, xyz.min(0)), np.maximum(hi, xyz.max(0))
         h = _median_edge(mesh, active) if resolution is None else float(resolution)
+        from .resolution import check_resolution
+
+        check_resolution(fes, self.length, self.nu, h=h, tol=resolution_tol)  # the elements resolve the length
         if method is None:
             method = "dense" if len(points) <= max_dense else "fft"
         if method == "spde":

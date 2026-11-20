@@ -71,6 +71,8 @@ class MaternCorrelation:
     boundary: str = "neumann"
     beta: float | None = REQUIRED  # Robin coefficient (boundary="robin" only): a number, or None to estimate it
     options: dict = field(default_factory=dict)  # boundary="torus" / "restrict": options of StationaryMatern
+    # the largest relative error of the discrete field's pointwise variance accepted (ngsrng.resolution); None: none
+    resolution_tol: float | None | str = "default"
     # tuned coefficients per space, kept with the correlation so that pickled copies (worker processes) reuse them
     _tuned: dict = field(default_factory=dict, init=False, repr=False, compare=False)
 
@@ -135,7 +137,10 @@ class MaternCorrelation:
             from .stationary import StationaryMatern
 
             return StationaryMatern(fes, self.length, self.nu, construction=self.boundary, seed=seed, rtol=self.rtol,
-                                    **{"device": device, **self.options})
+                                    resolution_tol=self.resolution_tol, **{"device": device, **self.options})
+        from .resolution import check_resolution
+
+        check_resolution(fes, self.length, self.nu, tol=self.resolution_tol)
         d = fes.mesh.dim
         kappa = self.kappa()
         power = self.nu + d / 2
@@ -167,7 +172,7 @@ class MaternCorrelation:
 
 
 def matern(length: float, nu: float = 1.0, rtol: float = 1e-7, boundary: str = "neumann", beta=REQUIRED, *,
-           robin=REQUIRED, **options) -> MaternCorrelation:
+           robin=REQUIRED, resolution_tol="default", **options) -> MaternCorrelation:
     """Unit-variance Matern correlation with range ``length`` and smoothness ``nu`` (samples are C^(nu-epsilon)); either
     may be a law (a ``scipy.stats`` distribution), a random parameter drawn anew for every draw of a field (see the
     module docstring).
@@ -178,11 +183,16 @@ def matern(length: float, nu: float = 1.0, rtol: float = 1e-7, boundary: str = "
     ``.robin_tuning(fes)`` reports the estimate and the remaining deviation), or no boundary condition at all:
     "torus" or "restrict", the stationary field of :class:`ngsrng.StationaryMatern` (constant variance up to the
     boundary; ``options``: its ``method``, ``tol``, ``resolution``, ``max_dense``, ``method_options``).
+
+    ``resolution_tol``: bound to a space, the field checks that the mesh resolves its length (:mod:`ngsrng.resolution`:
+    the discrete field's pointwise variance within this relative error of the continuous field's; default
+    ``ngsrng.resolution.RESOLUTION_TOL`` = 1%) and raises otherwise; None: no check. A random length is checked at its
+    smallest value.
     """
     if robin is not REQUIRED:
         raise TypeError("robin= (a factor of kappa) was replaced by beta=, the Robin coefficient itself (beta = factor "
                         "* kappa with kappa = sqrt(8 nu) / length); beta=None estimates it for the space")
-    return MaternCorrelation(length, nu, rtol, boundary, beta, dict(options))
+    return MaternCorrelation(length, nu, rtol, boundary, beta, dict(options), resolution_tol)
 
 
 def bind(spec, fes):
