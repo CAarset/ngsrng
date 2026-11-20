@@ -15,6 +15,8 @@ import warnings
 import numpy as np
 import torch
 
+from .solvers import first_check
+
 
 class MultiShiftPCG:
     """Solve (Q + t_l M) x_l = b for all shifts t_l >= 0 at once, with preconditioner M^-1.
@@ -50,7 +52,7 @@ class MultiShiftPCG:
         alpha_old = torch.ones(k, dtype=b.dtype, device=b.device)
         beta_old = torch.zeros(k, dtype=b.dtype, device=b.device)
         active = torch.ones((len(self.shifts), k), dtype=torch.bool, device=b.device)
-        it = 0
+        it, start = 0, first_check(self.iterations)
         for it in range(1, self.maxiter + 1):
             qp = self.apply_q(p_seed)
             pqp = (p_seed * qp).sum(0)
@@ -73,7 +75,7 @@ class MultiShiftPCG:
             shifted_res = torch.sqrt(rz_new.clamp_min(0)) * zeta_new.abs() / bnorm  # (S, k)
             active = active & (shifted_res > 1e-3 * self.tol)
             zeta_old, zeta, alpha_old, beta_old, rz = zeta, zeta_new, alpha, beta, rz_new
-            if shifted_res.max() <= self.tol:
+            if it >= start and shifted_res.max() <= self.tol:
                 break
         else:
             warnings.warn(
