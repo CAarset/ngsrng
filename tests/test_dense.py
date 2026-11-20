@@ -213,9 +213,9 @@ def test_range(space, rng):
 
 
 def test_a_float32_sampler_multiplies_in_float32_and_draws_the_float64_samplers_values(space, rng):
-    """A Bernstein (log-normal) law: the float32 sampler's dense product is float32 (no float64 factor on the device),
-    its map and conversion float64, so from the same noise it draws the float64 sampler's values up to the product's
-    float32 rounding, and stays in the support."""
+    """A Bernstein (log-normal) law: the float32 sampler's dense product and closed-form map are float32 (no float64
+    factor on the device), its pull and conversion float64, so from the same (host) noise it draws the float64
+    sampler's values up to float32 rounding, and stays in the support."""
     d = rng.distribution("lognormal", 0.0, 1.0, representation="bernstein")
     s64, s32 = d.dense(dtype="float64", seed=3), d.dense(dtype="float32", seed=3)
     y64, y32 = s64.sample(400), s32.sample(400)
@@ -226,6 +226,25 @@ def test_a_float32_sampler_multiplies_in_float32_and_draws_the_float64_samplers_
     assert (basis_at(space, np.random.default_rng(1).uniform(0, 1, (500, 2))) @ full.T).min() > 0  # the field's values
     linear = [v for k, v in s32._device.items() if k[0] == "linear"]
     assert [lin["factor"].dtype for lin in linear] == [torch.float32]
+
+
+@pytest.mark.parametrize("lengths", [[3, 1, 3, 2], [1, 0, 7, 2, 2, 30, 1], [5] * 6])
+def test_output_maps_by_gathers(lengths):
+    """The device form of an output map is v A^T: dense, one padded bucket, buckets by powers of two, empty rows."""
+    gen = np.random.default_rng(0)
+    s = 40
+    rows = [sp.csr_matrix((gen.standard_normal(k), (np.zeros(k, int), gen.choice(s, k, replace=False))), shape=(1, s))
+            for k in lengths]
+    a = sp.vstack(rows).tocsr()
+    v = gen.standard_normal((9, s))
+    for dense_out in (0, 10**6):
+        old = dense_module.DENSE_OUT
+        dense_module.DENSE_OUT = dense_out
+        try:
+            y = dense_module._OutputMap(a, torch.device("cpu"), torch.float64)(torch.from_numpy(v)).numpy()
+        finally:
+            dense_module.DENSE_OUT = old
+        np.testing.assert_allclose(y, v @ a.toarray().T, rtol=1e-14, atol=1e-14)
 
 
 def test_marginals_match_the_route(space, rng):
