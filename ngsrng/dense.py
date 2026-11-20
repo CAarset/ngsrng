@@ -51,10 +51,14 @@ Every family it covers is a pointwise map of one latent Gaussian, followed by li
 - **The Bernstein range guarantee** holds as in ``d.sample()``: the map comes before the linear conversion, and the
   values are pulled inside the family's range by a relative margin of at least 1000 times the conversion's measured
   rounding (summed over S, so it bounds every sample) before it.
-- **Precision**: the dense product w = m + F z, the cost of a draw, runs in the sampler's dtype. Point values in the
-  projection and Bernstein representations, whose conversions to coefficients are ill-conditioned (the margin above
-  is measured in float64), are drawn from float64 noise and mapped and converted in float64: a float32 sampler's
-  draws are then the float64 sampler's up to the float32 rounding of the product.
+- **Precision**: the noise z, the dense product w = m + F z (the cost of a draw) and the closed-form maps run in the
+  sampler's dtype. Numerical inversions and pointwise functions run in float64 for point values in the projection and
+  Bernstein representations, whose conversions to coefficients are ill-conditioned (the margin above is measured in
+  float64), and so do the clamps, the pull and the conversion there; in the sampler's dtype otherwise. With host
+  noise a float32 sampler's draws are the float64 sampler's (the same z) up to float32 rounding.
+- **Host synchronisation**: a draw on a GPU into torch tensors only queues work on the device, so the caller can queue
+  its own behind it: the output maps are applied by gathers (torch's sparse products wait for the device on some
+  GPUs), host noise is copied from pinned memory. NumPy output and pointwise functions without a torch form wait.
 
 The law is that of ``d.sample()`` (its marginal at the chosen DoFs, or its image under the observation), up to the
 cut and rounding; the draws themselves differ (another random stream). Data drawn by either route can be mixed. Not
@@ -81,9 +85,11 @@ As every sampler (:mod:`ngsrng.seeding`): ``seed=None`` reads torch's global gen
 stream, and ``sample(n, generator=g)`` reads ``g`` for that draw (one key per draw). The draws are sample-major
 standard normals z (n, k, r); every sample's z is fixed by its position in the stream, so the draws do not depend
 on how a batch is split (``sample(4)`` then ``sample(6)`` is ``sample(10)``: the same z, and the same values up to the
-rounding of products over other batch sizes). ``noise="host"`` (the CPU's default) draws z with NumPy and copies it
-to the device: the same samples on every device. ``noise="device"`` (a GPU's default) draws z on the device with
-torch, keyed per block of ``block`` samples (fast; the samples then depend on the device, as torch's generators do).
+rounding of products over other batch sizes). ``noise="host"`` (the CPU's default) draws z with NumPy (float64) and
+copies it to the device: the same samples on every device. ``noise="device"`` (a GPU's default) draws z on the device
+with torch in the sampler's dtype, keyed per block of ``block`` samples, a power of two (fast, and a batch of a
+power-of-two size draws no normals it does not use; the samples then depend on the device and the dtype, as torch's
+generators do).
 
 Stored samplers
 ---------------
@@ -143,8 +149,11 @@ RTOL = 1e-12  # the default cut: eigenvalues of K below rtol times the largest
 # evaluation gives ~1e-17 to basis functions that vanish at the point); configurable per call (zero=). To do: decide
 # whether a threshold belongs here at all (docs: "Look into later").
 ZERO = 1e-15
-BLOCK_NORMALS = 2**22  # standard normals per keyed block of device noise (performance, not accuracy)
-DENSE_OUT = 2**22  # output maps up to this many entries are dense on the device, larger ones sparse (performance)
+BLOCK_NORMALS = 2**22  # standard normals per keyed block of device noise at most (performance, not accuracy)
+# Output maps on the device: dense up to DENSE_OUT entries unless at most 1 / GATHER_FILL of them is stored; else by
+# gathers of their stored entries (rows padded to a common number of entries per bucket; performance)
+DENSE_OUT = 2**22
+GATHER_FILL = 8
 
 
 def _affine(w, xp, shift, scale):
@@ -200,7 +209,7 @@ class DenseSampler(InPlace):
         self.work_values = default_work_values(self.device) if work_values is None else int(work_values)
         self._device = DeviceCache()
         k, r = len(law["components"]), law["factor"].shape[1]
-        self.block = max(1, BLOCK_NORMALS // max(1, k * r))  # samples per keyed block of device noise
+        self.block = _floor_pow2(BLOCK_NORMALS // max(1, k * r))  # samples per keyed block of device noise
 
     # ------------------------------------------------------------------ description
 
@@ -298,7 +307,7 @@ class DenseSampler(InPlace):
         k, r = self.components, self.rank
         if tuple(z.shape[1:]) != (k, r):
             raise ValueError(f"z must have shape (n, {k}, {r}), got {tuple(z.shape)}")
-        rows = self._transform(z.to(self.device, self._work_dtype()).reshape(z.shape[0], k * r))
+        rows = self._transform(z.to(self.device, self.dtype).reshape(z.shape[0], k * r))
         return self._deliver([y.to(self.dtype) for y in rows], z.shape[0], output)
 
     def _sample_out(self, n, out, source):
@@ -331,24 +340,29 @@ class DenseSampler(InPlace):
             for row, y in zip(rows, self._transform(z)):
                 row[k0:k1].copy_(y)
 
-    def _work_dtype(self):
-        return torch.float64 if self.law["work64"] or self.dtype == torch.float64 else self.dtype
+    def _conversion_dtype(self):
+        """The dtype of the conversion to the outputs: float64 for point values in the projection and Bernstein
+        representations (ill-conditioned conversions), the sampler's otherwise."""
+        return torch.float64 if self.law["work64"] else self.dtype
 
     def _standard_normal(self, n, width, streams):
-        """(n, width) standard normals of the next n samples of the stream, on the device (see the module
-        docstring: host noise from NumPy, device noise keyed per block of samples)."""
-        wd = self._work_dtype()
+        """(n, width) standard normals of the next n samples of the stream, on the device in the sampler's dtype (see
+        the module docstring: host noise from NumPy, device noise keyed per block of samples)."""
         if self.noise == "host":
-            z = torch.from_numpy(streams.numpy().standard_normal((n, width)))
-            return z.to(self.device, wd)
+            z = torch.from_numpy(streams.numpy().standard_normal((n, width))).to(self.dtype)
+            return _to_device(z, self.device)
         seq, first = streams.reserve(n)
-        out = torch.empty((n, width), dtype=wd, device=self.device)
+        out = torch.empty((n, width), dtype=self.dtype, device=self.device)
         gen, b = self._generator(), self.block
         for blk in range(first // b, (first + n - 1) // b + 1):
             lo, hi = max(first, blk * b), min(first + n, (blk + 1) * b)
             gen.manual_seed(_block_seed(seq, blk))
-            z = torch.randn((b, width), generator=gen, dtype=wd, device=self.device)
-            out[lo - first:hi - first] = z[lo - blk * b:hi - blk * b]
+            dst = out[lo - first:hi - first]
+            if hi - lo == b:  # a whole block: drawn in place
+                torch.randn((b, width), generator=gen, dtype=self.dtype, device=self.device, out=dst)
+            else:
+                dst.copy_(torch.randn((b, width), generator=gen, dtype=self.dtype, device=self.device)[lo - blk * b:
+                                                                                                    hi - blk * b])
         return out
 
     def _generator(self):
@@ -358,47 +372,51 @@ class DenseSampler(InPlace):
         return self._device[key]
 
     def _transform(self, z):
-        """Samples (one (n, m) tensor per component) from standard normals z (n, k r) on the device: the dense
-        product w = m + F z, the cost of a draw, in the sampler's dtype; the family's map and the representation's
-        conversion in z's, the work dtype (_work_dtype: float64 for point values in the projection and Bernstein
-        representations, whose conversions to coefficients are ill-conditioned)."""
+        """Samples (one (n, m) tensor per component) from standard normals z (n, k r) in the sampler's dtype on the
+        device: the dense product w = m + F z (the cost of a draw) and the closed-form maps in the sampler's dtype;
+        numerical inversions and pointwise functions, the clamps, the Bernstein pulls and the conversion to the
+        outputs in the conversion dtype (float64 for point values in the projection and Bernstein representations,
+        whose conversions to coefficients are ill-conditioned)."""
         k, r = self.components, self.rank
         n = z.shape[0]
-        lin, comps = self._linear(self.dtype), self._conversions(z.dtype)
-        x = z.to(self.dtype).reshape(n, k, r)
+        lin, comps = self._linear(self.dtype), self._conversions()
+        x = z.reshape(n, k, r)
         if k > 1:
             x = torch.einsum("ij,njr->nir", lin["mix"], x)
         out = []
         for i, c in enumerate(comps):
             mean = lin["means"][i]
             w = torch.addmm(mean, x[:, i], lin["factor"].T) if r else mean.expand(n, -1).clone()
-            v = self._map(i, c, w.to(z.dtype))
-            a = c["out"]
-            if a is None:
-                y = v
-            elif a.layout == torch.strided:
-                y = v @ a.T
-            else:
-                y = (a @ v.T).T
-            out.append(y)
+            v = self._map(i, c, w)
+            out.append(v if c["out"] is None else c["out"](v))
         return out
 
     def _map(self, i, c, w):
         spec = self.law["components"][i]
+        cd = self._conversion_dtype()
         if spec["map"] in LIVE:  # a numerical inversion or a pointwise function (an object of the process)
+            w = w.to(cd)
             t = spec["transform"]
             if getattr(t, "torch_capable", False):
                 v = t(w, _xp(True))
             else:
-                v = torch.as_tensor(t(w.double().cpu().numpy(), _xp(False)), device=w.device).to(w.dtype)
+                v = torch.as_tensor(t(w.double().cpu().numpy(), _xp(False)), device=w.device).to(cd)
         else:
-            v = _maps()[spec["map"]](w, _xp(True), **c["params"])
-        for bound, op in c["clamp"]:  # strictly inside the support in the output precision
-            v = torch.maximum(v, bound) if op == "max" else torch.minimum(v, bound)
-        if c["pull"] is not None:  # Bernstein: inside the range by a margin safe against the conversion's rounding
-            margin = spec["pull"]["margin"] * v.abs().amax(dim=1, keepdim=True).clamp_min(1e-300)
+            v = _maps()[spec["map"]](w, _xp(True), **c["params"]).to(cd)
+        # strictly inside the support in the output precision, and for Bernstein inside the range by a margin safe
+        # against the conversion's rounding (relative to the largest value of the sample): one clamp to the tighter
+        # bounds
+        low, high = c["low"], c["high"]
+        if c["pull"] is not None:
+            a, b = torch.aminmax(v, dim=1, keepdim=True)
+            margin = spec["pull"]["margin"] * torch.maximum(a.abs(), b.abs()).clamp_min(1e-300)
             for bound, sign in c["pull"]:
-                v = torch.maximum(v, bound + margin) if sign > 0 else torch.minimum(v, bound - margin)
+                if sign > 0:
+                    low = bound + margin if low is None else torch.maximum(low, bound + margin)
+                else:
+                    high = bound - margin if high is None else torch.minimum(high, bound - margin)
+        if low is not None or high is not None:
+            v = torch.clamp(v, min=low, max=high)
         return v
 
     def _tensor(self, dt):
@@ -415,21 +433,21 @@ class DenseSampler(InPlace):
                                  "means": [t(spec["mean"]) for spec in self.law["components"]]}
         return self._device[key]
 
-    def _conversions(self, dt):
-        """The components' maps and conversions on the device in dtype dt (made once per device and dtype): the
-        maps' parameters, the output maps, the clamps and the Bernstein pulls."""
-        key = ("conversions", str(self.device), dt)
+    def _conversions(self):
+        """The components' maps and conversions on the device (made once per device and dtype): the closed-form maps'
+        parameters in the sampler's dtype; the output maps (:class:`_OutputMap`), the clamps and the Bernstein pulls
+        in the conversion dtype."""
+        key = ("conversions", str(self.device), self.dtype)
         if key not in self._device:
-            dev, t = self.device, self._tensor(dt)
+            cd = self._conversion_dtype()
+            t, tc = self._tensor(self.dtype), self._tensor(cd)
             comps = []
             for spec in self.law["components"]:
-                a = spec["out"]
-                if a is not None:
-                    a = sp.csr_matrix(a)
-                    a = t(a.toarray()) if a.shape[0] * a.shape[1] <= DENSE_OUT else sparse_to_torch(a, dev, dt)
                 params = {k: (t(v) if isinstance(v, np.ndarray) else v) for k, v in spec["params"].items()}
-                comps.append({"params": params, "out": a, "clamp": _clamp_bounds(spec.get("support"), self.dtype, t),
-                              "pull": _pull_bounds(spec.get("pull"), t)})
+                low, high = _clamp_bounds(spec.get("support"), self.dtype, tc)
+                comps.append({"params": params,
+                              "out": None if spec["out"] is None else _OutputMap(spec["out"], self.device, cd),
+                              "low": low, "high": high, "pull": _pull_bounds(spec.get("pull"), tc)})
             self._device[key] = comps
         return self._device[key]
 
@@ -535,21 +553,84 @@ def _block_seed(seq, block) -> int:
     return int(child.generate_state(1, np.uint64)[0] >> np.uint64(1))
 
 
+def _floor_pow2(x) -> int:
+    """The largest power of two at most x (1 for x < 2)."""
+    return 1 << (max(1, int(x)).bit_length() - 1)
+
+
+def _to_device(t, device):
+    """A host tensor on ``device``; to a GPU from pinned memory, so that the host does not wait for the device."""
+    if device.type == "cpu":
+        return t
+    return t.pin_memory().to(device, non_blocking=True)
+
+
+class _OutputMap:
+    """y = v A^T for an output map A (m x s, SciPy sparse) on the device, in one dtype.
+
+    Dense (one matrix product) when A has at most ``DENSE_OUT`` entries of which more than 1 / ``GATHER_FILL`` are
+    stored. Otherwise by gathers of the stored entries, without a sparse library (torch's sparse products synchronise
+    the host with the device on some GPUs): the rows are bucketed by their number of stored entries, rounded up to a
+    power of two (one bucket of the largest number when that at most doubles the work), each bucket's entries padded
+    with zeros to its width w, and y[:, rows] = sum_{t < w} v[:, idx_t] val_t, in a fixed order (deterministic)."""
+
+    def __init__(self, a, device, dtype):
+        a = sp.csr_matrix(a)
+        m, s = a.shape
+        self.m, self.dense, self.buckets = m, None, []
+        if m * s <= DENSE_OUT and GATHER_FILL * a.nnz > m * s:
+            self.dense = torch.as_tensor(a.toarray()).to(device, dtype)
+            return
+        lens = np.diff(a.indptr)
+        top = int(lens.max()) if m else 0
+        if top * m <= 2 * a.nnz:
+            widths = np.where(lens > 0, top, 0)
+        else:
+            widths = np.where(lens > 0, 1 << np.ceil(np.log2(np.maximum(lens, 1))).astype(np.int64), 0)
+        for w in np.unique(widths[widths > 0]):
+            rows = np.flatnonzero(widths == w)
+            t = np.arange(w)[:, None]
+            have = t < lens[rows][None, :]
+            at = (a.indptr[rows][None, :] + t)[have]
+            idx, val = np.zeros((w, rows.size), dtype=np.int64), np.zeros((w, rows.size))
+            idx[have], val[have] = a.indices[at], a.data[at]
+            self.buckets.append((torch.from_numpy(rows).to(device), torch.from_numpy(idx).to(device),
+                                 torch.from_numpy(val).to(device, dtype)))
+        self.whole = len(self.buckets) == 1 and self.buckets[0][0].numel() == m  # every row in one bucket, in order
+        self.zero_rows = bool((lens == 0).any())
+
+    def __call__(self, v):
+        if self.dense is not None:
+            return v @ self.dense.T
+        if self.whole:
+            return self._gather(v, *self.buckets[0][1:])
+        y = (torch.zeros if self.zero_rows else torch.empty)((v.shape[0], self.m), dtype=v.dtype, device=v.device)
+        for rows, idx, val in self.buckets:
+            y.index_copy_(1, rows, self._gather(v, idx, val))
+        return y
+
+    @staticmethod
+    def _gather(v, idx, val):
+        y = v.index_select(1, idx[0]) * val[0]
+        for t in range(1, idx.shape[0]):
+            y.addcmul_(v.index_select(1, idx[t]), val[t])
+        return y
+
+
 def _clamp_bounds(support, out_dtype, t):
-    """Bounds just inside a finite support in the output precision (as PointwiseField.clamp_open)."""
+    """(low, high): bounds just inside a finite support in the output precision (as PointwiseField.clamp_open), None
+    where the support is unbounded."""
     if support is None:
-        return []
+        return None, None
     dt = torch.empty(0, dtype=out_dtype).numpy().dtype
     bounds = []
-    for bound, toward, op in ((support[0], np.inf, "max"), (support[1], -np.inf, "min")):
-        if bound is None:
+    for bound, toward in ((support[0], np.inf), (support[1], -np.inf)):
+        b = None if bound is None else np.asarray(bound, dtype=float)
+        if b is None or not np.all(np.isfinite(b)):
+            bounds.append(None)
             continue
-        b = np.asarray(bound, dtype=float)
-        if not np.all(np.isfinite(b)):
-            continue
-        inner = np.nextafter(b.astype(dt), np.asarray(toward, dtype=dt)).astype(np.float64)
-        bounds.append((t(inner), op))
-    return bounds
+        bounds.append(t(np.nextafter(b.astype(dt), np.asarray(toward, dtype=dt)).astype(np.float64)))
+    return tuple(bounds)
 
 
 def _pull_bounds(pull, t):
