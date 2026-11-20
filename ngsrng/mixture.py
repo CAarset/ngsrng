@@ -24,7 +24,8 @@ or Gaussians (``Gaussian``, ``StationaryMatern``, posteriors, low-rank and obser
 (..., n), and so is the mixture's then. ``sample`` draws each law's group with the law's own sampler; ``dense()`` sets
 up every law's dense sampler (:mod:`ngsrng.dense`; ``rank=`` and ``tol=`` per law, relative to its own variance) and
 draws them together, on any device: a batch's labels, then one dense product per law for the draws that follow it.
-``E @ mixture`` is the mixture of the observed laws.
+Laws from one generator share its set-up (the points, the Bernstein form of the space), so a dense mixture of one
+family maps and converts the draws of all its laws at once. ``E @ mixture`` is the mixture of the observed laws.
 
 Randomness
 ----------
