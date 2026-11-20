@@ -16,3 +16,15 @@ def cuda_usable() -> bool:
     from ngsrng.backend import cuda_usable as usable
 
     return usable()
+
+
+def gpu_solver():
+    """The GPU's sparse solver: cuDSS (NVIDIA, a direct solver), else AMG-preconditioned CG (AMD and others, with
+    pyamg); None without a usable GPU or either solver. Tests of GPU routes pass it as ``method``."""
+    from ngsrng.solvers import cudss_available, pyamg_available
+
+    if not cuda_usable():
+        return None
+    if cudss_available():
+        return {"solver": "cudss"}
+    return {"solver": "amg-pcg"} if pyamg_available() else None
