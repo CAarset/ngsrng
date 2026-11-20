@@ -1,6 +1,7 @@
 """Correlated random fields (ngsrng.correlated): every component keeps its law (marginals, conditioning, the Bernstein
 range, bnd=), the latents are correlated by R, and draws follow the sampler conventions."""
 
+import importlib
 import math
 
 import ngsolve as ngs
@@ -149,6 +150,25 @@ def test_gaussian_fields(space):
     s2 = exact_covariance(gauss)[j, j]
     cov = s2 * np.array([[1.0, 0.9 * 3.0], [0.9 * 3.0, 9.0]])
     assert_gaussian(np.column_stack([a[:, i], b[:, i]]), [gauss.mean[i], 2.0], cov)
+
+
+def test_equal_specifications_share_their_covariance(space, monkeypatch):
+    """Components of generators with equal specifications but other solvers share their covariance by construction
+    (no probe, whose rounding differs between pipelines, e.g. float32 on a GPU); other lengths are told apart."""
+    cr = importlib.import_module("ngsrng.correlated")  # the module (ngsrng.correlated is the function)
+
+    corr = ngsrng.matern_correlation(0.3, nu=1)
+    a = ngsrng.default_rng(space, seed=1, correlation=corr).distribution("uniform")
+    b = ngsrng.default_rng(space, seed=2, correlation=corr, method={"solver": "cg"}).distribution("uniform")
+    assert a.field.points.gauss is not b.field.points.gauss
+    assert cr._covariance_key(a.field.points.gauss) == cr._covariance_key(b.field.points.gauss)
+    monkeypatch.setattr(cr._Part, "probe", lambda *args: pytest.fail("probed"))
+    ngsrng.correlated([a, b], 0.5)
+    monkeypatch.undo()
+    other = ngsrng.default_rng(space, seed=3, correlation=ngsrng.matern_correlation(0.31, nu=1)).distribution(
+        "uniform")
+    with pytest.raises(ValueError, match="differ in covariance"):
+        ngsrng.correlated([a, other], 0.5)
 
 
 def test_errors(space):
