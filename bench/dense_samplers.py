@@ -38,6 +38,9 @@ import ngsolve as ngs  # noqa: E402
 from netgen.geom2d import SplineGeometry  # noqa: E402
 
 import ngsrng  # noqa: E402
+import ngsrng.resolution  # noqa: E402
+
+ngsrng.resolution.RESOLUTION_TOL = None  # timings at fixed mesh sizes, resolved or not: no resolution check
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 

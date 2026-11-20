@@ -77,10 +77,13 @@ def run_one(domain, h, order, nu, prior, seed=0):
     """One prior on one case, in this process: a dict of results."""
     sys.path.insert(0, ROOT)
     import ngsrng  # noqa: F401, I001  (torch before NGSolve)
+    import ngsrng.resolution
     import ngsolve as ngs
     import numpy as np
     import torch
     from ngsrng.stationary import basis_at, matern_function
+
+    ngsrng.resolution.RESOLUTION_TOL = None  # accuracy at fixed mesh sizes, coarse ones included
 
     mesh = make_mesh(domain, h)
     dirichlet = prior.endswith("+dirichlet")
