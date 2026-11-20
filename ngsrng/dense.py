@@ -9,10 +9,11 @@
     A2 = ngsrng.DenseSampler.load("traces.npz", device="cuda")   # the stored law: no mesh, space or assembly
 
 ``dense()`` exists on every distribution (``rng.distribution(...)``), on ``ngsrng.correlated(...)``, on observed laws
-(``E @ d``: an :class:`ObservedField`, or an :class:`ngsrng.ObservedGaussian` for Gaussian fields) and on the
-Gaussians (``Gaussian``, ``LowRankGaussian``, ``MatheronPosterior``, ``StationaryMatern``: their coefficients). The
-set-up is made once per object and arguments and kept there (it survives pickling, and ``Generator.spawn`` children
-share it); draws are matrix products, on any device.
+(``E @ d``: an :class:`ObservedField`, or an :class:`ngsrng.ObservedGaussian` for Gaussian fields), on the
+Gaussians (``Gaussian``, ``LowRankGaussian``, ``MatheronPosterior``, ``StationaryMatern``: their coefficients) and on
+mixtures (``ngsrng.mixture(...)``: one dense law per law of the mixture, drawn together). The set-up is made once per
+object and arguments and kept there (it survives pickling, and ``Generator.spawn`` children share it); draws are
+matrix products, on any device.
 
 What is dense, and why it is exact
 ----------------------------------
@@ -48,6 +49,9 @@ Every family it covers is a pointwise map of one latent Gaussian, followed by li
   the factor. Decided at set-up and after each composition. Pointwise families keep F and A apart (T is in between).
 - **Correlated components** (``ngsrng.correlated``) share K: the joint factor is L_R (x) F (R the cross-correlation),
   and each component keeps its own mean, map and output map.
+- **Mixtures** (``ngsrng.mixture``): K laws with weights, each set up as above (its own S, factor, maps; ``rank=`` and
+  ``tol=`` relative to its own variance) with the same components and output sizes. A draw's label l (law l with
+  probability weights[l]) chooses its law; a batch costs one product per law, for the draws that follow it.
 - **The Bernstein range guarantee** holds as in ``d.sample()``: the map comes before the linear conversion, and the
   values are pulled inside the family's range by a relative margin of at least 1000 times the conversion's measured
   rounding (summed over S, so it bounds every sample) before it.
@@ -58,7 +62,7 @@ Every family it covers is a pointwise map of one latent Gaussian, followed by li
   noise a float32 sampler's draws are the float64 sampler's (the same z) up to float32 rounding.
 - **Host synchronisation**: a draw on a GPU into torch tensors only queues work on the device, so the caller can queue
   its own behind it: the output maps are applied by gathers (torch's sparse products wait for the device on some
-  GPUs), host noise is copied from pinned memory. NumPy output and pointwise functions without a torch form wait.
+  GPUs), host noise and labels are copied without waiting. NumPy output and functions without a torch form wait.
 
 The law is that of ``d.sample()`` (its marginal at the chosen DoFs, or its image under the observation), up to the
 cut and rounding; the draws themselves differ (another random stream). Data drawn by either route can be mixed. Not
@@ -77,15 +81,18 @@ second those of the field.
 
 Size: up to ``MAX_POINTS`` latent points by default (``max_points=`` moves it). The set-up costs |S| applications of
 L^T, a QR and an SVD of |S| columns; a draw costs |S| r + nnz(A) (folded: m r') multiply-adds per sample and
-component.
+component (of its law, for a mixture).
 
 Randomness
 ----------
 As every sampler (:mod:`ngsrng.seeding`): ``seed=None`` reads torch's global generator at each draw, an int is an own
 stream, and ``sample(n, generator=g)`` reads ``g`` for that draw (one key per draw). The draws are sample-major
-standard normals z (n, k, r); every sample's z is fixed by its position in the stream, so the draws do not depend
-on how a batch is split (``sample(4)`` then ``sample(6)`` is ``sample(10)``: the same z, and the same values up to the
-rounding of products over other batch sizes). ``noise="host"`` (the CPU's default) draws z with NumPy (float64) and
+standard normals z (n, k, r), r = ``rank`` (for a mixture, of its widest law: a draw following a law of rank r_l uses
+z[:, :, :r_l]), and for a mixture the labels, from a stream of their own (NumPy, on the host: the same labels on every
+device, and the sizes of the laws' groups are known there without waiting for the device); every sample's z and label
+are fixed by its position in the streams, so the draws do not depend on how a batch is split (``sample(4)`` then
+``sample(6)`` is ``sample(10)``: the same z, and the same values up to the rounding of products over other batch
+sizes). ``noise="host"`` (the CPU's default) draws z with NumPy (float64) and
 copies it to the device: the same samples on every device. ``noise="device"`` (a GPU's default) draws z on the device
 with torch in the sampler's dtype, keyed per block of ``block`` samples, a power of two (fast, and a batch of a
 power-of-two size draws no normals it does not use; the samples then depend on the device and the dtype, as torch's
@@ -93,36 +100,47 @@ generators do).
 
 Stored samplers
 ---------------
-``save(path)`` writes one ``.npz`` without pickles or code: the factor, the means, the maps (closed forms: family,
-parameters and range; numerical inversions: the scipy.stats distribution's name and parameters; ``transformed`` with
-a NumPy or torch function: its name), the output maps, the DoF indices and latent points, and provenance (ngsrng
-version and commit, space, mesh hash, representation, stream convention). ``DenseSampler.load(path, device=...)``
-rebuilds the sampler from these arrays alone. Without ngsrng, a stored sampler draws with NumPy and SciPy::
+``save(path)`` writes one ``.npz`` (format ``ngsrng.dense/2``) without pickles or code. ``meta`` (JSON) holds the
+format, the dtype, the laws' ``weights`` and per law its description (``laws[l]``: the components' maps, output sizes
+and the keys of their arrays, and ``info``, with provenance: ngsrng version and commit, space, mesh hash,
+representation, stream convention). The arrays of law l have keys ``law{l}/...``: the factor, the mixing of correlated
+components, the means, the maps' parameters and ranges (closed forms: family, parameters and range; numerical
+inversions: the scipy.stats distribution's name and parameters; ``transformed`` with a NumPy or torch function: its
+name), the output maps (COO), the DoF indices and the latent points. One law is K = 1.
+``DenseSampler.load(path, device=...)`` rebuilds the sampler from these arrays alone. Without ngsrng, a stored sampler
+draws with NumPy and SciPy::
 
     import json, numpy as np, scipy.stats as st
     from scipy.special import ndtr
     s = np.load("sampler.npz")
     meta = json.loads(str(s["meta"]))
-    z = np.random.default_rng(0).standard_normal((n, *s["mix"].shape[:1], s["factor"].shape[1]))
-    z = np.einsum("ij,njr->nir", s["mix"], z)                      # correlate the components
-    for i, c in enumerate(meta["components"]):
-        w = s[f"mean{i}"] + z[:, i] @ s["factor"].T               # latent values (n, |S|)
-        p = {k: s[v] if isinstance(v, str) else v for k, v in c["params"].items()}
-        if c["map"] == "inversion":                               # e.g. gamma: loc + scale F^-1(Phi(w))
-            q = c["stored"]
-            v = q["loc"] + q["scale"] * getattr(st, q["scipy"])(*q["args"], **q["kwds"]).ppf(ndtr(w))
-        else:
-            v = {"uniform": lambda w, low, high: low + (high - low) * ndtr(w),
-                 "lognormal": lambda w, mean, sigma: np.exp(mean + sigma * w),
-                 "affine": lambda w, shift, scale: shift + scale * w}[c["map"]](w, **p)
-        if c["out_shape"]:                                         # the output map (none: the values themselves)
-            a = np.zeros(c["out_shape"])
-            a[s[f"out{i}_rows"], s[f"out{i}_cols"]] = s[f"out{i}_vals"]
-            v = v @ a.T                                            # (n, m): component i
+    gen = np.random.default_rng(0)
+    labels = gen.choice(len(meta["weights"]), size=n, p=meta["weights"])   # the law each draw follows
+    out = [np.empty((n, c["nout"])) for c in meta["laws"][0]["components"]]
+    for l, law in enumerate(meta["laws"]):
+        a = lambda key: s[f"law{l}/{key}"]
+        rows = labels == l
+        z = gen.standard_normal((rows.sum(), a("mix").shape[0], a("factor").shape[1]))
+        z = np.einsum("ij,njr->nir", a("mix"), z)                  # correlate the components
+        for i, c in enumerate(law["components"]):
+            w = a(f"mean{i}") + z[:, i] @ a("factor").T            # latent values (n_l, |S|)
+            p = {k: s[v] if isinstance(v, str) else v for k, v in c["params"].items()}
+            if c["map"] == "inversion":                           # e.g. gamma: loc + scale F^-1(Phi(w))
+                q = c["stored"]
+                v = q["loc"] + q["scale"] * getattr(st, q["scipy"])(*q["args"], **q["kwds"]).ppf(ndtr(w))
+            else:
+                v = {"uniform": lambda w, low, high: low + (high - low) * ndtr(w),
+                     "lognormal": lambda w, mean, sigma: np.exp(mean + sigma * w),
+                     "affine": lambda w, shift, scale: shift + scale * w}[c["map"]](w, **p)
+            if c["out_shape"]:                                     # the output map (none: the values themselves)
+                m = np.zeros(c["out_shape"])
+                m[a(f"out{i}_rows"), a(f"out{i}_cols")] = a(f"out{i}_vals")
+                v = v @ m.T
+            out[i][rows] = v                                       # (n, m): component i
 
-(the other closed forms are ``transforms.CLOSED``; ``DenseSampler.from_noise(z)`` gives the same values from the same
-z, up to the range margins of bounded families, which move values within ~1e-9 of a bound by at most that, and the
-1e-10 accuracy of inversion tables.)
+(the other closed forms are ``transforms.CLOSED``; ``DenseSampler.from_noise(z, labels)`` gives the same values from
+the same z and labels, up to the range margins of bounded families, which move values within ~1e-9 of a bound by at
+most that, and the 1e-10 accuracy of inversion tables.)
 """
 
 import hashlib
@@ -142,7 +160,7 @@ from .seeding import Source, as_source, inherit, one_draw
 
 __all__ = ["DenseSampler", "ObservedField"]
 
-FORMAT = "ngsrng.dense/1"
+FORMAT = "ngsrng.dense/2"
 MAX_POINTS = 10_000  # latent points of a dense factor by default (|S|^2 float64: 0.8 GB at the limit)
 RTOL = 1e-12  # the default cut: eigenvalues of K below rtol times the largest
 # Entries of an output map at most ZERO times their row's largest are taken as rounding of exact zeros (a point
@@ -189,16 +207,22 @@ def _margin():
 class DenseSampler(InPlace):
     """Draws of a field at chosen DoFs or under a linear observation, by dense products (see :mod:`ngsrng.dense`).
 
-    Made by ``dense()`` (on a distribution, ``ngsrng.correlated(...)``, an observed law or a Gaussian), by ``E @
-    sampler`` or by :meth:`load`. ``sample(n)`` gives (n, m), or (n, k, m) for k correlated components (a tuple when
-    their output sizes differ); ``dofs`` (the DoF indices of the outputs, None for an observation), ``rank``, ``info``,
-    :meth:`save`, :meth:`to`.
+    Made by ``dense()`` (on a distribution, ``ngsrng.correlated(...)``, an observed law, a Gaussian or
+    ``ngsrng.mixture(...)``), by ``E @ sampler`` or by :meth:`load`. ``sample(n)`` gives (n, m), or (n, k, m) for k
+    correlated components (a tuple when their output sizes differ); ``dofs`` (the DoF indices of the outputs, None for
+    an observation), ``rank``, ``info``, :meth:`save`, :meth:`to`.
+
+    A sampler holds K >= 1 ``laws`` with ``weights``, a finite mixture: each draw follows law l with probability
+    weights[l] (the draw's label). The laws have the same components and output sizes. One law: K = 1.
     """
 
     __array_ufunc__ = None  # E @ sampler: NumPy (and SciPy, torch) leave the product to __rmatmul__
 
-    def __init__(self, law, *, device="cpu", dtype=None, noise=None, seed=None, output=None, work_values=None):
-        self.law = law
+    def __init__(self, laws, weights=None, *, device="cpu", dtype=None, noise=None, seed=None, output=None,
+                 work_values=None):
+        self.laws = (laws,) if isinstance(laws, dict) else tuple(laws)
+        self.weights = _mixture_weights(weights, len(self.laws))
+        _check_outputs(self.laws)
         self.device = resolve_device(device)
         self.dtype = resolve_dtype(dtype) if dtype is not None else torch.float64
         self.noise = noise or ("host" if self.device.type == "cpu" else "device")
@@ -208,43 +232,65 @@ class DenseSampler(InPlace):
         self.output = output
         self.work_values = default_work_values(self.device) if work_values is None else int(work_values)
         self._device = DeviceCache()
-        k, r = len(law["components"]), law["factor"].shape[1]
-        self.block = _floor_pow2(BLOCK_NORMALS // max(1, k * r))  # samples per keyed block of device noise
+        self.block = _floor_pow2(BLOCK_NORMALS // max(1, self.components * self.rank))  # samples per keyed block
+        # laws that share the map, bounds and output maps (drawn by one conversion), in the order of their draws
+        stages = {}
+        for l, law in enumerate(self.laws):
+            stages.setdefault(_stage_key(law), []).append(l)
+        self._stages = list(stages.values())
+        self._position = np.empty(len(self.laws), dtype=np.int64)
+        self._position[[l for stage in self._stages for l in stage]] = np.arange(len(self.laws))
 
     # ------------------------------------------------------------------ description
 
     @property
     def components(self) -> int:
         """Number of jointly drawn components (1 for a single field)."""
-        return len(self.law["components"])
+        return len(self.laws[0]["components"])
 
     @property
     def rank(self) -> int:
-        """Columns of the latent factor (standard normals per sample and component)."""
-        return int(self.law["factor"].shape[1])
+        """Standard normals per draw and component: the columns of the latent factor (of the widest law; a law
+        with fewer columns reads the leading ones)."""
+        return max(int(law["factor"].shape[1]) for law in self.laws)
 
     @property
     def latent_points(self) -> int:
-        return int(self.law["factor"].shape[0])
+        """Latent values (of the law with the most)."""
+        return max(int(law["factor"].shape[0]) for law in self.laws)
 
     @property
     def dofs(self):
         """The indices of the outputs among the values ``d.sample()`` returns (FE DoFs for coefficient
-        representations), or None for an observation."""
-        return self.law.get("dofs")
+        representations), or None for an observation (or laws with different DoFs)."""
+        first = self.laws[0].get("dofs")
+        if first is None or any(law.get("dofs") is None or not np.array_equal(law["dofs"], first)
+                                for law in self.laws[1:]):
+            return None
+        return first
 
     @property
     def nout(self):
-        sizes = [c["nout"] for c in self.law["components"]]
+        sizes = [c["nout"] for c in self.laws[0]["components"]]
         return sizes[0] if len(set(sizes)) == 1 else tuple(sizes)
 
     @property
     def info(self) -> dict:
-        return {**self.law["info"], "device": str(self.device), "dtype": str(self.dtype).replace("torch.", ""),
+        if len(self.laws) == 1:
+            law = self.laws[0]["info"]
+        else:
+            law = {"law": f"mixture of {len(self.laws)} laws", "weights": self.weights.tolist(),
+                   "laws": [law["info"] for law in self.laws],
+                   "memory_bytes": sum(int(law["info"].get("memory_bytes", 0)) for law in self.laws)}
+        return {**law, "device": str(self.device), "dtype": str(self.dtype).replace("torch.", ""),
                 "noise": self.noise, "block": self.block, "randomness": self.source.describe()}
 
     def __repr__(self):
-        i = self.law["info"]
+        if len(self.laws) > 1:
+            ranks = [int(law["factor"].shape[1]) for law in self.laws]
+            return (f"DenseSampler(mixture of {len(self.laws)} laws: {self.components} x {self.nout} outputs, rank "
+                    f"{min(ranks)}..{max(ranks)}, device={self.device})")
+        i = self.laws[0]["info"]
         return (f"DenseSampler({i.get('law', '')}: {self.components} x {self.nout} outputs, {self.latent_points} "
                 f"latent values, rank {self.rank}, {'exact' if i.get('exact') else 'truncated'}, device={self.device})")
 
@@ -253,41 +299,51 @@ class DenseSampler(InPlace):
         same stream, continued by both samplers); ``noise`` follows a new device's default."""
         if noise is None and device is None:
             noise = self.noise
-        return DenseSampler(self.law, device=self.device if device is None else device,
+        return DenseSampler(self.laws, self.weights, device=self.device if device is None else device,
                             dtype=self.dtype if dtype is None else dtype, noise=noise,
                             seed=self.source if seed is None else seed,
                             output=self.output if output is None else output)
 
     def __rmatmul__(self, operator):
         """``E @ sampler``: the outputs observed by E (m2 x m), a dense sampler again, without a new set-up: the latent
-        values E no longer reads are dropped, the factor recompressed, Gaussian components folded where cheaper.
-        Same randomness (stream) and sampling settings."""
+        values E no longer reads are dropped, the factor recompressed, Gaussian components folded where cheaper (per
+        law of a mixture). Same randomness (stream) and sampling settings."""
         from .observed import _as_operator
 
         if not isinstance(self.nout, int):
             raise ValueError("E @ sampler: the components have outputs of different sizes")
         e = _as_operator(operator, self.nout)
-        law = _compose(self.law, e)
-        return DenseSampler(law, device=self.device, dtype=self.dtype, noise=self.noise, seed=self.source,
-                            output=self.output, work_values=self.work_values)
+        return DenseSampler([_compose(law, e) for law in self.laws], self.weights, device=self.device,
+                            dtype=self.dtype, noise=self.noise, seed=self.source, output=self.output,
+                            work_values=self.work_values)
 
     # ------------------------------------------------------------------ draws
 
-    def sample(self, n=None, generator=None, output=None, out=None):
+    def sample(self, n=None, generator=None, output=None, out=None, labels=False):
         """n draws: (n, m), or (n, k, m) for correlated components; ``n=None``: one, without the sample axis.
 
         ``generator``: a torch or NumPy generator read for this draw (one key), instead of the sampler's own
         randomness. ``output``: "numpy" or "torch" (default: NumPy on the CPU, torch tensors on a GPU). ``out``: a
-        buffer of that shape (any float dtype and device, or one per component) filled in place and returned."""
+        buffer of that shape (any float dtype and device, or one per component) filled in place and returned.
+        ``labels``: also return each draw's label, the index of the law it follows (int64, (n,); zeros for one
+        law), as ``(samples, labels)``."""
         source = self.source if generator is None else Source(generator)
         with one_draw():
             if out is not None:
-                return self._sample_out(n, out, source)
-            ns = 1 if n is None else int(n)
-            rows = [torch.empty((ns, c["nout"]), dtype=self.dtype, device=self.device)
-                    for c in self.law["components"]]
-            self._fill(rows, source)
-        return self._deliver(rows, n, output)
+                lab = self._sample_out(n, out, source)
+                res, count = out, as_tensor(out[0] if isinstance(out, (list, tuple)) else out).shape[0]
+            else:
+                count = 1 if n is None else int(n)
+                rows = [torch.empty((count, c["nout"]), dtype=self.dtype, device=self.device)
+                        for c in self.laws[0]["components"]]
+                lab = self._fill(rows, source)
+                res = self._deliver(rows, n, output)
+        if not labels:
+            return res
+        lab = np.zeros(count, dtype=np.int64) if lab is None else lab
+        if (output or self.output or ("numpy" if self.device.type == "cpu" else "torch")) == "torch":
+            lab = _to_device(torch.from_numpy(lab), self.device)
+        return res, (lab[0] if n is None and out is None else lab)
 
     rvs = sample
 
@@ -297,18 +353,27 @@ class DenseSampler(InPlace):
             self._sample_out(None, rows, self.source)
         return rows
 
-    def from_noise(self, z, output=None):
-        """The samples made from given standard normals ``z``: (n, k, r) (or (n, r) for one component), as
-        ``sample`` returns them: the deterministic part of a draw (for antithetic or quasi-random z, or to check a
-        stored sampler against a reference implementation)."""
+    def from_noise(self, z, labels=None, output=None):
+        """The samples made from given standard normals ``z``: (n, k, r) (or (n, r) for one component, r =
+        ``rank``), and for a mixture the draws' ``labels`` (n,), as ``sample`` returns them: the deterministic part
+        of a draw (for antithetic or quasi-random z, or to check a stored sampler against a reference
+        implementation). A draw following a law with fewer columns reads the leading ones of its z."""
         z = torch.as_tensor(z)
         if z.ndim == 2:
             z = z[:, None, :]
-        k, r = self.components, self.rank
+        k, r, n = self.components, self.rank, z.shape[0]
         if tuple(z.shape[1:]) != (k, r):
             raise ValueError(f"z must have shape (n, {k}, {r}), got {tuple(z.shape)}")
-        rows = self._transform(z.to(self.device, self.dtype).reshape(z.shape[0], k * r))
-        return self._deliver([y.to(self.dtype) for y in rows], z.shape[0], output)
+        lab = None
+        if len(self.laws) > 1:
+            if labels is None:
+                raise ValueError(f"a mixture of {len(self.laws)} laws: give the draws' labels (n,)")
+            lab = np.asarray(labels, dtype=np.int64).reshape(-1)
+            if lab.shape != (n,) or (n and (lab.min() < 0 or lab.max() >= len(self.laws))):
+                raise ValueError(f"labels: n = {n} integers in [0, {len(self.laws)})")
+        rows = [torch.empty((n, c["nout"]), dtype=self.dtype, device=self.device) for c in self.laws[0]["components"]]
+        self._write(rows, 0, n, z.to(self.device, self.dtype).reshape(n, k * r), lab)
+        return self._deliver(rows, n, output)
 
     def _sample_out(self, n, out, source):
         bufs = list(out) if isinstance(out, (list, tuple)) else [out]
@@ -320,30 +385,68 @@ class DenseSampler(InPlace):
             rows = [as_tensor(b) for b in bufs]
         else:
             raise ValueError(f"out: one buffer, or one per component ({k})")
-        for r, c in zip(rows, self.law["components"]):
+        for r, c in zip(rows, self.laws[0]["components"]):
             if r.ndim != 2 or r.shape[1] != c["nout"] or (n is not None and r.shape[0] != int(n)):
                 raise ValueError(f"out holds {tuple(r.shape)} values per component, expected (n, {c['nout']})")
-        self._fill(rows, source)
-        return out
+        return self._fill(rows, source)
 
     def _fill(self, rows, source):
-        n = rows[0].shape[0]
+        """Fill the rows with draws in chunks of ``work_values`` values; the draws' labels (None for one law)."""
+        n, many = rows[0].shape[0], len(self.laws) > 1
+        labels = np.empty(n, dtype=np.int64) if many else None
         if n == 0:
-            return
+            return labels
         k, r = self.components, self.rank
-        per = k * (r + 2 * self.latent_points) + sum(c["nout"] for c in self.law["components"])
+        per = k * r + max(k * 2 * int(law["factor"].shape[0]) for law in self.laws) + \
+            sum(c["nout"] for c in self.laws[0]["components"])
         step = max(1, int(self.work_values // max(per, 1)))
         streams = source.streams()
+        edges = np.cumsum(self.weights)[:-1]
         for k0 in range(0, n, step):
             k1 = min(n, k0 + step)
-            z = self._standard_normal(k1 - k0, k * r, streams)
-            for row, y in zip(rows, self._transform(z)):
-                row[k0:k1].copy_(y)
+            lab = None
+            if many:  # the labels from their own stream (on the host: the groups' sizes are known there)
+                lab = labels[k0:k1] = np.searchsorted(edges, streams.labels().random(k1 - k0), side="right")
+            self._write(rows, k0, k1, self._standard_normal(k1 - k0, k * r, streams), lab)
+        return labels
 
-    def _conversion_dtype(self):
-        """The dtype of the conversion to the outputs: float64 for point values in the projection and Bernstein
+    def _write(self, rows, k0, k1, z, labels):
+        """rows[k0:k1] from the standard normals z (k1 - k0, k r) and the draws' labels (None: one law). A mixture's
+        draws are sorted by law (one gather of z): one product per law into its slice of the latent values, then the
+        map and the conversion once per stage (laws whose map, bounds and output maps are the same: the same family
+        and representation under, e.g., another correlation length), and one scatter back to the draws' rows."""
+        if labels is None:
+            for row, y in zip(rows, self._transform(0, z)):
+                row[k0:k1].copy_(y)
+            return
+        k, r = self.components, self.rank
+        order = np.argsort(self._position[labels], kind="stable")
+        counts = np.bincount(labels, minlength=len(self.laws))
+        perm = _to_device(torch.from_numpy(order), self.device)
+        zs = z.view(-1, k, r).index_select(0, perm)
+        at = 0
+        for stage in self._stages:
+            size = int(counts[stage].sum())
+            if not size:
+                continue
+            nlat = int(self.laws[stage[0]]["factor"].shape[0])
+            ws = [torch.empty((size, nlat), dtype=self.dtype, device=self.device) for _ in range(k)]
+            s0 = 0
+            for l in stage:
+                c, rl = int(counts[l]), int(self.laws[l]["factor"].shape[1])
+                if c:
+                    self._latent(l, zs[at + s0:at + s0 + c, :, :rl].reshape(c, k * rl), [w[s0:s0 + c] for w in ws])
+                    s0 += c
+            idx = perm[at:at + size]
+            for row, y in zip(rows, self._convert(stage[0], ws)):
+                where = idx if row.device == idx.device else torch.from_numpy(order[at:at + size]).to(row.device)
+                row[k0:k1].index_copy_(0, where, y.to(row.device, row.dtype))
+            at += size
+
+    def _conversion_dtype(self, l):
+        """The dtype of law l's conversion to the outputs: float64 for point values in the projection and Bernstein
         representations (ill-conditioned conversions), the sampler's otherwise."""
-        return torch.float64 if self.law["work64"] else self.dtype
+        return torch.float64 if self.laws[l]["work64"] else self.dtype
 
     def _standard_normal(self, n, width, streams):
         """(n, width) standard normals of the next n samples of the stream, on the device in the sampler's dtype (see
@@ -371,29 +474,43 @@ class DenseSampler(InPlace):
             self._device[key] = torch.Generator(device=self.device)
         return self._device[key]
 
-    def _transform(self, z):
-        """Samples (one (n, m) tensor per component) from standard normals z (n, k r) in the sampler's dtype on the
-        device: the dense product w = m + F z (the cost of a draw) and the closed-form maps in the sampler's dtype;
-        numerical inversions and pointwise functions, the clamps, the Bernstein pulls and the conversion to the
-        outputs in the conversion dtype (float64 for point values in the projection and Bernstein representations,
-        whose conversions to coefficients are ill-conditioned)."""
-        k, r = self.components, self.rank
-        n = z.shape[0]
-        lin, comps = self._linear(self.dtype), self._conversions()
+    def _transform(self, l, z):
+        """Samples of law l (one (n, m) tensor per component) from standard normals z (n, k r_l) in the sampler's
+        dtype on the device: the dense product w = m + F z (the cost of a draw) and the closed-form maps in the
+        sampler's dtype; numerical inversions and pointwise functions, the clamps, the Bernstein pulls and the
+        conversion to the outputs in the conversion dtype (float64 for point values in the projection and Bernstein
+        representations, whose conversions to coefficients are ill-conditioned)."""
+        return self._convert(l, self._latent(l, z))
+
+    def _latent(self, l, z, out=None):
+        """Law l's latent values w = m + F z per component, (n, |S|) in the sampler's dtype (into ``out``, one
+        tensor per component, if given)."""
+        law = self.laws[l]
+        k, r, n = self.components, int(law["factor"].shape[1]), z.shape[0]
+        lin = self._linear(l)
         x = z.reshape(n, k, r)
         if k > 1:
             x = torch.einsum("ij,njr->nir", lin["mix"], x)
+        ws = []
+        for i in range(k):
+            dst, mean = None if out is None else out[i], lin["means"][i]
+            if r:
+                ws.append(torch.addmm(mean, x[:, i], lin["factor"].T, out=dst))
+            else:
+                ws.append(mean.expand(n, -1).clone() if dst is None else dst.copy_(mean.expand(n, -1)))
+        return ws
+
+    def _convert(self, l, ws):
+        """The outputs from latent values ws (per component) with law l's maps and conversions."""
         out = []
-        for i, c in enumerate(comps):
-            mean = lin["means"][i]
-            w = torch.addmm(mean, x[:, i], lin["factor"].T) if r else mean.expand(n, -1).clone()
-            v = self._map(i, c, w)
+        for i, (c, w) in enumerate(zip(self._conversions(l), ws)):
+            v = self._map(l, i, c, w)
             out.append(v if c["out"] is None else c["out"](v))
         return out
 
-    def _map(self, i, c, w):
-        spec = self.law["components"][i]
-        cd = self._conversion_dtype()
+    def _map(self, l, i, c, w):
+        spec = self.laws[l]["components"][i]
+        cd = self._conversion_dtype(l)
         if spec["map"] in LIVE:  # a numerical inversion or a pointwise function (an object of the process)
             w = w.to(cd)
             t = spec["transform"]
@@ -423,26 +540,26 @@ class DenseSampler(InPlace):
         dev = self.device
         return lambda x: torch.as_tensor(np.asarray(x, dtype=np.float64)).to(dev, dt)
 
-    def _linear(self, dt):
-        """The dense product's arrays on the device in dtype dt (made once per device and dtype): the factor, the
-        mixing of correlated components and the components' means."""
-        key = ("linear", str(self.device), dt)
+    def _linear(self, l):
+        """Law l's dense product on the device in the sampler's dtype (made once per device and dtype): the factor,
+        the mixing of correlated components and the components' means."""
+        key = ("linear", l, str(self.device), self.dtype)
         if key not in self._device:
-            t = self._tensor(dt)
-            self._device[key] = {"factor": t(self.law["factor"]), "mix": t(self.law["mix"]),
-                                 "means": [t(spec["mean"]) for spec in self.law["components"]]}
+            law, t = self.laws[l], self._tensor(self.dtype)
+            self._device[key] = {"factor": t(law["factor"]), "mix": t(law["mix"]),
+                                 "means": [t(spec["mean"]) for spec in law["components"]]}
         return self._device[key]
 
-    def _conversions(self):
-        """The components' maps and conversions on the device (made once per device and dtype): the closed-form maps'
+    def _conversions(self, l):
+        """Law l's maps and conversions on the device (made once per device and dtype): the closed-form maps'
         parameters in the sampler's dtype; the output maps (:class:`_OutputMap`), the clamps and the Bernstein pulls
         in the conversion dtype."""
-        key = ("conversions", str(self.device), self.dtype)
+        key = ("conversions", l, str(self.device), self.dtype)
         if key not in self._device:
-            cd = self._conversion_dtype()
+            cd = self._conversion_dtype(l)
             t, tc = self._tensor(self.dtype), self._tensor(cd)
             comps = []
-            for spec in self.law["components"]:
+            for spec in self.laws[l]["components"]:
                 params = {k: (t(v) if isinstance(v, np.ndarray) else v) for k, v in spec["params"].items()}
                 low, high = _clamp_bounds(spec.get("support"), self.dtype, tc)
                 comps.append({"params": params,
@@ -477,41 +594,14 @@ class DenseSampler(InPlace):
         self._device = DeviceCache()
 
     def save(self, path):
-        """Write the sampler's law to one ``.npz`` file, without pickles or code (see the module docstring for its
-        layout and a NumPy reference sampler). Every map is stored but ``transformed`` with a function other than a
-        NumPy or torch one (which would need its code)."""
-        law = self.law
-        arrays = {"factor": law["factor"], "mix": law["mix"]}
-        for key in ("dofs", "latent_index", "latent_coordinates"):
-            if law.get(key) is not None:
-                arrays[key] = np.asarray(law[key])
-        comps = []
-        for i, spec in enumerate(law["components"]):
-            if spec["map"] == "object":
-                raise NotImplementedError(
-                    f"component {spec['name']}: its map ({spec['label']}) is a user function, whose code a file "
-                    "without pickles cannot hold (NumPy and torch functions are stored by name)")
-            arrays[f"mean{i}"] = spec["mean"]
-            params = {}
-            for name, v in spec["params"].items():
-                if isinstance(v, np.ndarray):
-                    arrays[f"param{i}_{name}"] = v
-                    params[name] = f"param{i}_{name}"
-                else:
-                    params[name] = v
-            entry = {"name": spec["name"], "map": spec["map"], "params": params, "nout": int(spec["nout"]),
-                     "support": _store_pair(spec.get("support"), arrays, f"support{i}"),
-                     "pull": None if spec.get("pull") is None else
-                     {"range": _store_pair(spec["pull"]["range"], arrays, f"range{i}"),
-                      "margin": float(spec["pull"]["margin"])},
-                     "out_shape": None, "stored": spec.get("stored") if spec["map"] in LIVE else None}
-            if spec["out"] is not None:
-                a = sp.coo_matrix(spec["out"])
-                arrays[f"out{i}_rows"], arrays[f"out{i}_cols"], arrays[f"out{i}_vals"] = a.row, a.col, a.data
-                entry["out_shape"] = list(a.shape)
-            comps.append(entry)
-        meta = {"format": FORMAT, "work64": bool(law["work64"]), "components": comps, "info": law["info"],
-                "dtype": str(self.dtype).replace("torch.", "")}
+        """Write the sampler's laws and weights to one ``.npz`` file, without pickles or code (see the module
+        docstring for its layout and a NumPy reference sampler). Every map is stored but ``transformed`` with a
+        function other than a NumPy or torch one (which would need its code)."""
+        arrays, laws = {}, []
+        for l, law in enumerate(self.laws):
+            laws.append(_store_law(law, arrays, f"law{l}/"))
+        meta = {"format": FORMAT, "dtype": str(self.dtype).replace("torch.", ""), "weights": self.weights.tolist(),
+                "laws": laws}
         np.savez(path, meta=np.array(json.dumps(meta, default=_json_default)), **arrays)
 
     @classmethod
@@ -522,29 +612,92 @@ class DenseSampler(InPlace):
             arrays = {k: f[k] for k in f.files}
         meta = json.loads(str(arrays.pop("meta")))
         if meta.get("format") != FORMAT:
-            raise ValueError(f"{path}: not a stored ngsrng dense sampler ({FORMAT})")
-        comps = []
-        for i, c in enumerate(meta["components"]):
-            params = {k: arrays[v] if isinstance(v, str) and v in arrays else v for k, v in c["params"].items()}
-            pull = c.get("pull")
-            out = None
-            if c["out_shape"] is not None:
-                out = sp.csr_matrix((arrays[f"out{i}_vals"], (arrays[f"out{i}_rows"], arrays[f"out{i}_cols"])),
-                                    shape=tuple(c["out_shape"]))
-            spec = {"name": c["name"], "map": c["map"], "params": params, "nout": c["nout"],
-                    "mean": arrays[f"mean{i}"], "out": out, "label": c["map"],
-                    "support": _load_pair(c.get("support"), arrays),
-                    "pull": None if pull is None else {"range": _load_pair(pull["range"], arrays),
-                                                       "margin": pull["margin"]}}
-            if c["map"] in LIVE:
-                spec.update(stored=c["stored"], transform=_rebuild_map(c["map"], c["stored"]))
-            comps.append(spec)
-        law = {"factor": arrays["factor"], "mix": arrays["mix"], "components": comps, "work64": meta["work64"],
-               "dofs": arrays.get("dofs"), "latent_index": arrays.get("latent_index"),
-               "latent_coordinates": arrays.get("latent_coordinates"), "info": meta["info"]}
+            raise ValueError(f"{path}: not a stored ngsrng dense sampler of format {FORMAT} (found "
+                             f"{meta.get('format')!r})")
+        laws = [_load_law(entry, arrays, f"law{l}/") for l, entry in enumerate(meta["laws"])]
         saved = meta.get("dtype")
-        return cls(law, device=device, dtype=dtype if dtype is not None else saved, noise=noise, seed=seed,
-                   output=output)
+        return cls(laws, meta["weights"], device=device, dtype=dtype if dtype is not None else saved, noise=noise,
+                   seed=seed, output=output)
+
+
+def _mixture_weights(weights, k) -> np.ndarray:
+    """The weights of k laws as probabilities (None: equal)."""
+    if k < 1:
+        raise ValueError("a dense sampler needs at least one law")
+    if weights is None:
+        return np.full(k, 1.0 / k)
+    w = np.asarray(weights, dtype=np.float64).reshape(-1)
+    if w.shape != (k,) or not np.all(np.isfinite(w)) or (w < 0).any() or w.sum() <= 0:
+        raise ValueError(f"weights: {k} nonnegative finite numbers, not all zero")
+    return w / w.sum()
+
+
+def _check_outputs(laws):
+    """The laws of one sampler draw the same components with the same output sizes."""
+    first = [c["nout"] for c in laws[0]["components"]]
+    for l, law in enumerate(laws[1:], 1):
+        if [c["nout"] for c in law["components"]] != first:
+            raise ValueError(f"law {l} has outputs {[c['nout'] for c in law['components']]} per component, law 0 "
+                             f"{first}: the laws of a mixture have the same components and output sizes")
+
+
+def _store_law(law, arrays, prefix) -> dict:
+    """Law ``law`` into ``arrays`` (keys with ``prefix``); its description (JSON) with the keys of its arrays."""
+    arrays[prefix + "factor"], arrays[prefix + "mix"] = law["factor"], law["mix"]
+    for key in ("dofs", "latent_index", "latent_coordinates"):
+        if law.get(key) is not None:
+            arrays[prefix + key] = np.asarray(law[key])
+    comps = []
+    for i, spec in enumerate(law["components"]):
+        if spec["map"] == "object":
+            raise NotImplementedError(
+                f"component {spec['name']}: its map ({spec['label']}) is a user function, whose code a file "
+                "without pickles cannot hold (NumPy and torch functions are stored by name)")
+        arrays[f"{prefix}mean{i}"] = spec["mean"]
+        params = {}
+        for name, v in spec["params"].items():
+            if isinstance(v, np.ndarray):
+                arrays[f"{prefix}param{i}_{name}"] = v
+                params[name] = f"{prefix}param{i}_{name}"
+            else:
+                params[name] = v
+        entry = {"name": spec["name"], "map": spec["map"], "params": params, "nout": int(spec["nout"]),
+                 "support": _store_pair(spec.get("support"), arrays, f"{prefix}support{i}"),
+                 "pull": None if spec.get("pull") is None else
+                 {"range": _store_pair(spec["pull"]["range"], arrays, f"{prefix}range{i}"),
+                  "margin": float(spec["pull"]["margin"])},
+                 "out_shape": None, "stored": spec.get("stored") if spec["map"] in LIVE else None}
+        if spec["out"] is not None:
+            a = sp.coo_matrix(spec["out"])
+            arrays[f"{prefix}out{i}_rows"], arrays[f"{prefix}out{i}_cols"] = a.row, a.col
+            arrays[f"{prefix}out{i}_vals"] = a.data
+            entry["out_shape"] = list(a.shape)
+        comps.append(entry)
+    return {"work64": bool(law["work64"]), "components": comps, "info": law["info"]}
+
+
+def _load_law(entry, arrays, prefix) -> dict:
+    comps = []
+    for i, c in enumerate(entry["components"]):
+        params = {k: arrays[v] if isinstance(v, str) and v in arrays else v for k, v in c["params"].items()}
+        pull = c.get("pull")
+        out = None
+        if c["out_shape"] is not None:
+            out = sp.csr_matrix((arrays[f"{prefix}out{i}_vals"],
+                                 (arrays[f"{prefix}out{i}_rows"], arrays[f"{prefix}out{i}_cols"])),
+                                shape=tuple(c["out_shape"]))
+        spec = {"name": c["name"], "map": c["map"], "params": params, "nout": c["nout"],
+                "mean": arrays[f"{prefix}mean{i}"], "out": out, "label": c["map"],
+                "support": _load_pair(c.get("support"), arrays),
+                "pull": None if pull is None else {"range": _load_pair(pull["range"], arrays),
+                                                   "margin": pull["margin"]}}
+        if c["map"] in LIVE:
+            spec.update(stored=c["stored"], transform=_rebuild_map(c["map"], c["stored"]))
+        comps.append(spec)
+    return {"factor": arrays[prefix + "factor"], "mix": arrays[prefix + "mix"], "components": comps,
+            "work64": entry["work64"], "dofs": arrays.get(prefix + "dofs"),
+            "latent_index": arrays.get(prefix + "latent_index"),
+            "latent_coordinates": arrays.get(prefix + "latent_coordinates"), "info": entry["info"]}
 
 
 def _block_seed(seq, block) -> int:
@@ -559,10 +712,30 @@ def _floor_pow2(x) -> int:
 
 
 def _to_device(t, device):
-    """A host tensor on ``device``; to a GPU from pinned memory, so that the host does not wait for the device."""
+    """A host tensor on ``device``, without waiting for the device's queue (the driver stages a non-blocking copy from
+    pageable memory before it returns)."""
     if device.type == "cpu":
         return t
-    return t.pin_memory().to(device, non_blocking=True)
+    return t.to(device, non_blocking=True)
+
+
+def _stage_key(law):
+    """What a law's conversion depends on beyond its latent values: the number of latent values and, per component,
+    the map, its parameters, the support, the pull and the output map."""
+    def pair(p):
+        return None if p is None else tuple(_digest(np.asarray(b)) if isinstance(b, np.ndarray) else b for b in p)
+
+    key = [bool(law["work64"]), int(law["factor"].shape[0])]
+    for c in law["components"]:
+        live = None
+        if c["map"] in LIVE:
+            stored = c.get("stored")
+            live = json.dumps(stored, sort_keys=True, default=_json_default) if stored else ("object",
+                                                                                              id(c.get("transform")))
+        key.append((c["map"], tuple(sorted((k, _digest(v)) for k, v in c["params"].items())), pair(c.get("support")),
+                    None if c.get("pull") is None else (pair(c["pull"]["range"]), float(c["pull"]["margin"])),
+                    int(c["nout"]), None if c["out"] is None else _digest(sp.csr_matrix(c["out"])), live))
+    return tuple(key)
 
 
 class _OutputMap:
@@ -948,7 +1121,7 @@ def dense(source, dofs=None, observe=None, *, rank=None, tol=None, rtol=RTOL, pi
     key = law_key + (str(device), str(dtype), noise, _digest(seed), output)
     if key not in samplers:
         src = seed if seed is not None else _child_source(parent)
-        samplers[key] = DenseSampler(law, device=device, dtype=dtype, noise=noise, seed=src, output=output)
+        samplers[key] = DenseSampler([law], device=device, dtype=dtype, noise=noise, seed=src, output=output)
     return samplers[key]
 
 
