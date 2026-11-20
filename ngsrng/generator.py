@@ -137,7 +137,21 @@ def _nparams(name) -> int:
 
 
 def _field_key(name, args, kwargs, corr, opts):
-    return name, _freeze(args), _freeze(kwargs), tuple(sorted((k, id(v)) for k, v in corr.items())), _freeze(opts)
+    return name, _freeze(args), _freeze(kwargs), tuple(sorted((k, _corr_key(v)) for k, v in corr.items())), \
+        _freeze(opts)
+
+
+def _corr_key(spec):
+    """A correlation specification as a key: Matérn correlations (also as a length or a dict of its arguments) by
+    their values, so that equal ones share their fields; other specifications by identity."""
+    if isinstance(spec, numbers.Real):
+        spec = matern(float(spec))
+    elif isinstance(spec, dict):
+        spec = matern(**spec)
+    if isinstance(spec, MaternCorrelation):
+        return ("matern", spec.length, spec.nu, spec.rtol, spec.boundary, repr(spec.beta),
+                repr(sorted(spec.options.items())))
+    return ("id", id(spec))
 
 
 def _rekey_gaussian(key, value):
@@ -502,6 +516,10 @@ class Generator:
             spec = matern(float(spec))
         elif isinstance(spec, dict):
             spec = matern(**spec)
+        if isinstance(spec, MaternCorrelation) and spec.random:
+            raise ValueError(f"the correlation has random parameters ({', '.join(spec.random)}): the field is a "
+                             "mixture over them, not one Gaussian; draw it with rng.distribution(name, ..., "
+                             "correlation=...) (rng.distribution('normal', ...) for the Gaussian field)")
         key = (("matern", spec.length, spec.nu, spec.rtol, spec.boundary, spec.beta, repr(sorted(spec.options.items())))
                if isinstance(spec, MaternCorrelation) else ("id", id(spec)))
         if key not in self._gaussians:
@@ -828,6 +846,9 @@ class Generator:
         """
         name = _canonical(name)
         args, size, output, out = self._split(name, args, kwargs)
+        spec = self._random_correlation(kwargs)
+        if spec is not None:
+            return self._over_parameters(name, args, kwargs, spec).sample(size, output=output, out=out)
         return self._draw(self._field(name, args, kwargs), size, output, name, out=out)
 
     def distribution(self, name, *args, **kwargs) -> FieldDistribution:
@@ -835,7 +856,38 @@ class Generator:
         name = _canonical(name)
         if "size" in kwargs or "output" in kwargs or "out" in kwargs:
             raise TypeError("pass size/output/out to FieldDistribution.sample")
+        spec = self._random_correlation(kwargs)
+        if spec is not None:  # random correlation parameters: the mixture over them (ngsrng.parameters)
+            return self._over_parameters(name, args, kwargs, spec)
         return FieldDistribution(self, name, self._field(name, args, kwargs))
+
+    def _random_correlation(self, kwargs):
+        """The Matérn correlation with random parameters a call uses (given, or the generator's), or None."""
+        given = [kwargs[k] for k in CORRELATION_KEYS if kwargs.get(k) is not None]
+        spec = _as_spec("correlation", given[0]) if given else self.correlation
+        if isinstance(spec, dict):
+            spec = matern(**spec)
+        return spec if isinstance(spec, MaternCorrelation) and spec.random else None
+
+    def _over_parameters(self, name, args, kwargs, spec):
+        """The field with random correlation parameters: the finite mixture over the values of the parameters with
+        finitely many, of the field at those values, or of the continuous mixture over the others
+        (:class:`ngsrng.mixture.ParameterMixture`)."""
+        import itertools
+
+        from .mixture import Mixture, ParameterMixture
+
+        rest = {k: v for k, v in kwargs.items() if k not in CORRELATION_KEYS}
+        finite = {k: p for k, p in spec.random.items() if p.finite}
+        if not finite:
+            return ParameterMixture(self, name, args, rest, spec)
+        laws, weights, values = [], [], []
+        for combo in itertools.product(*[zip(p.values, p.weights) for p in finite.values()]):
+            vals = {k: float(v) for k, (v, _) in zip(finite, combo)}
+            laws.append(self.distribution(name, *args, correlation=spec.at(**vals), **rest))
+            weights.append(math.prod(w for _, w in combo))
+            values.append(vals)
+        return Mixture(laws, weights, values=values)
 
     def info(self, name, *args, **kwargs) -> dict:
         """The law and the automatically chosen algorithms for a distribution."""
