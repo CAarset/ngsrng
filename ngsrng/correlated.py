@@ -28,7 +28,9 @@ of the latents, m_i their means and R = L L^T the k x k cross-correlation (Chole
   transformation of the data is needed, and copies of one posterior are fine.
 - **What the components must share**: the latent covariance (after the pointwise standardisation), and the points
   where the latents live (the same space and representation, or the same ``points=``); for Gaussian fields, the
-  covariance of the coefficients. The constructor checks both (the covariance with two random probes). Bernstein
+  covariance of the coefficients. The constructor checks both: Gaussians built from the same specification (space,
+  precision or Matérn parameters, exact or the same approximate noise) share their covariance whatever their solver,
+  device or arithmetic; others are compared with two random probes. Bernstein
   fields of one space that live at different domain points (``bnd=`` puts one at its trace's points only) are
   rebuilt at the union of the points first: the joint law is that of the unrestricted fields, restricted afterwards.
 - **Cost**: the components' own draws plus a k x k mix per point and sample.
@@ -53,7 +55,10 @@ from .inplace import InPlace, as_tensor, write
 
 __all__ = ["correlated", "CorrelatedFields"]
 
-PROBE_RTOL = 1e-6  # relative difference of the probed latent covariances above which the components differ
+# relative difference of the probed latent covariances above which the components differ: for float64 pipelines, and
+# when a float32 one is among them (float32 solves are accurate to about cond(K) 6e-8: 2e-6 measured at 5e4 DoFs)
+PROBE_RTOL = 1e-6
+PROBE_RTOL_32 = 1e-3
 
 
 def correlated(components, cross_correlation):
@@ -399,10 +404,17 @@ def _check_shared(parts):
             if a.shape != b.shape or (a != b).nnz:
                 raise ValueError(f"{p.name}: the components' latents must live at the same points (same space, "
                                  "representation, order and points=)")
-    # the covariance of the latent fluctuations: two random probes (skipped for shared latents)
+    # the covariance of the latent fluctuations: the same by construction (shared latents, or Gaussians from equal
+    # specifications), else two random probes
     distinct = {(id(p.gauss), id(p.points)) for p in parts}
     if len(distinct) == 1:
         return
+    keys = [_covariance_key(p.gauss) for p in parts]
+    if keys[0] is not None and all(k == keys[0] for k in keys):
+        return
+    import torch
+
+    rtol = PROBE_RTOL_32 if any(_work_dtype(p.gauss) == torch.float32 for p in parts) else PROBE_RTOL
     v = np.random.default_rng(0).standard_normal((parts[0].latent_size(), 2))
     ref = parts[0].probe(v)
     scale = max(np.abs(ref).max(), 1e-300)
@@ -410,8 +422,41 @@ def _check_shared(parts):
         if (id(p.gauss), id(p.points)) == (id(parts[0].gauss), id(parts[0].points)):
             continue
         diff = np.abs(p.probe(v) - ref).max() / scale
-        if diff > PROBE_RTOL:
+        if diff > rtol:
             raise ValueError(
                 f"{p.name}: the components' latent Gaussians differ in covariance (relative difference {diff:.1e}). "
                 "Correlated components share one latent covariance: build them on one prior, or on posteriors of "
                 "one prior conditioned at the same points with the same noise (their data may differ)")
+
+
+def _covariance_key(g):
+    """What determines a Gaussian's covariance, as a key (equal keys: the same covariance, whatever the solver, device
+    or arithmetic), or None when it is not known (posteriors, covariances given as operators)."""
+    import dataclasses
+
+    from .gaussian import Gaussian
+    from .specs import PDEPrecision
+    from .stationary import StationaryMatern
+
+    if getattr(g, "_prior", None) is not None or getattr(g, "_maps", None) or getattr(g, "_post_maps", None):
+        return None
+    if isinstance(g, Gaussian) and isinstance(g.spec, PDEPrecision) and dataclasses.is_dataclass(g.spec.form):
+        form = g.spec.form
+        values = tuple((f.name, getattr(form, f.name) if isinstance(getattr(form, f.name), (int, float, str))
+                        or getattr(form, f.name) is None else ("id", id(getattr(form, f.name))))
+                       for f in dataclasses.fields(form))
+        noise = "exact" if g.plan.get("exact", True) else g.plan.get("noise")
+        return ("pde", id(g.space.fes), type(form).__name__, values, g.spec.power, g.spec.scale, g.spec.rtol, noise)
+    if isinstance(g, StationaryMatern):
+        return ("stationary", id(g.space.fes), g.length, g.nu, g.construction, g.method, g.tol,
+                repr(g.plan.get("source", {}).get("box")), repr(g.plan.get("source", {}).get("cells")))
+    return None
+
+
+def _work_dtype(g):
+    """The arithmetic of a Gaussian's pipeline (of its prior for derived ones)."""
+    import torch
+
+    from .distributions.pointwise import prior_of
+
+    return getattr(prior_of(g), "_work_dtype", torch.float64)
