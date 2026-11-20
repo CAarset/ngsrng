@@ -37,6 +37,7 @@ from datetime import datetime
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 LENGTH = 0.3
+DENSE_REFERENCE = 3000  # quadrature points up to which the exact dense kernel is computed as the reference (time)
 
 PROFILES = {
     "quick": [("square", 0.1, 2, 1.0), ("square", 0.1, 2, 2.0), ("lshape", 0.1, 2, 1.0),
@@ -79,7 +80,7 @@ def run_one(domain, h, order, nu, prior, seed=0):
     import ngsolve as ngs
     import numpy as np
     import torch
-    from ngsrng.stationary import MAX_DENSE, basis_at, matern_function
+    from ngsrng.stationary import basis_at, matern_function
 
     mesh = make_mesh(domain, h)
     dirichlet = prior.endswith("+dirichlet")
@@ -102,8 +103,8 @@ def run_one(domain, h, order, nu, prior, seed=0):
         if meth == "dense":
             from ngsrng.quadrature import QuadratureRule
             from ngsrng.space import SpaceInfo
-            if QuadratureRule.count(SpaceInfo(fes)) > MAX_DENSE:
-                return {**out, "skipped": f"more than {MAX_DENSE} quadrature points"}
+            if QuadratureRule.count(SpaceInfo(fes)) > DENSE_REFERENCE:
+                return {**out, "skipped": f"more than {DENSE_REFERENCE} quadrature points"}
         g = ngsrng.matern_correlation(LENGTH, nu, boundary=cons, method=meth).bind(fes, seed=seed)  # StationaryMatern
         out["source"] = g.plan["source"]
         out["conditioning"] = g.plan["conditioning"]

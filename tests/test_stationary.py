@@ -67,13 +67,44 @@ def test_circulant_embedding_is_exact_on_the_grid():
     assert (src.values(eta) * y).sum() == pytest.approx((eta * src.values_t(y)).sum(), rel=1e-12)
 
 
-def test_dense_source_is_the_kernel():
+def test_dense_source_is_the_kernel(monkeypatch):
     pts = np.random.default_rng(1).random((80, 2))
-    src = _DenseSource(pts, LENGTH, 2.0, max_points=100)
+    src = _DenseSource(pts, LENGTH, 2.0)
     dist = np.linalg.norm(pts[:, None] - pts[None], axis=-1)
     np.testing.assert_allclose(src.r @ src.r.T, matern_function(dist, LENGTH, 2.0), atol=1e-10)
-    with pytest.raises(MemoryError, match="max_dense"):
-        _DenseSource(pts, LENGTH, 2.0, max_points=50)
+    monkeypatch.setattr(st, "available_memory", lambda: 2 * st._dense_bytes(50))  # room for 50 points, not 80
+    with pytest.raises(MemoryError, match="GiB"):
+        _DenseSource(pts, LENGTH, 2.0)
+
+
+@pytest.mark.parametrize("nu", [0.5, 2.0])
+def test_interpolation_error_is_exact(nu):
+    """The FFT route's pointwise variance shortfall, from one cell's corner kernel, is that of its interpolation
+    matrix and the exact kernel at the grid nodes."""
+    pts = np.random.default_rng(2).random((60, 2))
+    src = _GridSource(pts, np.zeros(2), np.ones(2), LENGTH, nu, 0.07)
+    w = src.w.tocsr()
+    nodes = np.array(np.unravel_index(np.arange(int(np.prod(src.n))), src.n)).T * np.asarray(src.h)
+    var = [w[i].data @ matern_function(np.linalg.norm(nodes[w[i].indices][:, None] - nodes[w[i].indices][None],
+                                                      axis=-1), LENGTH, nu) @ w[i].data for i in range(60)]
+    assert src.info["interpolation_error"] == pytest.approx(1.0 - min(var), rel=1e-12, abs=1e-15)
+
+
+def test_restrict_auto_and_grid_refinement(square, monkeypatch):
+    """"auto": dense for few points, FFT for many (operation counts); the FFT grid is refined until its interpolation
+    error meets the tolerance; a given resolution that does not raises."""
+    import ngsrng.resolution as res
+
+    monkeypatch.setattr(res, "RESOLUTION_TOL", 0.01)
+    coarse = ngs.H1(ngs.Mesh(ngs.unit_square.GenerateMesh(maxh=1.0)), order=1)  # a dozen points
+    assert ngsrng.StationaryMatern(coarse, 2.0, 2.0, construction="restrict", resolution_tol=None).method == "dense"
+    g = ngsrng.StationaryMatern(ngs.H1(square, order=2), 1.5, 1.0, construction="restrict", resolution_tol=0.002)
+    src = g.plan["source"]
+    assert g.method == "fft" and src["interpolation_error"] <= 0.002
+    assert src["spacing"][0] < 0.1 / 4  # refined beyond a quarter of the mesh size
+    with pytest.raises(ValueError, match="smaller resolution"):
+        ngsrng.StationaryMatern(ngs.H1(square, order=2), 1.5, 1.0, construction="restrict", method="fft",
+                                resolution=0.1, resolution_tol=0.002)
 
 
 @pytest.mark.parametrize("construction, method", [("torus", "auto"), ("restrict", "fft")])

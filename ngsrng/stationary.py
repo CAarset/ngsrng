@@ -21,14 +21,20 @@ not depend on position. Two constructions:
     isotropic. Methods:
 
     - "dense": the kernel matrix at the quadrature points and its eigendecomposition. Exact; O(n^3) time and O(n^2)
-      memory in the number n of points, so for small problems (``max_dense`` points). The reference.
+      memory in the number n of points (a clear error where it does not fit in memory). The reference.
     - "fft": circulant embedding (Wood & Chan 1994; Dietrich & Newsam 1997; Graham et al. 2018) on a regular grid over
       the domain's bounding box, embedded in a periodic grid that is enlarged until the embedding is positive
       semidefinite. Exact at the grid nodes when it is; the field at the quadrature points is the multilinear
-      interpolant of the grid values. O(N log N) per sample in the grid size N, which depends on the bounding box and
-      the grid spacing, not on the mesh.
+      interpolant of the grid values, whose pointwise variance w^T K_c w (w the point's interpolation weights, K_c the
+      kernel between the corners of its grid cell) falls short of 1 between the nodes. That shortfall is computed
+      exactly at set-up, and the grid spacing (from a quarter of the mesh size in 1D and 2D, half in 3D) is halved
+      until it is at most ``resolution_tol`` (default ``ngsrng.resolution.RESOLUTION_TOL``, 1%) at every point
+      (``plan["source"]["interpolation_error"]``); a given ``resolution`` is used as it is, and raises if too coarse.
+      O(N log N) per sample in the grid size N, which depends on the bounding box and the grid spacing, not on the
+      mesh.
 
-    "auto": dense up to ``max_dense`` points, fft beyond.
+    "auto": dense when its eigendecomposition (n^3 operations) costs at most ``ngsrng.covariance.AUTO_RATIO`` times
+    the FFT's set-up (N log N for its embedding) and fits in memory, fft otherwise.
 
 Either field is represented on the given FE space by its L2 projection: the values g at the quadrature points of the
 space give the coefficients M^-1 B g, as for ``representation="projection"`` of the distributions. The rule has degree
@@ -85,8 +91,6 @@ from .solvers import NGSolveDirect
 from .space import SpaceInfo, coefficient_vector, mass_form
 
 CONSTRUCTIONS = {"torus": ("spde",), "restrict": ("dense", "fft")}
-MAX_DENSE = 3000  # quadrature points up to which construction="restrict" uses the exact dense kernel by default (an
-# eigendecomposition of about 20 s on a laptop; the cost grows with the cube)
 DENSE_CONDITIONING_VALUES = 2**24  # Sigma_FD Sigma_DD^-1 kept (n_free x n_D values) up to this size
 EMBEDDING_GROWTH = 1.25  # circulant embedding: enlarge the periodic grid by this factor until it is PSD
 EMBEDDING_MAX_FACTOR = 8  # ... up to this many times the grid (per direction)
@@ -297,10 +301,10 @@ class _DenseSource:
 
     method = "dense"
 
-    def __init__(self, points, length, nu, max_points, rtol=1e-12):
+    def __init__(self, points, length, nu, rtol=1e-12):
         n = len(points)
-        if n > max_points:
-            raise MemoryError(f"the dense Matérn kernel needs {n} x {n} values (limit max_dense={max_points}): "
+        if not _dense_fits(n):
+            raise MemoryError(f"the dense Matérn kernel of {n} points needs about {_dense_bytes(n) / 2**30:.1f} GiB: "
                               "use method='fft' or construction='torus'")
         from scipy.spatial.distance import cdist
 
@@ -330,6 +334,55 @@ class _DenseSource:
         return self._r(g.device).T @ g
 
 
+def _dense_bytes(n) -> int:
+    """Memory of the dense kernel's eigendecomposition (the matrix, its eigenvectors and LAPACK's workspace)."""
+    return 3 * 8 * n * n
+
+
+def _dense_fits(n) -> bool:
+    mem = available_memory()
+    return mem is None or _dense_bytes(n) <= 0.5 * mem
+
+
+def grid_geometry(lo, hi, spacing):
+    """Nodes per direction and the spacings of a regular grid over [lo, hi] with spacing at most ``spacing``."""
+    extent = np.maximum(np.asarray(hi, dtype=float) - np.asarray(lo, dtype=float), 0.0)
+    n = [max(2, int(math.ceil(e / spacing)) + 1) for e in extent]
+    return n, [e / (k - 1) if e > 0 else spacing for e, k in zip(extent, n)]
+
+
+def _cell_weights(points, lo, n, h):
+    """Multilinear interpolation: per point its grid cell (lower node, per direction) and the weights of the cell's
+    2^d corners (npoints x 2^d, corner c with bit k = upper node in direction k)."""
+    d = points.shape[1]
+    t = (points - lo) / np.asarray(h)
+    idx = np.clip(np.floor(t).astype(int), 0, np.asarray(n) - 2)
+    frac = np.clip(t - idx, 0.0, 1.0)
+    w = np.ones((len(points), 2**d))
+    for corner in range(2**d):
+        for k in range(d):
+            w[:, corner] *= frac[:, k] if (corner >> k) & 1 else 1.0 - frac[:, k]
+    return idx, w
+
+
+def interpolation_error(points, lo, hi, spacing, length, nu) -> float:
+    """The largest shortfall of the pointwise variance of the multilinear interpolant of the exact Matérn field on a
+    grid of spacing at most ``spacing``, at ``points``: max (1 - w^T K_c w), K_c the kernel between a cell's corners."""
+    n, h = grid_geometry(lo, hi, spacing)
+    _, w = _cell_weights(np.asarray(points, dtype=float), np.asarray(lo, dtype=float), n, h)
+    d = len(n)
+    bits = np.array([[(c >> k) & 1 for k in range(d)] for c in range(2**d)], dtype=float) * np.asarray(h)
+    kc = matern_function(np.linalg.norm(bits[:, None] - bits[None], axis=-1), length, nu)
+    return float(np.max(1.0 - np.einsum("pi,ij,pj->p", w, kc, w)))
+
+
+def _embedding_operations(n) -> float:
+    """Operations of the circulant embedding's set-up (an FFT of the periodic grid of 2 (n_k - 1) nodes per
+    direction)."""
+    m = float(np.prod([2 * (k - 1) for k in n]))
+    return m * math.log2(max(m, 2.0))
+
+
 class _GridSource:
     """Circulant embedding of the Matérn kernel on a regular grid over the bounding box [lo, hi], interpolated
     multilinearly to the target points.
@@ -343,9 +396,7 @@ class _GridSource:
     method = "fft"
 
     def __init__(self, points, lo, hi, length, nu, spacing):
-        extent = np.maximum(hi - lo, 0.0)
-        self.n = [max(2, int(math.ceil(e / spacing)) + 1) for e in extent]
-        self.h = [e / (k - 1) if e > 0 else spacing for e, k in zip(extent, self.n)]
+        self.n, self.h = grid_geometry(lo, hi, spacing)
         self.lo = np.asarray(lo, dtype=float)
         m = [2 * (k - 1) for k in self.n]
         attempts, clipped = 0, 0.0
@@ -369,26 +420,20 @@ class _GridSource:
         self.nrand = 2 * self.M
         self.w = self._interpolation(points)
         self.info = {"grid": self.n, "spacing": [float(x) for x in self.h], "embedding": m, "attempts": attempts,
-                     "clipped": clipped, "exact_on_grid": bool(ok)}
+                     "clipped": clipped, "exact_on_grid": bool(ok),
+                     "interpolation_error": interpolation_error(points, lo, hi, spacing, length, nu)}
 
     def _interpolation(self, points):
         """Multilinear interpolation weights (npoints x prod(n)) from the grid nodes to the points."""
         d = points.shape[1]
-        t = (points - self.lo) / np.asarray(self.h)
-        idx = np.clip(np.floor(t).astype(int), 0, np.asarray(self.n) - 2)
-        frac = np.clip(t - idx, 0.0, 1.0)
+        idx, wc = _cell_weights(points, self.lo, self.n, self.h)
         strides = np.cumprod([1] + self.n[::-1][:-1])[::-1]  # C order: last axis fastest
         rows, cols, vals = [], [], []
         for corner in range(2**d):
-            bits = [(corner >> k) & 1 for k in range(d)]
-            wgt = np.ones(len(points))
-            lin = np.zeros(len(points), dtype=np.int64)
-            for k, bit in enumerate(bits):
-                wgt *= frac[:, k] if bit else 1.0 - frac[:, k]
-                lin += (idx[:, k] + bit) * strides[k]
+            lin = sum((idx[:, k] + ((corner >> k) & 1)) * strides[k] for k in range(d))
             rows.append(np.arange(len(points)))
             cols.append(lin)
-            vals.append(wgt)
+            vals.append(wc[:, corner])
         w = sp.csr_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
                           shape=(len(points), int(np.prod(self.n))))
         w.sum_duplicates()
@@ -483,7 +528,7 @@ class StationaryMatern(DenseOf, InPlace, Rebuildable):
     """
 
     def __init__(self, fes, length, nu=1.0, *, construction=None, method="auto", mean=None, seed=None, tol=1e-3,
-                 resolution=None, max_dense=MAX_DENSE, rtol=1e-7, method_options=None, device="cpu", engine=None,
+                 resolution=None, rtol=1e-7, method_options=None, device="cpu", engine=None,
                  resolution_tol="default"):
         if construction not in CONSTRUCTIONS:
             raise ValueError("construction has no default: 'torus' (the Matérn SPDE on a periodic box around the "
@@ -525,15 +570,21 @@ class StationaryMatern(DenseOf, InPlace, Rebuildable):
         from .resolution import check_resolution
 
         check_resolution(fes, self.length, self.nu, h=h, tol=resolution_tol)  # the elements resolve the length
+        spacing = None
+        if construction == "restrict" and method in (None, "fft"):  # the FFT grid, refined to the tolerance
+            spacing = self._grid_spacing(points, lo, hi, h, d, resolution, resolution_tol)
         if method is None:
-            method = "dense" if len(points) <= max_dense else "fft"
+            from .covariance import auto_exact
+
+            n_grid, _ = grid_geometry(lo, hi, spacing)
+            cheap = auto_exact(float(len(points)) ** 3, _embedding_operations(n_grid))
+            method = "dense" if cheap and _dense_fits(len(points)) else "fft"
         if method == "spde":
             self._src = _TorusSource(points, lo, hi, self.length, self.nu, self.tol, h, max(1, self.space.order),
                                      rtol, method_options, self.device, self._torch)
         elif method == "dense":
-            self._src = _DenseSource(points, self.length, self.nu, max_dense)
+            self._src = _DenseSource(points, self.length, self.nu)
         else:
-            spacing = h / (4 if d <= 2 else 2) if resolution is None else h
             self._src = _GridSource(points, lo, hi, self.length, self.nu, spacing)
         self.method = method
         self._mass = NGSolveDirect(self._full, mass_form)
@@ -555,6 +606,34 @@ class StationaryMatern(DenseOf, InPlace, Rebuildable):
         # pointwise families standardise a conditioned field by the field it was conditioned from (as posteriors by
         # their prior): here the field before the boundary update (ngsrng.distributions.pointwise)
         self.unconditioned = None if self._cond is None else self._unconditioned()
+
+    def _grid_spacing(self, points, lo, hi, h, d, resolution, resolution_tol):
+        """The FFT grid's spacing: ``resolution`` as given (raising if its interpolation error exceeds the tolerance),
+        or from a quarter of the mesh size (half in 3D), halved until the error is within it and the grid fits in
+        memory."""
+        from .resolution import DEFAULT, RESOLUTION_TOL
+
+        tol = RESOLUTION_TOL if resolution_tol == DEFAULT else resolution_tol
+        if resolution is not None or tol is None:
+            spacing = h / (4 if d <= 2 else 2) if resolution is None else h
+            err = interpolation_error(points, lo, hi, spacing, self.length, self.nu)
+            if tol is not None and err > tol:
+                raise ValueError(f"the FFT grid of spacing {spacing:.3g} interpolates the field with a pointwise "
+                                 f"variance error of {err:.1%} (tolerance {tol:.1%}): pass a smaller resolution")
+            return spacing
+        spacing = h / (4 if d <= 2 else 2)
+        mem = available_memory()
+        while True:
+            err = interpolation_error(points, lo, hi, spacing, self.length, self.nu)
+            if err <= tol:
+                return spacing
+            n, _ = grid_geometry(lo, hi, spacing / 2)
+            need = 64 * float(np.prod([2 * (k - 1) for k in n]))  # the embedding and its FFTs (complex128)
+            if mem is not None and need > 0.5 * mem:
+                raise MemoryError(f"the FFT grid that interpolates the field to {tol:.1%} (spacing below "
+                                  f"{spacing:.3g}, error {err:.1%} there) needs about {need / 2**30:.1f} GiB: use "
+                                  "construction='torus', a longer length or a larger resolution_tol")
+            spacing /= 2
 
     def _unconditioned(self):
         """The field before its boundary update: same source, mean and randomness, all used dofs free."""

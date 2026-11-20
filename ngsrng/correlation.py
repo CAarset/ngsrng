@@ -20,7 +20,7 @@ No local boundary condition keeps the variance exactly constant and the correlat
 ``boundary="torus"`` and ``boundary="restrict"`` use no boundary condition: the field is
 :class:`ngsrng.StationaryMatern` (the SPDE on a periodic box around the domain, or the Matérn covariance of R^d
 restricted to the domain; on spaces with Dirichlet dofs, conditioned on its trace there). Their options (``method``,
-``tol``, ``resolution``, ``max_dense``, ``method_options``) are passed on; ``bind(fes)`` returns the sampler.
+``tol``, ``resolution``, ``method_options``) are passed on; ``bind(fes)`` returns the sampler.
 
 **Random parameters.** ``length`` and ``nu`` may be laws (:mod:`ngsrng.parameters`): a ``scipy.stats``
 distribution, drawn anew for every draw of a field. A field with such a correlation (``rng.distribution(...,
@@ -53,7 +53,7 @@ REQUIRED = _Required()
 
 BOUNDARIES = ("neumann", "robin", "torus", "restrict")
 STATIONARY = ("torus", "restrict")  # no boundary condition: ngsrng.StationaryMatern with construction=boundary
-STATIONARY_OPTIONS = ("method", "tol", "resolution", "max_dense", "method_options")
+STATIONARY_OPTIONS = ("method", "tol", "resolution", "method_options")
 
 ROBIN_REQUIRED = (
     "boundary='robin' needs the Robin coefficient beta (the condition du/dn + beta u = 0; it has no default, since the "
@@ -182,7 +182,7 @@ def matern(length: float, nu: float = 1.0, rtol: float = 1e-7, boundary: str = "
     keeps the pointwise variance closest to constant (:func:`ngsrng.tune_robin`: seconds per space, cached;
     ``.robin_tuning(fes)`` reports the estimate and the remaining deviation), or no boundary condition at all:
     "torus" or "restrict", the stationary field of :class:`ngsrng.StationaryMatern` (constant variance up to the
-    boundary; ``options``: its ``method``, ``tol``, ``resolution``, ``max_dense``, ``method_options``).
+    boundary; ``options``: its ``method``, ``tol``, ``resolution``, ``method_options``).
 
     ``resolution_tol``: bound to a space, the field checks that the mesh resolves its length (:mod:`ngsrng.resolution`:
     the discrete field's pointwise variance within this relative error of the continuous field's; default
