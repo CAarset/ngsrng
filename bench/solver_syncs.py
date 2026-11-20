@@ -45,6 +45,9 @@ import torch  # before ngsolve
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import ngsrng  # noqa: E402
+import ngsrng.resolution  # noqa: E402
+
+ngsrng.resolution.RESOLUTION_TOL = None  # timings at fixed mesh sizes, resolved or not: no resolution check
 from ngsrng.blackbox import MultiShiftPCG  # noqa: E402
 from ngsrng.calibration.common import make_space  # noqa: E402
 from ngsrng.distributions.mixtures import torch_gamma  # noqa: E402

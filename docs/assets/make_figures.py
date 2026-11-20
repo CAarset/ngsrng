@@ -36,14 +36,14 @@ def show(ax, field, mesh=None, title=None, width=520, **kw):
 def fields():
     """(field, mesh, title, options) for the banner and the gallery."""
     out = {}
-    m = domains.NGSCircle(maxh=0.04).mesh
-    r = ngsrng.default_rng(ngs.H1(m, order=2), seed=3, correlation=ngsrng.matern_correlation(0.25, nu=1.0))
+    m = domains.NGSCircle(maxh=0.035).mesh
+    r = ngsrng.default_rng(ngs.H1(m, order=2), seed=3, correlation=ngsrng.matern_correlation(0.3, nu=1.0))
     out["gaussian"] = (r.normal(), m, "Gaussian (Matérn)", {})
     m = domains.NGSDoubleHalfPipes(maxh=0.05).mesh
     r = ngsrng.default_rng(ngs.H1(m, order=2), seed=5, correlation=ngsrng.matern_correlation(0.4, nu=1.5))
     out["lognormal"] = (r.lognormal(0.0, 0.6, representation="bernstein"), m, "log-normal", {})
     m = domains.NGSPerforated(maxh=0.03).mesh
-    r = ngsrng.default_rng(ngs.H1(m, order=2), seed=2, correlation=ngsrng.matern_correlation(0.2, nu=1.0))
+    r = ngsrng.default_rng(ngs.H1(m, order=2), seed=2, correlation=ngsrng.matern_correlation(0.25, nu=1.0))
     out["uniform"] = (r.uniform(representation="bernstein"), m, "uniform", {"vmin": 0, "vmax": 1})
     m = domains.NGSLShaped(maxh=0.03).mesh
     V = ngs.H1(m, order=2)
@@ -52,16 +52,16 @@ def fields():
                     if not (x > 0.5 and y > 0.5)])
     var = ngsrng.pointwise_variance(prior.condition(points=pts, noise=1e-3))
     out["posterior"] = (ngs.sqrt(ngs.IfPos(var, var, 0)), m, "posterior std (exact)", {})
-    m = domains.NGSEllipseInPolygon(maxh=0.04).mesh
-    r = ngsrng.default_rng(ngs.H1(m, order=2), seed=7, correlation=ngsrng.matern_correlation(0.3, nu=0.5))
-    out["rough"] = (r.normal(), m, "rough (ν = 1/2)", {})
+    m = domains.NGSEllipseInPolygon(maxh=0.035).mesh
+    r = ngsrng.default_rng(ngs.H1(m, order=2), seed=7, correlation=ngsrng.matern_correlation(0.3, nu=1.0))
+    out["rough"] = (r.normal(), m, "rough (ν = 1)", {})
     r = ngsrng.default_rng(ngs.H1(m, order=2), seed=7, correlation=ngsrng.matern_correlation(0.3, nu=3.0))
     out["smooth"] = (r.normal(), m, "smooth (ν = 3)", {})
     m = domains.NGSDoubleSlit(maxh=0.04).mesh
-    r = ngsrng.default_rng(ngs.H1(m, order=2), seed=4, correlation=ngsrng.matern_correlation(0.3, nu=1.0))
+    r = ngsrng.default_rng(ngs.H1(m, order=2), seed=4, correlation=ngsrng.matern_correlation(0.33, nu=1.0))
     out["gamma"] = (r.gamma(2.0, representation="bernstein"), m, "gamma(2)", {})
     cube = ngs.Mesh(ngs.unit_cube.GenerateMesh(maxh=0.08))
-    r = ngsrng.default_rng(ngs.H1(cube, order=1), seed=9, correlation=ngsrng.matern_correlation(0.3, nu=1.5))
+    r = ngsrng.default_rng(ngs.H1(cube, order=2), seed=9, correlation=ngsrng.matern_correlation(0.5, nu=2.5))
     out["3d"] = (r.normal(), cube, "3D", {"elev": 25, "azim": -55})
     return out
 

@@ -39,6 +39,9 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import ngsrng  # noqa: E402
+import ngsrng.resolution  # noqa: E402
+
+ngsrng.resolution.RESOLUTION_TOL = None  # timings at fixed mesh sizes, resolved or not: no resolution check
 from ngsrng.distributions.pointwise import XP  # noqa: E402
 from ngsrng.solvers import cudss_available  # noqa: E402
 

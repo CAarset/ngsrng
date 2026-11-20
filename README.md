@@ -75,9 +75,9 @@ accurate one for your space and hardware.
 
 <p align="center">
   <img src="docs/assets/gallery.png" width="100%"
-       alt="Matérn fields with smoothness 1/2 and 3, a gamma field on a double-slit domain, and a Gaussian field on the unit cube">
+       alt="Matérn fields with smoothness 1 and 3, a gamma field on a double-slit domain, and a Gaussian field on the unit cube">
   <br>
-  <sub>Rough (ν = 1/2) and smooth (ν = 3) Matérn fields, a gamma(2) field and a 3D Gaussian field, on the test
+  <sub>Rough (ν = 1) and smooth (ν = 3) Matérn fields, a gamma(2) field and a 3D Gaussian field, on the test
   geometries in <code>ngsrng.domains</code> (<a href="docs/assets/make_figures.py">make_figures.py</a>).</sub>
 </p>
 
@@ -157,8 +157,8 @@ use [ngsplot](https://github.com/CAarset/ngsplot), which draws the same pictures
        alt="Pointwise variance of a Matérn prior on an irregular domain with Neumann, tuned Robin, torus and restrict boundary treatments">
   <br>
   <sub>Pointwise variance of a Matérn prior (target 1) on an irregular domain, from the demo. Neumann reaches 4,
-  and a tuned Robin condition stays within [0.68, 1.25]. The stationary torus and restrict fields are constant to
-  within 1.4%.</sub>
+  and a tuned Robin condition stays within [0.71, 1.25]. The stationary torus and restrict fields are constant to
+  within 1.7%.</sub>
 </p>
 
 ## Features
