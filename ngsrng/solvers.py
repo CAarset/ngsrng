@@ -89,6 +89,16 @@ class _NGSolveBase(Solver, Rebuildable):
 # NGSolve direct solvers whose concurrent solves were checked against sequential results. "pardiso" (an MKL build)
 # returned samples off by up to 1e67 in the GPU-box benchmark and is not offered.
 INVERSES = ("sparsecholesky", "umfpack")
+# Iterative solves on a torch device test their convergence (a host synchronisation) from this fraction of the
+# iterations their previous solve took, every iteration from the start the first time: repeated solves with one matrix
+# converge in nearly the same number of iterations, so the host can queue the iterations ahead (performance only: the
+# tolerance is met as before, at most a few iterations beyond it).
+CHECK_FROM = 0.9
+
+
+def first_check(iterations) -> int:
+    """The iteration from which a solve tests its convergence, given its earlier solves' iteration counts."""
+    return max(1, int(CHECK_FROM * iterations[-1])) if iterations else 1
 
 
 class NGSolveDirect(_NGSolveBase):
@@ -299,7 +309,7 @@ class TorchPCG(Solver):
         p = z.clone()
         rz = (r * z).sum(0)
         bnorm = torch.linalg.vector_norm(b, dim=0).clamp_min(torch.finfo(b.dtype).tiny)
-        it, res = 0, None
+        it, res, start = 0, None, first_check(self.iterations)
         for it in range(1, self.maxiter + 1):
             ap = self.a @ p
             pap = (p * ap).sum(0)
@@ -308,7 +318,7 @@ class TorchPCG(Solver):
             x += alpha * p
             r -= alpha * ap
             res = (torch.linalg.vector_norm(r, dim=0) / bnorm).max()
-            if res <= self.tol:
+            if it >= start and res <= self.tol:
                 break
             z = self.dinv[:, None] * r
             rz_new = (r * z).sum(0)
@@ -410,7 +420,7 @@ class TorchAMGPCG(Solver):
         p = z.clone()
         rz = (r * z).sum(0)
         bnorm = torch.linalg.vector_norm(b, dim=0).clamp_min(torch.finfo(b.dtype).tiny)
-        it, res = 0, None
+        it, res, start = 0, None, first_check(self.iterations)
         for it in range(1, self.maxiter + 1):
             ap = self.a @ p
             pap = (p * ap).sum(0)
@@ -418,7 +428,7 @@ class TorchAMGPCG(Solver):
             x += alpha * p
             r -= alpha * ap
             res = (torch.linalg.vector_norm(r, dim=0) / bnorm).max()
-            if res <= self.tol:
+            if it >= start and res <= self.tol:
                 break
             z = self._vcycle(0, r)
             rz_new = (r * z).sum(0)
