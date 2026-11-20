@@ -404,6 +404,12 @@ class ParameterMixture(InPlace):
         tol = spec.options.get("tol", 1e-3)
         values = {"length": spec.length, "nu": spec.nu}
         ref = max(corners, key=lambda c: padding_for(**{**values, **c}, tol=tol))
+        from .resolution import check_resolution
+
+        for c in corners:  # the smallest length (and every smoothness at it) must be resolved
+            if c.get("length", values["length"]) == min(cc.get("length", values["length"]) for cc in corners):
+                check_resolution(generator.fes, c.get("length", values["length"]), c.get("nu", values["nu"]),
+                                 h=spec.options.get("resolution"), tol=spec.resolution_tol)
         self.template = generator.distribution(name, *args, correlation=spec.at(**ref), **kwargs)
         self.fixed = {k: float(v) for k, v in values.items() if k not in self.random}
         self.source = generator._seed()

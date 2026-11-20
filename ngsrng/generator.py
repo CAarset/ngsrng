@@ -150,7 +150,7 @@ def _corr_key(spec):
         spec = matern(**spec)
     if isinstance(spec, MaternCorrelation):
         return ("matern", spec.length, spec.nu, spec.rtol, spec.boundary, repr(spec.beta),
-                repr(sorted(spec.options.items())))
+                repr(sorted(spec.options.items())), spec.resolution_tol)
     return ("id", id(spec))
 
 
@@ -520,8 +520,8 @@ class Generator:
             raise ValueError(f"the correlation has random parameters ({', '.join(spec.random)}): the field is a "
                              "mixture over them, not one Gaussian; draw it with rng.distribution(name, ..., "
                              "correlation=...) (rng.distribution('normal', ...) for the Gaussian field)")
-        key = (("matern", spec.length, spec.nu, spec.rtol, spec.boundary, spec.beta, repr(sorted(spec.options.items())))
-               if isinstance(spec, MaternCorrelation) else ("id", id(spec)))
+        key = (("matern", spec.length, spec.nu, spec.rtol, spec.boundary, spec.beta, repr(sorted(spec.options.items())),
+                spec.resolution_tol) if isinstance(spec, MaternCorrelation) else ("id", id(spec)))
         if key not in self._gaussians:
             if isinstance(spec, OperatorCovariance):  # a KL expansion (computed with NumPy), sampling on the device
                 gauss = spec.bind(self.fes, seed=self._seed(), device=self.device)
