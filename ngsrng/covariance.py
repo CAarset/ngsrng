@@ -335,12 +335,13 @@ def _sigma(g, y):
 
 
 def _variance_projection(space: SpaceInfo):
-    """L2(order 2p) space, and the same-rule projection of point values into it (exact for functions in it)."""
+    """L2(order 2p) space, and the same-rule projection of point values into it (exact for functions in it): the rule
+    of degree 4p integrates the products of its functions exactly on affine elements (the variance is of degree 2p)."""
     from .quadrature import QuadratureRule
 
     p = space.order
     target = SpaceInfo(ngs.L2(space.mesh, order=2 * p))
-    order = max(4 * p, 2)
+    order = max(2 * p, 1)  # QuadratureRule's order: a rule of degree 2 order
     src = QuadratureRule(space, order)
     dst = QuadratureRule(target, order)
     e_dst = dst.evaluation_full
@@ -384,19 +385,26 @@ class LocalCovariance:
         """Variance k_h(x, x) at points, from their evaluation matrix e (npoints x nfree); with ``stderr`` also the
         standard error of the Monte Carlo part (zero where exact)."""
         e = sp.csr_matrix(e)
-        v = np.zeros(e.shape[0])
-        if self.pattern is not None:
-            v += np.asarray(e.multiply(e @ self.pattern).sum(axis=1)).ravel()
-        for u, d in self.terms:
-            eu = e @ u
-            v += np.einsum("ij,ij->i", eu if d is None else eu @ d, eu)
-        se = np.zeros_like(v)
-        if self.mc is not None:
-            a, b = self.mc
-            ea = e @ a
-            t = ea * (ea if b is a else e @ b)
-            v += t.mean(axis=1)
-            se = t.std(axis=1, ddof=1) / np.sqrt(t.shape[1])
+        v, se = np.zeros(e.shape[0]), np.zeros(e.shape[0])
+        # blocks of points: the products below have a row per point (sparse ones a local patch long, dense ones as long
+        # as the low-rank terms and samples), so they are bounded by BLOCK_VALUES, not by the number of points
+        width = max([1] + [u.shape[1] for u, _ in self.terms] + ([self.mc[0].shape[1]] if self.mc else []))
+        patch = int(np.diff(self.pattern.indptr).max()) if self.pattern is not None and self.pattern.nnz else 1
+        step = max(1, BLOCK_VALUES // (4 * max(width, patch * max(1, int(np.diff(e.indptr).max(initial=1))))))
+        for i0 in range(0, e.shape[0], step):
+            eb = e[i0:i0 + step]
+            vb = v[i0:i0 + step]
+            if self.pattern is not None:
+                vb += np.asarray(eb.multiply(eb @ self.pattern).sum(axis=1)).ravel()
+            for u, d in self.terms:
+                eu = eb @ u
+                vb += np.einsum("ij,ij->i", eu if d is None else eu @ d, eu)
+            if self.mc is not None:
+                a, b = self.mc
+                ea = eb @ a
+                t = ea * (ea if b is a else eb @ b)
+                vb += t.mean(axis=1)
+                se[i0:i0 + step] = t.std(axis=1, ddof=1) / np.sqrt(t.shape[1])
         return (v, se) if stderr else v
 
     def trace(self):
