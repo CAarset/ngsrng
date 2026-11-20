@@ -238,8 +238,9 @@ def test_float64_arithmetic_by_default():
     g = ngsrng.Gaussian(fes, ngsrng.matern(3.0), method={"engine": "torch"})
     assert g.dtype == torch.float32 and g._work_dtype == torch.float64
     assert g._platform == "cpu-torch"
-    assert ngsrng.tuning.platform_of("torch", "cuda", torch.float64) == "cuda-f64"
-    assert ngsrng.tuning.platform_of("torch", "cuda", "float32") == "cuda-f32"
+    gpu = ngsrng.tuning.gpu_backend()  # "cuda" or "rocm": the GPU tables are named by torch's backend
+    assert ngsrng.tuning.platform_of("torch", "cuda", torch.float64) == f"{gpu}-f64"
+    assert ngsrng.tuning.platform_of("torch", "cuda", "float32") == f"{gpu}-f32"
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         g = ngsrng.Gaussian(fes, ngsrng.matern(3.0), method={"work_dtype": "float32"})
@@ -248,8 +249,8 @@ def test_float64_arithmetic_by_default():
         with pytest.warns(UserWarning, match="single precision"):
             g = ngsrng.Gaussian(fes, ngsrng.matern(3.0), device="cuda", method={"work_dtype": "float32"})
         # GPU tables are per device (tuning format 2): the platform names the card
-        assert g._work_dtype == torch.float32 and g._platform.startswith("cuda-f32@")
-        assert ngsrng.Gaussian(fes, ngsrng.matern(3.0), device="cuda")._platform.startswith("cuda-f64@")
+        assert g._work_dtype == torch.float32 and g._platform.startswith(f"{gpu}-f32@")
+        assert ngsrng.Gaussian(fes, ngsrng.matern(3.0), device="cuda")._platform.startswith(f"{gpu}-f64@")
 
 
 @pytest.mark.parametrize("noise,expected", [("lumped", "relative covariance error"), ("chebyshev", "1e-08")])

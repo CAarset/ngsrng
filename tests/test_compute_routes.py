@@ -17,6 +17,7 @@ from conftest import cuda_usable
 import ngsrng
 from ngsrng.backend import DeviceCache, compute_device, device_copy, resolve_device, same_device
 from ngsrng.quadrature import QuadratureRule
+from ngsrng.solvers import cudss_available
 
 DEVICES = [("cpu", {"engine": "torch"})] + ([("cuda", None)] if cuda_usable() else [])
 cuda = pytest.mark.skipif(not cuda_usable(), reason="needs a usable CUDA device")
@@ -417,7 +418,8 @@ def test_precomposed_bernstein_conversion(fes, order, monkeypatch):
     assert rel(c, c_old) < 1e-13 and np.all(r < 1e-12) and np.all(r_old < 1e-12)
     for device in ["cpu"] + (["cuda"] if cuda_usable() else []):
         ct, rt = bf.to_coefficients(torch.from_numpy(b).to(device))
-        tol = 1e-12 if device == "cuda" else 1e-10  # cuDSS is exact; on a CPU device the mass solve is Jacobi PCG
+        exact = device == "cuda" and cudss_available()  # cuDSS is exact; otherwise the mass solve is iterative
+        tol = 1e-12 if exact else 1e-10
         assert ct.device.type == device and rel(ct, c_old) < tol and float(rt.max()) < 1e-11
     monkeypatch.setattr("ngsrng.distributions.bernstein.available_memory", lambda: 1.0)  # one column per block
     assert bf._check_step(7, 1.0) == 1

@@ -2,7 +2,7 @@ import ngsolve as ngs
 import numpy as np
 import pytest
 import torch
-from conftest import cuda_usable
+from conftest import gpu_solver
 from ngsolve.meshes import Make1DMesh
 
 import ngsrng
@@ -32,8 +32,8 @@ def _spec(fes, beta):
 
 
 ENGINES = [("ngsolve", "cpu", {})]
-if cuda_usable():
-    ENGINES += [("torch", "cuda", {"solver": "cudss"})]
+if gpu_solver() is not None:  # the GPU's solver: cuDSS on NVIDIA, AMG-preconditioned CG elsewhere (to 1e-8)
+    ENGINES += [("torch", "cuda", gpu_solver())]
 
 
 @pytest.mark.parametrize("engine", ENGINES, ids=[e[0] for e in ENGINES])
