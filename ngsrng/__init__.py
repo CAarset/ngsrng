@@ -33,7 +33,8 @@ from .dense import DenseSampler, ObservedField
 from .gaussian import Gaussian
 from .generator import FieldDistribution, Generator, default_rng
 from .lowrank import LowRankGaussian, karhunen_loeve, operator_kl
-from .mixture import Mixture, mixture
+from .mixture import Mixture, ParameterMixture, mixture
+from .parameters import RandomParameter
 from .observed import ObservedGaussian
 from .observations import observation_operator
 from .posterior import LinearObservations, MatheronPosterior, downdate
@@ -52,6 +53,8 @@ __all__ = [
     "CorrelatedFields",
     "mixture",
     "Mixture",
+    "ParameterMixture",
+    "RandomParameter",
     "Gaussian",
     "LowRankGaussian",
     "karhunen_loeve",

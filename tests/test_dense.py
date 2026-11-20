@@ -483,9 +483,11 @@ def _square(x):
     return x * x
 
 
-def reference(path, z, labels=None):
-    """The module docstring's NumPy reference sampler (NumPy and SciPy, no ngsrng), from given z (n, k, r) and
-    labels."""
+def reference(path, z, labels=None, parameters=None):
+    """The module docstring's NumPy reference sampler (NumPy and SciPy, no ngsrng), from given z (n, k, r), labels
+    and parameters (spectral laws: untruncated, every column)."""
+    from scipy.special import gammaln
+
     s = np.load(path)
     meta = json.loads(str(s["meta"]))
     labels = np.zeros(len(z), dtype=int) if labels is None else np.asarray(labels)
@@ -493,10 +495,20 @@ def reference(path, z, labels=None):
     out = [np.zeros((len(z), c["nout"])) for c in nout]
     for l, law in enumerate(meta["laws"]):
         a = lambda key: s[f"law{l}/{key}"]  # noqa: E731
-        rows = labels == l
-        zl = np.einsum("ij,njr->nir", a("mix"), z[rows][:, :, :a("factor").shape[1]])
+        rows, b = labels == l, a("factor")
+        zl, sl, var = z[rows][:, :, :b.shape[1]], law["spectral"], None
+        if sl is not None:
+            th = {**law["values"], **{k: np.asarray(parameters[k])[rows] for k in sl["random"]}}
+            nu, d = np.broadcast_to(th["nu"], rows.sum()), sl["dim"]
+            k2, ha = 8 * nu / th["length"] ** 2, (nu + d / 2) / 2
+            logc = -0.5 * (gammaln(nu) - gammaln(2 * ha) - d / 2 * np.log(4 * np.pi) - nu * np.log(k2))
+            w8 = np.exp(logc[:, None] - ha[:, None] * np.log(k2[:, None] + a("lam")))
+            zl, var = zl * w8[:, None, :], (w8 ** 2) @ (b ** 2).T
+        zl = np.einsum("ij,njr->nir", a("mix"), zl)
         for i, c in enumerate(law["components"]):
-            w = a(f"mean{i}") + zl[:, i] @ a("factor").T
+            w = a(f"mean{i}") + zl[:, i] @ b.T
+            if sl is not None and sl["standardize"][i]:
+                w = w / np.sqrt(var)
             p = {k: s[v] if isinstance(v, str) else v for k, v in c["params"].items()}
             if c["map"] == "inversion":
                 q = c["stored"]

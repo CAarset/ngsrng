@@ -52,6 +52,10 @@ Every family it covers is a pointwise map of one latent Gaussian, followed by li
 - **Mixtures** (``ngsrng.mixture``): K laws with weights, each set up as above (its own S, factor, maps; ``rank=`` and
   ``tol=`` relative to its own variance) with the same components and output sizes. A draw's label l (law l with
   probability weights[l]) chooses its law; a batch costs one product per law, for the draws that follow it.
+- **Random parameters** (``matern_correlation(length=law, nu=law)``, :mod:`ngsrng.spectral`): a spectral law, whose
+  factor B = P Phi holds the modes at S; a draw's parameters theta weight its z, w = m + B (s_theta z), and pointwise
+  families are standardised per draw by the kept modes' variance. A batch costs two products (values and variances)
+  per group of draws that keep the same number of modes.
 - **The Bernstein range guarantee** holds as in ``d.sample()``: the map comes before the linear conversion, and the
   values are pulled inside the family's range by a relative margin of at least 1000 times the conversion's measured
   rounding (summed over S, so it bounds every sample) before it.
@@ -106,12 +110,17 @@ and the keys of their arrays, and ``info``, with provenance: ngsrng version and 
 representation, stream convention). The arrays of law l have keys ``law{l}/...``: the factor, the mixing of correlated
 components, the means, the maps' parameters and ranges (closed forms: family, parameters and range; numerical
 inversions: the scipy.stats distribution's name and parameters; ``transformed`` with a NumPy or torch function: its
-name), the output maps (COO), the DoF indices and the latent points. One law is K = 1.
+name), the output maps (COO), the DoF indices and the latent points. One law is K = 1. ``laws[l]["values"]`` holds a
+law's fixed parameter values (a mixture over a parameter). A spectral law (``laws[l]["spectral"]``) also stores
+``law{l}/lam`` (lambda of its modes; its factor is B) and the parameters' laws (``random``: scipy.stats names and
+parameters), the dimension, which components standardise, and its truncation: a draw with parameters theta keeps the
+leading r columns, r the largest ``table`` entry over the corners of the ``grids`` cell holding theta, rounded up to the
+smallest ``ladder`` entry not below it (with all columns it draws the untruncated law).
 ``DenseSampler.load(path, device=...)`` rebuilds the sampler from these arrays alone. Without ngsrng, a stored sampler
 draws with NumPy and SciPy::
 
     import json, numpy as np, scipy.stats as st
-    from scipy.special import ndtr
+    from scipy.special import gammaln, ndtr
     s = np.load("sampler.npz")
     meta = json.loads(str(s["meta"]))
     gen = np.random.default_rng(0)
@@ -119,11 +128,23 @@ draws with NumPy and SciPy::
     out = [np.empty((n, c["nout"])) for c in meta["laws"][0]["components"]]
     for l, law in enumerate(meta["laws"]):
         a = lambda key: s[f"law{l}/{key}"]
-        rows = labels == l
-        z = gen.standard_normal((rows.sum(), a("mix").shape[0], a("factor").shape[1]))
+        rows, b = labels == l, a("factor")
+        z = gen.standard_normal((rows.sum(), a("mix").shape[0], b.shape[1]))
+        sl, var = law["spectral"], None
+        if sl is not None:                                         # random parameters: this draw's weights
+            th = {**law["values"], **{k: getattr(st, v["scipy"])(*v["args"], **v["kwds"]).rvs(rows.sum(),
+                                                                                              random_state=gen)
+                                      for k, v in sl["random"].items()}}
+            nu, d = np.broadcast_to(th["nu"], rows.sum()), sl["dim"]
+            k2, ha = 8 * nu / th["length"] ** 2, (nu + d / 2) / 2   # kappa^2, alpha / 2
+            logc = -0.5 * (gammaln(nu) - gammaln(2 * ha) - d / 2 * np.log(4 * np.pi) - nu * np.log(k2))
+            w8 = np.exp(logc[:, None] - ha[:, None] * np.log(k2[:, None] + a("lam")))
+            z, var = z * w8[:, None, :], (w8 ** 2) @ (b ** 2).T     # (untruncated: every column)
         z = np.einsum("ij,njr->nir", a("mix"), z)                  # correlate the components
         for i, c in enumerate(law["components"]):
-            w = a(f"mean{i}") + z[:, i] @ a("factor").T            # latent values (n_l, |S|)
+            w = a(f"mean{i}") + z[:, i] @ b.T                      # latent values (n_l, |S|)
+            if sl is not None and sl["standardize"][i]:
+                w = w / np.sqrt(var)                               # exact pointwise standardisation of each draw
             p = {k: s[v] if isinstance(v, str) else v for k, v in c["params"].items()}
             if c["map"] == "inversion":                           # e.g. gamma: loc + scale F^-1(Phi(w))
                 q = c["stored"]
@@ -157,6 +178,7 @@ import torch
 from .backend import DeviceCache, owned_cache, resolve_device, resolve_dtype, sparse_to_torch
 from .inplace import InPlace, as_tensor, default_work_values
 from .seeding import Source, as_source, inherit, one_draw
+from .spectral import draw_ranks, matern_spectrum
 
 __all__ = ["DenseSampler", "ObservedField"]
 
@@ -240,6 +262,11 @@ class DenseSampler(InPlace):
         self._stages = list(stages.values())
         self._position = np.empty(len(self.laws), dtype=np.int64)
         self._position[[l for stage in self._stages for l in stage]] = np.arange(len(self.laws))
+        # parameters: the random ones of spectral laws (drawn per draw), and the fixed values of every law
+        self._spectral_laws = [l for l, law in enumerate(self.laws) if law.get("spectral") is not None]
+        self._random_names = sorted({k for l in self._spectral_laws for k in self.laws[l]["spectral"]["random"]})
+        self.parameter_names = sorted(set(self._random_names) | {k for law in self.laws for k in law.get("values",
+                                                                                                          {})})
 
     # ------------------------------------------------------------------ description
 
@@ -319,31 +346,42 @@ class DenseSampler(InPlace):
 
     # ------------------------------------------------------------------ draws
 
-    def sample(self, n=None, generator=None, output=None, out=None, labels=False):
+    def sample(self, n=None, generator=None, output=None, out=None, labels=False, parameters=False):
         """n draws: (n, m), or (n, k, m) for correlated components; ``n=None``: one, without the sample axis.
 
         ``generator``: a torch or NumPy generator read for this draw (one key), instead of the sampler's own
         randomness. ``output``: "numpy" or "torch" (default: NumPy on the CPU, torch tensors on a GPU). ``out``: a
         buffer of that shape (any float dtype and device, or one per component) filled in place and returned.
         ``labels``: also return each draw's label, the index of the law it follows (int64, (n,); zeros for one
-        law), as ``(samples, labels)``."""
+        law). ``parameters``: also return each draw's parameters ({name: (n,)}, e.g. the correlation length; NaN
+        where a law does not have that parameter). Extras follow the samples: ``(samples, labels, parameters)``."""
         source = self.source if generator is None else Source(generator)
         with one_draw():
             if out is not None:
-                lab = self._sample_out(n, out, source)
+                lab, theta = self._sample_out(n, out, source)
                 res, count = out, as_tensor(out[0] if isinstance(out, (list, tuple)) else out).shape[0]
             else:
                 count = 1 if n is None else int(n)
                 rows = [torch.empty((count, c["nout"]), dtype=self.dtype, device=self.device)
                         for c in self.laws[0]["components"]]
-                lab = self._fill(rows, source)
+                lab, theta = self._fill(rows, source)
                 res = self._deliver(rows, n, output)
-        if not labels:
+        if not (labels or parameters):
             return res
-        lab = np.zeros(count, dtype=np.int64) if lab is None else lab
-        if (output or self.output or ("numpy" if self.device.type == "cpu" else "torch")) == "torch":
-            lab = _to_device(torch.from_numpy(lab), self.device)
-        return res, (lab[0] if n is None and out is None else lab)
+        as_torch = (output or self.output or ("numpy" if self.device.type == "cpu" else "torch")) == "torch"
+        one = n is None and out is None
+
+        def deliver(a):
+            a = _to_device(torch.from_numpy(a), self.device) if as_torch else a
+            return a[0] if one else a
+
+        extra = []
+        if labels:
+            extra.append(deliver(np.zeros(count, dtype=np.int64) if lab is None else lab))
+        if parameters:
+            theta = theta if theta is not None else self._parameters(np.zeros(count, np.int64), None)
+            extra.append({k: deliver(v) for k, v in theta.items()})
+        return (res, *extra)
 
     rvs = sample
 
@@ -353,11 +391,12 @@ class DenseSampler(InPlace):
             self._sample_out(None, rows, self.source)
         return rows
 
-    def from_noise(self, z, labels=None, output=None):
+    def from_noise(self, z, labels=None, parameters=None, output=None):
         """The samples made from given standard normals ``z``: (n, k, r) (or (n, r) for one component, r =
-        ``rank``), and for a mixture the draws' ``labels`` (n,), as ``sample`` returns them: the deterministic part
-        of a draw (for antithetic or quasi-random z, or to check a stored sampler against a reference
-        implementation). A draw following a law with fewer columns reads the leading ones of its z."""
+        ``rank``), for a mixture the draws' ``labels`` (n,), and for laws with random parameters the draws'
+        ``parameters`` ({name: (n,)}), as ``sample`` returns them: the deterministic part of a draw (for antithetic
+        or quasi-random z, or to check a stored sampler against a reference implementation). A draw following a law
+        with fewer columns, or a spectral law truncated for its parameters, reads the leading ones of its z."""
         z = torch.as_tensor(z)
         if z.ndim == 2:
             z = z[:, None, :]
@@ -371,8 +410,13 @@ class DenseSampler(InPlace):
             lab = np.asarray(labels, dtype=np.int64).reshape(-1)
             if lab.shape != (n,) or (n and (lab.min() < 0 or lab.max() >= len(self.laws))):
                 raise ValueError(f"labels: n = {n} integers in [0, {len(self.laws)})")
+        theta = None
+        if self._random_names:
+            if parameters is None or any(k not in parameters for k in self._random_names):
+                raise ValueError(f"laws with random parameters: give the draws' parameters {self._random_names}")
+            theta = {k: np.asarray(parameters[k], dtype=np.float64).reshape(-1) for k in self._random_names}
         rows = [torch.empty((n, c["nout"]), dtype=self.dtype, device=self.device) for c in self.laws[0]["components"]]
-        self._write(rows, 0, n, z.to(self.device, self.dtype).reshape(n, k * r), lab)
+        self._write(rows, 0, n, z.to(self.device, self.dtype).reshape(n, k * r), lab, theta)
         return self._deliver(rows, n, output)
 
     def _sample_out(self, n, out, source):
@@ -391,11 +435,13 @@ class DenseSampler(InPlace):
         return self._fill(rows, source)
 
     def _fill(self, rows, source):
-        """Fill the rows with draws in chunks of ``work_values`` values; the draws' labels (None for one law)."""
-        n, many = rows[0].shape[0], len(self.laws) > 1
-        labels = np.empty(n, dtype=np.int64) if many else None
+        """Fill the rows with draws in chunks of ``work_values`` values; the draws' labels (None for one law) and
+        parameters (None without parameters)."""
+        n, many, nrand = rows[0].shape[0], len(self.laws) > 1, len(self._random_names)
+        labels = np.zeros(n, dtype=np.int64) if many or nrand else None
+        theta = {k: np.full(n, np.nan) for k in self.parameter_names} if self.parameter_names else None
         if n == 0:
-            return labels
+            return labels, theta
         k, r = self.components, self.rank
         per = k * r + max(k * 2 * int(law["factor"].shape[0]) for law in self.laws) + \
             sum(c["nout"] for c in self.laws[0]["components"])
@@ -404,24 +450,55 @@ class DenseSampler(InPlace):
         edges = np.cumsum(self.weights)[:-1]
         for k0 in range(0, n, step):
             k1 = min(n, k0 + step)
-            lab = None
-            if many:  # the labels from their own stream (on the host: the groups' sizes are known there)
-                lab = labels[k0:k1] = np.searchsorted(edges, streams.labels().random(k1 - k0), side="right")
-            self._write(rows, k0, k1, self._standard_normal(k1 - k0, k * r, streams), lab)
-        return labels
+            lab, u = None, None
+            if many or nrand:  # labels and parameters from their own stream, one row per draw (on the host)
+                u = streams.labels().random((k1 - k0, 1 + nrand) if nrand else k1 - k0)
+                lab = labels[k0:k1] = np.searchsorted(edges, u[:, 0] if nrand else u, side="right") if many else 0
+            th = None
+            if theta is not None:
+                th = self._parameters(labels[k0:k1] if labels is not None else np.zeros(k1 - k0, np.int64), u)
+                for name, v in th.items():
+                    theta[name][k0:k1] = v
+            self._write(rows, k0, k1, self._standard_normal(k1 - k0, k * r, streams), lab if many else None, th)
+        return labels if many else None, theta
 
-    def _write(self, rows, k0, k1, z, labels):
-        """rows[k0:k1] from the standard normals z (k1 - k0, k r) and the draws' labels (None: one law). A mixture's
-        draws are sorted by law (one gather of z): one product per law into its slice of the latent values, then the
-        map and the conversion once per stage (laws whose map, bounds and output maps are the same: the same family
-        and representation under, e.g., another correlation length), and one scatter back to the draws' rows."""
-        if labels is None:
+    def _parameters(self, labels, u):
+        """The draws' parameters {name: (n,)}: the random ones of spectral laws from the uniforms u[:, 1:], the fixed
+        values of the other laws; NaN where a law has no such parameter."""
+        n = labels.shape[0]
+        out = {k: np.full(n, np.nan) for k in self.parameter_names}
+        for l, law in enumerate(self.laws):
+            sel = labels == l
+            if not sel.any():
+                continue
+            for name, v in law.get("values", {}).items():
+                out[name][sel] = v
+            if u is not None and law.get("spectral") is not None:
+                for j, name in enumerate(self._random_names):
+                    if name in law["spectral"]["random"]:
+                        out[name][sel] = law["spectral"]["random"][name].ppf(u[sel, 1 + j])
+        return out
+
+    def _write(self, rows, k0, k1, z, labels, theta=None):
+        """rows[k0:k1] from the standard normals z (k1 - k0, k r), the draws' labels (None: one law) and parameters.
+        The draws are sorted by law (one gather of z), and the draws of a spectral law by their rank: one product per
+        law (per rank) into its slice of the latent values, then the map and the conversion once per stage (laws whose
+        map, bounds and output maps are the same: the same family and representation under, e.g., another
+        correlation length), and one scatter back to the draws' rows."""
+        if labels is None and not self._spectral_laws:
             for row, y in zip(rows, self._transform(0, z)):
                 row[k0:k1].copy_(y)
             return
-        k, r = self.components, self.rank
-        order = np.argsort(self._position[labels], kind="stable")
-        counts = np.bincount(labels, minlength=len(self.laws))
+        k, r, n = self.components, self.rank, z.shape[0]
+        lab = np.zeros(n, dtype=np.int64) if labels is None else labels
+        ranks = np.zeros(n, dtype=np.int64)
+        for l in self._spectral_laws:
+            sel = np.flatnonzero(lab == l)
+            if sel.size:
+                ranks[sel] = draw_ranks(self.laws[l]["spectral"], {name: theta[name][sel] for name in
+                                                                   self.laws[l]["spectral"]["random"]})
+        order = np.lexsort((-ranks, self._position[lab]))
+        counts = np.bincount(lab, minlength=len(self.laws))
         perm = _to_device(torch.from_numpy(order), self.device)
         zs = z.view(-1, k, r).index_select(0, perm)
         at = 0
@@ -433,10 +510,21 @@ class DenseSampler(InPlace):
             ws = [torch.empty((size, nlat), dtype=self.dtype, device=self.device) for _ in range(k)]
             s0 = 0
             for l in stage:
-                c, rl = int(counts[l]), int(self.laws[l]["factor"].shape[1])
-                if c:
+                c = int(counts[l])
+                if not c:
+                    continue
+                if self.laws[l].get("spectral") is None:
+                    rl = int(self.laws[l]["factor"].shape[1])
                     self._latent(l, zs[at + s0:at + s0 + c, :, :rl].reshape(c, k * rl), [w[s0:s0 + c] for w in ws])
-                    s0 += c
+                else:
+                    group = order[at + s0:at + s0 + c]
+                    rg = ranks[group]
+                    cuts = np.flatnonzero(np.diff(rg)) + 1
+                    for g0, g1 in zip(np.r_[0, cuts], np.r_[cuts, c]):
+                        rl, sel = int(rg[g0]), group[g0:g1]
+                        self._latent(l, zs[at + s0 + g0:at + s0 + g1, :, :rl].reshape(g1 - g0, k * rl),
+                                     [w[s0 + g0:s0 + g1] for w in ws], {name: theta[name][sel] for name in theta})
+                s0 += c
             idx = perm[at:at + size]
             for row, y in zip(rows, self._convert(stage[0], ws)):
                 where = idx if row.device == idx.device else torch.from_numpy(order[at:at + size]).to(row.device)
@@ -482,22 +570,44 @@ class DenseSampler(InPlace):
         representations, whose conversions to coefficients are ill-conditioned)."""
         return self._convert(l, self._latent(l, z))
 
-    def _latent(self, l, z, out=None):
+    def _latent(self, l, z, out=None, theta=None):
         """Law l's latent values w = m + F z per component, (n, |S|) in the sampler's dtype (into ``out``, one
-        tensor per component, if given)."""
+        tensor per component, if given). A spectral law: w = m + B (s_theta * z) with the draws' weights s_theta
+        (:mod:`ngsrng.spectral`), standardised per draw where the family standardises; z then has as many columns as
+        the draws keep."""
         law = self.laws[l]
-        k, r, n = self.components, int(law["factor"].shape[1]), z.shape[0]
+        k, n = self.components, z.shape[0]
+        r = z.shape[1] // k if law.get("spectral") is not None else int(law["factor"].shape[1])
         lin = self._linear(l)
         x = z.reshape(n, k, r)
+        sl, s = law.get("spectral"), None
+        if sl is not None:
+            values = {**law["values"], **(theta or {})}
+            kappa2, half_alpha, logc = matern_spectrum(values["length"], values["nu"], sl["dim"])
+
+            def dev(a):
+                a = np.array(np.broadcast_to(np.asarray(a, dtype=np.float64), (n,)))  # a writable copy
+                return _to_device(torch.from_numpy(a), self.device).to(self.dtype)
+
+            s = torch.exp(dev(logc)[:, None] - dev(half_alpha)[:, None] * torch.log(dev(kappa2)[:, None] +
+                                                                                   lin["lam"][None, :r]))
+            x = x * s[:, None, :]
         if k > 1:
             x = torch.einsum("ij,njr->nir", lin["mix"], x)
-        ws = []
+        factor = lin["factor"][:, :r] if sl is not None else lin["factor"]
+        ws, inv = [], None
         for i in range(k):
             dst, mean = None if out is None else out[i], lin["means"][i]
             if r:
-                ws.append(torch.addmm(mean, x[:, i], lin["factor"].T, out=dst))
+                w = torch.addmm(mean, x[:, i], factor.T, out=dst)
             else:
-                ws.append(mean.expand(n, -1).clone() if dst is None else dst.copy_(mean.expand(n, -1)))
+                w = mean.expand(n, -1).clone() if dst is None else dst.copy_(mean.expand(n, -1))
+            if sl is not None and sl["standardize"][i]:  # exact pointwise standardisation of this draw's latent
+                if inv is None:
+                    var = (s * s) @ lin["factor_sq"][:, :r].T
+                    inv = torch.where(var > 0, torch.rsqrt(var), torch.zeros_like(var))
+                w.mul_(inv)
+            ws.append(w)
         return ws
 
     def _convert(self, l, ws):
@@ -546,8 +656,11 @@ class DenseSampler(InPlace):
         key = ("linear", l, str(self.device), self.dtype)
         if key not in self._device:
             law, t = self.laws[l], self._tensor(self.dtype)
-            self._device[key] = {"factor": t(law["factor"]), "mix": t(law["mix"]),
-                                 "means": [t(spec["mean"]) for spec in law["components"]]}
+            lin = {"factor": t(law["factor"]), "mix": t(law["mix"]),
+                   "means": [t(spec["mean"]) for spec in law["components"]]}
+            if law.get("spectral") is not None:
+                lin.update(lam=t(law["spectral"]["lam"]), factor_sq=lin["factor"] * lin["factor"])
+            self._device[key] = lin
         return self._device[key]
 
     def _conversions(self, l):
@@ -673,7 +786,17 @@ def _store_law(law, arrays, prefix) -> dict:
             arrays[f"{prefix}out{i}_vals"] = a.data
             entry["out_shape"] = list(a.shape)
         comps.append(entry)
-    return {"work64": bool(law["work64"]), "components": comps, "info": law["info"]}
+    entry = {"work64": bool(law["work64"]), "components": comps, "info": law["info"],
+             "values": {k: float(v) for k, v in law.get("values", {}).items()}, "spectral": None}
+    sl = law.get("spectral")
+    if sl is not None:
+        arrays[prefix + "lam"] = np.asarray(sl["lam"])
+        entry["spectral"] = {"family": sl["family"], "dim": int(sl["dim"]), "source": sl["source"],
+                             "random": {k: v.store() for k, v in sl["random"].items()},
+                             "standardize": [bool(x) for x in sl["standardize"]], "tol": sl["tol"],
+                             "rtol": sl["rtol"], "rank": sl["rank"], "grids": sl["grids"],
+                             "table": np.asarray(sl["table"]).tolist(), "ladder": list(sl["ladder"])}
+    return entry
 
 
 def _load_law(entry, arrays, prefix) -> dict:
@@ -694,10 +817,17 @@ def _load_law(entry, arrays, prefix) -> dict:
         if c["map"] in LIVE:
             spec.update(stored=c["stored"], transform=_rebuild_map(c["map"], c["stored"]))
         comps.append(spec)
+    sl = entry.get("spectral")
+    if sl is not None:
+        from .parameters import RandomParameter
+
+        sl = {**sl, "lam": arrays[prefix + "lam"], "table": np.asarray(sl["table"], dtype=np.int64),
+              "random": {k: RandomParameter.load(v) for k, v in sl["random"].items()}}
     return {"factor": arrays[prefix + "factor"], "mix": arrays[prefix + "mix"], "components": comps,
             "work64": entry["work64"], "dofs": arrays.get(prefix + "dofs"),
             "latent_index": arrays.get(prefix + "latent_index"),
-            "latent_coordinates": arrays.get(prefix + "latent_coordinates"), "info": entry["info"]}
+            "latent_coordinates": arrays.get(prefix + "latent_coordinates"), "info": entry["info"],
+            "values": dict(entry.get("values", {})), "spectral": sl}
 
 
 def _block_seed(seq, block) -> int:
@@ -1332,6 +1462,25 @@ class _Part:
         e = self.points.eval_full.tocsr()[idx][:, free]
         return (sp.diags(d) @ e).tocsr(), self.field._latent_mean()[idx]
 
+    @property
+    def standardizes(self) -> bool:
+        """Whether the family standardises its latent pointwise (a spectral law does so per draw)."""
+        return self.kind == "points" and bool(self.field.standardize)
+
+    def spectral_rows(self, idx):
+        """G (|idx| x nfree, CSR) with latent = mean + G g before any standardisation, for the coefficient
+        fluctuation g of an unconditioned Gaussian, and the latent mean (zero for a standardised family: its mean is
+        its centre)."""
+        from .distributions.pointwise import is_conditioned
+
+        if is_conditioned(self.gauss) or getattr(self.gauss, "unconditioned", None) is not None:
+            raise NotImplementedError("random parameters: conditioned Gaussians have no spectral law (the "
+                                      "conditioning depends on the parameters); use a finite law of the parameters")
+        if self.kind == "coefficients":
+            return self.latent_operator(idx)
+        e = self.points.eval_full.tocsr()[idx][:, self.gauss.space.free].tocsr()
+        return e, (np.zeros(len(idx)) if self.standardizes else np.asarray(self.points.mean, dtype=float)[idx])
+
     def mapping(self, idx, mean):
         """The pointwise map of the latent at ``idx`` as the sampler keeps it: name, parameters, support, pull."""
         if self.kind == "coefficients":  # loc + scale (g - mean_g)
@@ -1399,7 +1548,9 @@ def _projection_rows(part, rows):
     return sp.vstack(pieces).tocsr()
 
 
-def _build_law(parts, mix, dofs, observe, rank, tol, rtol, pin, zero, max_points) -> dict:
+def _build_law(parts, mix, dofs, observe, rank, tol, rtol, pin, zero, max_points, spectral=None) -> dict:
+    """The dense law of ``parts``; with ``spectral`` ({"modes": SpectralModes, "random": {name: RandomParameter},
+    "values": {name: number}}) the spectral law of the field with random parameters (:mod:`ngsrng.spectral`)."""
     from .observed import covariance_factor
 
     t0 = time.perf_counter()
@@ -1427,6 +1578,8 @@ def _build_law(parts, mix, dofs, observe, rank, tol, rtol, pin, zero, max_points
             "depend on fewer values (representation='bernstein' rather than 'projection'), or raise max_points")
     comps, scale, noise = [], 1.0, None
     for p, (o, _), a in zip(parts, outs, lat):
+        if p.kind == "observed" and spectral is not None:
+            raise NotImplementedError("random parameters: observations with noise have no spectral law")
         if p.kind == "observed":  # the observations (with their noise) are the latent; loc and scale inside
             obs = p.obs
             g_full = (o @ sp.csr_matrix(obs.G)).tocsr()
@@ -1446,7 +1599,7 @@ def _build_law(parts, mix, dofs, observe, rank, tol, rtol, pin, zero, max_points
                     "support": None, "pull": None}
             out = None
         else:
-            g_op, mean = p.latent_operator(support)
+            g_op, mean = p.latent_operator(support) if spectral is None else p.spectral_rows(support)
             spec = p.mapping(support, mean)
             a_s = sp.csr_matrix(a)[:, support].tocsr()
             if p.kind == "points" and p.representation == "bernstein":
@@ -1457,9 +1610,17 @@ def _build_law(parts, mix, dofs, observe, rank, tol, rtol, pin, zero, max_points
             out = None if _is_identity(a_s) else a_s
         spec.update(name=p.name, mean=mean, out=out, nout=o.shape[0], g=g_op)
         comps.append(spec)
-    # the latent covariance (shared by the components) and its factor
-    f, finfo = covariance_factor(p0.gauss, comps[0]["g"], p0.space, scale=scale, noise=noise, rtol=rtol, rank=rank,
-                                 tol=tol, pin=pin)
+    if spectral is None:  # the latent covariance (shared by the components) and its factor
+        f, finfo = covariance_factor(p0.gauss, comps[0]["g"], p0.space, scale=scale, noise=noise, rtol=rtol,
+                                     rank=rank, tol=tol, pin=pin)
+        f, spectral_law = f.cpu().numpy(), None
+    else:  # the modes at the latent values: B = G Phi, one column per mode
+        modes = spectral["modes"]
+        f = np.asarray(sp.csr_matrix(comps[0]["g"]) @ modes.modes)
+        spectral_law = {"family": "matern", "dim": modes.dim, "lam": modes.lam, "source": modes.source,
+                        "random": dict(spectral["random"]), "standardize": [p.standardizes for p in parts],
+                        "tol": tol, "rtol": rtol, "rank": rank}
+        finfo = {"covariance": f"spectral: {modes.lam.size} modes of {modes.source}"}
     for c in comps:
         del c["g"]
     work64 = any(p.kind == "points" and p.representation in ("projection", "bernstein") for p in parts)
@@ -1478,9 +1639,10 @@ def _build_law(parts, mix, dofs, observe, rank, tol, rtol, pin, zero, max_points
         "zero_drop": dropped,
         "provenance": _provenance(p0),
     }
-    law = {"factor": f.cpu().numpy(), "mix": np.asarray(mix, dtype=float), "components": comps, "work64": work64,
+    law = {"factor": f, "mix": np.asarray(mix, dtype=float), "components": comps, "work64": work64,
            "dofs": outs[0][1], "latent_index": None if at_outputs else support,
-           "latent_coordinates": None if at_outputs else _coordinates(p0, support), "info": info}
+           "latent_coordinates": None if at_outputs else _coordinates(p0, support), "info": info,
+           "spectral": spectral_law, "values": {} if spectral is None else dict(spectral["values"])}
     law = _compile(law)
     law["info"]["setup_s"] = round(time.perf_counter() - t0, 3)
     return law
@@ -1529,9 +1691,13 @@ def _compile(law) -> dict:
     2. a factor with more columns than rows is recompressed to as many columns (F V from the SVD F = U s V^T: the
        same covariance, z -> V^T z is again standard normal, the same V for every component keeps their coupling);
     3. Gaussian (affine) components with one output map A fold it into the factor, y = A m' + (A F) z (A F recompressed
-       the same way to at most m columns), when that costs less per sample (m r' < |S| r + nnz(A))."""
+       the same way to at most m columns), when that costs less per sample (m r' < |S| r + nnz(A)).
+
+    A spectral law's columns are its modes, weighted per draw: they are not recompressed (folding keeps them), and its
+    per-draw truncation (:func:`_spectral_tables`) is made from its rows."""
     comps = law["components"]
     f = law["factor"]
+    spectral = law.get("spectral") is not None
     nlat = f.shape[0]
     used = np.arange(nlat)
     if all(c["out"] is not None for c in comps):
@@ -1539,7 +1705,7 @@ def _compile(law) -> dict:
     if used.size < nlat:
         law = _restrict_law(law, used)
         comps, f = law["components"], law["factor"]
-    if f.shape[1] > f.shape[0]:
+    if f.shape[1] > f.shape[0] and not spectral:
         f = _recompress(f)
     law = {**law, "factor": f}
     outs = [c["out"] for c in comps]
@@ -1547,7 +1713,7 @@ def _compile(law) -> dict:
             all(o is outs[0] or (o.shape == outs[0].shape and (o != outs[0]).nnz == 0) for o in outs):
         a = sp.csr_matrix(outs[0])
         g = np.asarray(a @ f)
-        if g.shape[1] > g.shape[0]:
+        if g.shape[1] > g.shape[0] and not spectral:
             g = _recompress(g)
         if a.shape[0] * g.shape[1] < f.shape[0] * f.shape[1] + a.nnz:
             new = []
@@ -1558,9 +1724,30 @@ def _compile(law) -> dict:
                                        shift * np.asarray(a.sum(axis=1)).ravel()}})
             law = {**law, "factor": g, "components": new, "latent_index": None, "latent_coordinates": None,
                    "info": {**law["info"], "latent": "outputs", "folded": True}}
+    if spectral:
+        law = _spectral_tables(law)
     info = law["info"]
     info.update(latent_points=int(law["factor"].shape[0]), rank=int(law["factor"].shape[1]),
                 memory_bytes=int(law["factor"].nbytes + sum(_nbytes(c) for c in law["components"])))
+    return law
+
+
+def _spectral_tables(law) -> dict:
+    """A spectral law's per-draw truncation (:mod:`ngsrng.spectral`): the kept modes on a grid of the random
+    parameters' range, the columns beyond the most any draw keeps dropped, and the ladder of ranks."""
+    from .spectral import GRID, ladder, rank_table
+
+    sl = law["spectral"]
+    f = law["factor"]
+    grids = {k: np.geomspace(*p.support, GRID) for k, p in sorted(sl["random"].items())}
+    table = rank_table(sl["lam"][:f.shape[1]], (f * f).sum(axis=0), grids, sl["dim"], law["values"], sl["tol"],
+                       sl["rtol"], sl["rank"])
+    r = int(table.max())
+    sl = {**sl, "lam": sl["lam"][:r], "grids": {k: g.tolist() for k, g in grids.items()}, "table": table,
+          "ladder": ladder(r).tolist()}
+    law = {**law, "factor": np.ascontiguousarray(f[:, :r]), "spectral": sl}
+    ranks = table.ravel()
+    law["info"] = {**law["info"], "rank_per_draw": [int(ranks.min()), int(ranks.max())]}
     return law
 
 

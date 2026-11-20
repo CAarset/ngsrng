@@ -687,6 +687,33 @@ class Gaussian(DenseOf, InPlace, Rebuildable):
             self._cpu_torch["mass"] = sparse_to_torch(self.space.mass_free, torch.device("cpu"), torch.float64)
         return self._cpu_torch["mass"]
 
+    def spectral_modes(self):
+        """The generalised eigenpairs K0 Phi = M Phi Lambda of the precision's operator without its kappa^2 term, on
+        the free DoFs (:mod:`ngsrng.spectral`): for SPDE precisions whose form has a ``kappa`` (``matern``,
+        ``matern_dg``), unconditioned. Computed once (a dense eigendecomposition on the CPU) and kept."""
+        from .spectral import SpectralModes
+
+        spec = self.spec
+        if self._prior is not None or not isinstance(spec, PDEPrecision) or not hasattr(spec.form, "kappa"):
+            raise NotImplementedError("spectral modes exist for unconditioned SPDE precisions with a kappa^2 term "
+                                      "(ngsrng.matern, ngsrng.matern_dg)")
+        if self.__dict__.get("_spectral") is None:
+            import dataclasses
+
+            import scipy.linalg as sla
+
+            from .backend import available_memory
+
+            n = self.space.nfree
+            mem = available_memory()
+            if mem is not None and 4 * 8 * n * n > 0.5 * mem:
+                raise MemoryError(f"the spectral modes of {n} free DoFs need about {32 * n * n / 2**30:.1f} GiB")
+            k0 = self.space.assemble_free(dataclasses.replace(spec.form, kappa=0.0)).toarray()
+            lam, phi = sla.eigh(k0, self.space.mass_free.toarray(), overwrite_a=True, overwrite_b=True,
+                                check_finite=False)
+            self._spectral = SpectralModes(lam, phi, self.space.dim, f"the SPDE operator on {self.space.describe()}")
+        return self._spectral
+
     def apply_precision(self, c: torch.Tensor) -> torch.Tensor:
         """Prior precision Sigma^-1 (primal -> dual) on free-dof vectors (nfree x k), in float64 on ``c``'s device.
 

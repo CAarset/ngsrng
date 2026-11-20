@@ -21,11 +21,20 @@ No local boundary condition keeps the variance exactly constant and the correlat
 :class:`ngsrng.StationaryMatern` (the SPDE on a periodic box around the domain, or the Matérn covariance of R^d
 restricted to the domain; on spaces with Dirichlet dofs, conditioned on its trace there). Their options (``method``,
 ``tol``, ``resolution``, ``max_dense``, ``method_options``) are passed on; ``bind(fes)`` returns the sampler.
+
+**Random parameters.** ``length`` and ``nu`` may be laws (:mod:`ngsrng.parameters`): a ``scipy.stats``
+distribution, drawn anew for every draw of a field. A field with such a correlation (``rng.distribution(...,
+correlation=matern(length=scipy.stats.loguniform(0.1, 0.4)))``) is the mixture over the parameters: for laws with
+finitely many values the finite mixture of the field at each value (:func:`ngsrng.mixture`; every boundary choice),
+for continuous laws the continuous mixture drawn through one spectral basis (:mod:`ngsrng.spectral`; ``"torus"``,
+``"neumann"`` and ``"robin"`` with a given ``beta``, unconditioned).
 """
 
+import dataclasses
 from dataclasses import dataclass, field
 from math import gamma, pi, sqrt
 
+from .parameters import RandomParameter, as_parameter
 from .specs import matern as _matern_h1
 from .specs import matern_dg
 
@@ -56,8 +65,8 @@ ROBIN_REQUIRED = (
 
 @dataclass
 class MaternCorrelation:
-    length: float
-    nu: float = 1.0
+    length: float | RandomParameter
+    nu: float | RandomParameter = 1.0
     rtol: float = 1e-7
     boundary: str = "neumann"
     beta: float | None = REQUIRED  # Robin coefficient (boundary="robin" only): a number, or None to estimate it
@@ -66,6 +75,17 @@ class MaternCorrelation:
     _tuned: dict = field(default_factory=dict, init=False, repr=False, compare=False)
 
     def __post_init__(self):
+        self.length, self.nu = as_parameter(self.length), as_parameter(self.nu)
+        for name in ("length", "nu"):
+            v = getattr(self, name)
+            if (v.support[0] if isinstance(v, RandomParameter) else v) <= 0:
+                raise ValueError(f"{name} must be positive")
+        if any(not p.finite for p in self.random.values()) and (
+                self.boundary == "restrict" or (self.boundary == "robin" and self.beta is None)):
+            raise ValueError("a continuous law of the length or nu needs a covariance that is a function of one fixed "
+                             "operator (ngsrng.spectral): boundary='torus', 'neumann', or 'robin' with a given beta. "
+                             "boundary='restrict' and the tuned Robin coefficient (beta=None) change with the "
+                             "parameters: use a law with finitely many values (scipy.stats.rv_discrete)")
         if self.boundary not in BOUNDARIES:
             raise ValueError("boundary must be 'neumann', 'robin', 'torus' or 'restrict'")
         if self.boundary == "robin":
@@ -85,16 +105,32 @@ class MaternCorrelation:
                              "(ngsrng.StationaryMatern), not of boundary='neumann' or 'robin'")
 
     @property
+    def random(self) -> dict:
+        """The parameters given as laws: {name: RandomParameter}."""
+        return {k: v for k, v in (("length", self.length), ("nu", self.nu)) if isinstance(v, RandomParameter)}
+
+    def at(self, **values) -> "MaternCorrelation":
+        """The correlation with the given parameter values (the field at one value of its random parameters)."""
+        return dataclasses.replace(self, **{k: float(v) for k, v in values.items()})
+
+    def _fixed(self):
+        if self.random:
+            raise ValueError(f"the correlation has random parameters ({', '.join(self.random)}): a field with it is a "
+                             "mixture, made by rng.distribution(..., correlation=...) or ngsrng.mixture")
+
+    @property
     def stationary(self) -> bool:
         """True for the choices without a boundary condition ("torus", "restrict")."""
         return self.boundary in STATIONARY
 
     def kappa(self) -> float:
+        self._fixed()
         return sqrt(8.0 * self.nu) / self.length
 
     def bind(self, fes, seed=None, device="cpu"):
         """The precision on ``fes`` (a :class:`ngsrng.PDEPrecision`), or, for boundary="torus" / "restrict", the
         sampler itself (a :class:`ngsrng.StationaryMatern`, with randomness ``seed``, computing on ``device``)."""
+        self._fixed()
         if self.stationary:
             from .stationary import StationaryMatern
 
@@ -132,7 +168,9 @@ class MaternCorrelation:
 
 def matern(length: float, nu: float = 1.0, rtol: float = 1e-7, boundary: str = "neumann", beta=REQUIRED, *,
            robin=REQUIRED, **options) -> MaternCorrelation:
-    """Unit-variance Matern correlation with range ``length`` and smoothness ``nu`` (samples are C^(nu-epsilon)).
+    """Unit-variance Matern correlation with range ``length`` and smoothness ``nu`` (samples are C^(nu-epsilon)); either
+    may be a law (a ``scipy.stats`` distribution), a random parameter drawn anew for every draw of a field (see the
+    module docstring).
 
     ``boundary``: "neumann" (the natural condition; variance inflated near the boundary), "robin", with the Robin
     coefficient ``beta`` (du/dn + beta u = 0), which has no default: a number, or ``None`` to estimate the beta that
@@ -144,8 +182,6 @@ def matern(length: float, nu: float = 1.0, rtol: float = 1e-7, boundary: str = "
     if robin is not REQUIRED:
         raise TypeError("robin= (a factor of kappa) was replaced by beta=, the Robin coefficient itself (beta = factor "
                         "* kappa with kappa = sqrt(8 nu) / length); beta=None estimates it for the space")
-    if length <= 0 or nu <= 0:
-        raise ValueError("length and nu must be positive")
     return MaternCorrelation(length, nu, rtol, boundary, beta, dict(options))
 
 

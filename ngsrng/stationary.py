@@ -680,6 +680,27 @@ class StationaryMatern(DenseOf, InPlace, Rebuildable):
         """(Sigma x)[rows] for full-dof columns x."""
         return self._project(self._project_t(x_full))[rows]
 
+    def spectral_modes(self):
+        """The torus construction's spectral modes (:mod:`ngsrng.spectral`): the generalised eigenpairs of the periodic
+        box's SPDE operator without its kappa^2 term, each mode projected onto this field's free DoFs as its draws
+        are. Unconditioned torus fields only (no Dirichlet DoFs, not a posterior). Computed once and kept."""
+        from .spectral import SpectralModes
+
+        if self.method != "spde" or self._cond is not None or self._prior is not None or self._maps \
+                or self._post_maps:
+            raise NotImplementedError("spectral modes exist for unconditioned torus fields (construction='torus', "
+                                      "no Dirichlet DoFs, not a posterior)")
+        if self.__dict__.get("_spectral") is None:
+            torus = self._src.gauss.spectral_modes()
+            bg = self._b @ (self._src.e @ torus.modes)  # the modes' values at the points, tested (B E Phi)
+            used = self._full.free
+            coeffs = np.zeros((self.space.ndof, torus.lam.size))
+            coeffs[used] = self._mass.apply(torch.from_numpy(np.ascontiguousarray(bg[used]))).numpy()  # L2 projection
+            self._spectral = SpectralModes(torus.lam, coeffs[self.space.free], self.space.dim,
+                                           f"the torus box {np.round(self._src.box, 4).tolist()} "
+                                           f"({torus.modes.shape[0]} DoFs)")
+        return self._spectral
+
     @property
     def nrand(self) -> int:
         return self._src.nrand
