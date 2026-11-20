@@ -21,7 +21,7 @@ from ..backend import (
     sparse_to_torch,
     torch_device_of,
 )
-from ..covariance import EXACT_LIMIT
+from ..covariance import as_covariance, auto_exact, exact_applications, lowrank_applications
 from ..inplace import InPlace
 from ..observations import observation_operator
 from ..quadrature import QuadratureRule
@@ -114,8 +114,8 @@ class GaussianAtPoints(Rebuildable):  # pickles; the NGSolve evaluation matrix i
 
     ``std``: how std_ref is obtained (all through :func:`ngsrng.covariance.local_covariance`, cached on the
     reference Gaussian):
-    - "auto": "exact" when that is cheap (finite-rank Gaussians; up to ``EXACT_STD_LIMIT`` points or free dofs),
-      "lowrank" beyond;
+    - "auto": "exact" when that is cheap (finite-rank Gaussians; at most ``ngsrng.covariance.AUTO_RATIO`` times the
+      applications of "lowrank": about 15k points or free dofs), "lowrank" beyond;
     - "exact": sqrt(diag(E Sigma E^T)), exact (:func:`ngsrng.covariance.variance_at_points`). Free for finite-rank
       Gaussians; otherwise one application of L^T per point when there are fewer points than free dofs (a few user
       points, the domain points of a trace), else one of L and L^T per free dof (the entries of Sigma in the pattern
@@ -130,7 +130,7 @@ class GaussianAtPoints(Rebuildable):  # pickles; the NGSolve evaluation matrix i
     torch device (the torch engine, a low-rank model on a GPU), point values can be produced there (``on_device=True``).
     """
 
-    EXACT_STD_LIMIT = EXACT_LIMIT
+    LOWRANK = {"rank": 200, "samples": 64, "power_iterations": 2}  # the "lowrank" estimate's parameters
 
     def __init__(self, gauss, order=None, std="auto", mc_samples=4000, points=None, standardize_by="prior",
                  bernstein=None):
@@ -161,8 +161,9 @@ class GaussianAtPoints(Rebuildable):  # pickles; the NGSolve evaluation matrix i
         self.device_capable = self.torch_device is not None and self.torch_device.type != "cpu"
         self._device = DeviceCache()  # evaluation matrices, the projection's operators, per device and dtype
         if isinstance(std, str) and std == "auto":
-            applications = min(self.npoints, self.reference.space.nfree)  # of Sigma, for "exact"
-            cheap = hasattr(self.reference, "rinv") or applications <= self.EXACT_STD_LIMIT
+            src = as_covariance(self.reference)
+            cheap = hasattr(self.reference, "rinv") or auto_exact(exact_applications(src, self.npoints),
+                                                                  lowrank_applications(src, **self.LOWRANK))
             std = "exact" if cheap else "lowrank"
         self.std_method = std if isinstance(std, str) or std is None else "given"
         self.std = self._std(std, mc_samples)
@@ -211,7 +212,7 @@ class GaussianAtPoints(Rebuildable):  # pickles; the NGSolve evaluation matrix i
             v = variance_at_points(self.reference, self._free_eval()).values
             return np.sqrt(np.clip(v, 0.0, None))
         if isinstance(std, str) and std == "lowrank":
-            lc = self._local("lowrank", rank=200, samples=64)
+            lc = self._local("lowrank", **self.LOWRANK)
             v, se = lc.values(self._free_eval(), stderr=True)
             rel = 0.5 * se / np.maximum(v, 1e-300)  # relative error of the std is half that of the variance
             warnings.warn(

@@ -321,7 +321,10 @@ def test_trace_fields_live_at_the_trace_points(mesh, monkeypatch):
     np.testing.assert_allclose(d.sample(20)[:, trace], full.sample(20)[:, trace], rtol=0, atol=1e-11)
     given = rng_for(fes, std=fp.std).distribution("uniform", bnd="left").field.points
     assert given.std_method == "given" and np.array_equal(given.std, fp.std[p.bernstein.rows])
-    monkeypatch.setattr(GaussianAtPoints, "EXACT_STD_LIMIT", trace.size)  # the space is "large", its trace is not
+    gauss = rng_for(fes).gaussian()
+    estimate = cv.lowrank_applications(cv.as_covariance(gauss), **GaussianAtPoints.LOWRANK)
+    monkeypatch.setattr(cv, "AUTO_RATIO", trace.size / estimate)  # the space is "large", its trace is not
+    assert not cv.auto_exact(cv.exact_applications(cv.as_covariance(gauss)), estimate)
     assert rng_for(fes).info("uniform", bnd="left")["standardisation"] == "exact"
 
 

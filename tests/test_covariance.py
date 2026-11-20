@@ -334,7 +334,7 @@ def test_pointwise_families_use_the_local_covariance():
 def test_explicit_exact_posterior_stays_exact_beyond_the_auto_limit(monkeypatch):
     import ngsrng.covariance as cv
 
-    monkeypatch.setattr(cv, "EXACT_LIMIT", 10)  # every space is "large" now
+    monkeypatch.setattr(cv, "AUTO_RATIO", 1e-9)  # every space is "large" now
     fes = ngs.H1(ngs.Mesh(ngs.unit_square.GenerateMesh(maxh=0.25)), order=1)
     _, prior = _setup(fes)
     post = prior.condition(points=_points(fes, 4), noise=0.01)
