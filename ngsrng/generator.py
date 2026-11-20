@@ -410,7 +410,7 @@ class Generator:
         self._gaussians = {_rekey_gaussian(k, v): v for k, v in self._gaussians.items()}
         self._points = {(id(v[0]), k[1], k[2] if isinstance(v[1], str) or v[1] is None else id(v[1]), *k[3:]): v
                         for k, v in self._points.items()}
-        self._bernstein = {id(v[0]): v for v in self._bernstein.values()}
+        self._bernstein = {id(v[0].fes): v for v in self._bernstein.values()}
         self._fields = {_field_key(k[0], *v[0]): v for k, v in self._fields.items()}
         self._boundary = {(id(v[0]), k[1]): v for k, v in self.__dict__.get("_boundary", {}).items()}
         self._factors = {(id(v[0]), *k[1:]): v for k, v in self.__dict__.get("_factors", {}).items()}
@@ -538,10 +538,11 @@ class Generator:
         return self._points[key][2]
 
     def bernstein_form(self, space) -> BernsteinForm:
-        """The (cached) Bernstein-Bezier description of an FE space."""
-        if id(space) not in self._bernstein:
-            self._bernstein[id(space)] = (space, BernsteinForm(space))
-        return self._bernstein[id(space)][1]
+        """The (cached) Bernstein-Bezier description of an FE space: one per NGSolve space, shared by the Gaussians
+        on it (it depends on the mesh, the space and its order only)."""
+        if id(space.fes) not in self._bernstein:
+            self._bernstein[id(space.fes)] = (space, BernsteinForm(space))
+        return self._bernstein[id(space.fes)][1]
 
     def points(self, order=None) -> np.ndarray:
         """Coordinates (npoints x dim) of the quadrature points that index pointwise-family values."""

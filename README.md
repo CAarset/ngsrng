@@ -61,6 +61,9 @@ accurate one for your space and hardware.
 - **Correlated fields.** `ngsrng.correlated([d1, d2], 0.8)` draws several fields jointly, correlated through
   their latent Gaussians. Each keeps its own law: its family and parameters, its conditioning, the Bernstein
   range and `bnd=`.
+- **Mixtures.** `ngsrng.mixture([d1, ..., dK], weights)` draws each sample from one of several laws, e.g. one
+  per correlation length for a random length. Each law stays exact, and `labels=True` says which law each draw
+  followed.
 - **Large batches, fast.**
   - Thousands of samples refilled in place (`out=`, a NumPy array or a torch tensor), threaded on the CPU.
   - On NVIDIA GPUs the solver is cuDSS; on AMD GPUs, AMG-preconditioned CG.
@@ -172,6 +175,7 @@ use [ngsplot](https://github.com/CAarset/ngsplot), which draws the same pictures
 | chi-square, Student-t, Wishart, matrix log-normal, Dirichlet, NIG | sums, scale mixtures, Bartlett and process constructions | exact at every stored point | 1.4–14× |
 | non-Gaussian Karhunen–Loève fields | KL modes with uniform, Rademacher, Laplace or any scipy coefficients | covariance exact | one product |
 | correlated components (`ngsrng.correlated`): pointwise families and Gaussian fields drawn jointly | the components' latent Gaussians mixed by the cross-correlation's Cholesky factor | each component's law exact; latent cross-correlation exact | the components' own draws |
+| finite mixtures (`ngsrng.mixture`): any laws with the same outputs, e.g. one per correlation length | a label per draw from the weights, then the law's own draw (dense: one product per law) | each law exact; labels exact | the laws' own draws |
 | dense samplers (`d.dense()`, `(E @ d).dense()`, `E @ sampler`): any of the above that is one Gaussian and a pointwise map, at chosen DoFs or observed | the latent covariance at the points the outputs depend on, factorised once (QR, cut SVD); then the family's map and the output map, folded for Gaussian fields | the same law (eigenvalues below `rtol` = 1e-12 of the largest dropped; `rtol=None`: none) | two small matrix products |
 
 Costs are relative to one Gaussian sample and come from a CPU smoke run, so treat them as indicative. Every

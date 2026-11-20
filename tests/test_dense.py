@@ -71,7 +71,7 @@ def route_draw(gen, field, n):
 def noise_for(sampler, w, i=0):
     """The standard normals z with which the dense sampler's latent is closest to given latent values w (|S| x n),
     and the distance (zero up to rounding, or up to the cut when K is singular)."""
-    law = sampler.law
+    law = sampler.laws[0]
     f, mu = law["factor"], law["components"][i]["mean"]
     ws = w[law["latent_index"]]
     z, *_ = np.linalg.lstsq(f, ws - mu[:, None], rcond=None)
@@ -116,7 +116,7 @@ def test_latent_covariance_is_exact(space, rng, rtol):
     post = rng.gaussian().condition(points=[(0.5, 0.5)], noise=1e-2, data=[0.3])
     d = rng.distribution("uniform", -1, 20, representation="bernstein", bnd="left", correlation=post)
     a = d.dense(rtol=rtol)
-    s, f = a.law["latent_index"], a.law["factor"]
+    s, f = a.laws[0]["latent_index"], a.laws[0]["factor"]
     pts = d.field.points
     e = pts.eval_full.tocsr()[s][:, post.space.free]
     dd = 1 / pts.std[s]
@@ -136,8 +136,8 @@ def test_pinned_and_deterministic_points(space, rng):
     assert d.dense().info["deterministic"] == 0  # 1e-24: tiny, not zero
     a = d.dense(pin=1e-12)
     assert a.info["deterministic"] == 2
-    pinned = np.flatnonzero(~a.law["factor"].any(axis=1))
-    np.testing.assert_allclose(a.law["latent_coordinates"][pinned], corners, atol=1e-12)
+    pinned = np.flatnonzero(~a.laws[0]["factor"].any(axis=1))
+    np.testing.assert_allclose(a.laws[0]["latent_coordinates"][pinned], corners, atol=1e-12)
     verts = [v.nr for v in space.mesh.vertices if min(np.linalg.norm(np.subtract(v.point, c)) for c in corners) < 1e-12]
     cols = [list(a.dofs).index(v) for v in verts]
     y = a.sample(200)
@@ -147,7 +147,7 @@ def test_pinned_and_deterministic_points(space, rng):
     r2 = ngsrng.default_rng(dirichlet, seed=2, dtype="float64", correlation=CORR)
     g = r2.distribution("normal", 1.0, 2.0).dense(dofs=np.arange(dirichlet.ndof))
     fixed = np.flatnonzero(~np.array(dirichlet.FreeDofs()))
-    assert g.info["deterministic"] == fixed.size and not g.law["factor"][fixed].any()
+    assert g.info["deterministic"] == fixed.size and not g.laws[0]["factor"][fixed].any()
 
 
 @pytest.mark.parametrize("order, dim, kind", [(3, 2, "H1"), (2, 3, "H1"), (2, 2, "L2")])
@@ -340,9 +340,9 @@ def test_observed_gaussians(space, rng):
     assert isinstance(obs, ngsrng.ObservedGaussian) and isinstance(e @ gauss, ngsrng.ObservedGaussian)
     assert obs.method == "pathwise" and obs.sample(3).shape == (len(LEFT[::5]), 3)
     a = obs.dense()
-    assert a.law["factor"].shape[0] == len(LEFT[::5])  # fewer observations than the DoFs they read: at them
+    assert a.laws[0]["factor"].shape[0] == len(LEFT[::5])  # fewer observations than the DoFs they read: at them
     own = ngsrng.ObservedGaussian(gauss, points=LEFT[::5], noise=0.01)  # a factor of its own: reused
-    assert own.dense().info.get("reused") and own.dense().law["factor"].shape == tuple(own._F64.shape)
+    assert own.dense().info.get("reused") and own.dense().laws[0]["factor"].shape == tuple(own._F64.shape)
     grid = ngsrng.observation_operator(space, points=np.random.default_rng(3).uniform(0, 1, (400, 2)))
     many = (grid @ d).dense()  # more observations than DoFs read: the latent at the DoFs, the same law
     assert many.latent_points < 400 and many.info["latent"] == "coefficients"
@@ -427,7 +427,7 @@ def test_cache_truncation_and_limits(space, rng):
     d = rng.distribution("uniform", -1, 20, representation="bernstein", bnd="left")
     a = d.dense()
     assert d.dense() is a and rng.distribution("uniform", -1, 20, representation="bernstein", bnd="left").dense() is a
-    assert a.to(dtype="float32").law is a.law
+    assert a.to(dtype="float32").laws is a.laws
     t = d.dense(rank=3)
     assert t.rank == 3 and not t.info["exact"] and t.info["captured_variance"] < 1.0
     tt = d.dense(tol=0.05)
@@ -445,9 +445,9 @@ def test_set_ups_survive_pickling_and_spawn(space, rng, monkeypatch):
     clone = pickle.loads(pickle.dumps(d))
     unpickled_child = pickle.loads(pickle.dumps(child))
     monkeypatch.setattr(dense_module, "_build_law", lambda *args: pytest.fail("set up again"))
-    np.testing.assert_array_equal(clone.dense().law["factor"], a.law["factor"])
+    np.testing.assert_array_equal(clone.dense().laws[0]["factor"], a.laws[0]["factor"])
     cd = child.distribution("uniform", -1, 20, representation="bernstein", bnd="left").dense()
-    assert cd.law is a.law and cd.source is not a.source
+    assert cd.laws[0] is a.laws[0] and cd.source is not a.source
     unpickled_child.distribution("uniform", -1, 20, representation="bernstein", bnd="left").dense()
     holder = type("Holder", (), {})()
     owned_cache(holder, "_c")["x"] = 1
@@ -483,27 +483,33 @@ def _square(x):
     return x * x
 
 
-def reference(path, z):
-    """The module docstring's NumPy reference sampler (NumPy and SciPy, no ngsrng)."""
+def reference(path, z, labels=None):
+    """The module docstring's NumPy reference sampler (NumPy and SciPy, no ngsrng), from given z (n, k, r) and
+    labels."""
     s = np.load(path)
     meta = json.loads(str(s["meta"]))
-    z = np.einsum("ij,njr->nir", s["mix"], z)
-    out = []
-    for i, c in enumerate(meta["components"]):
-        w = s[f"mean{i}"] + z[:, i] @ s["factor"].T
-        p = {k: s[v] if isinstance(v, str) else v for k, v in c["params"].items()}
-        if c["map"] == "inversion":
-            q = c["stored"]
-            v = q["loc"] + q["scale"] * getattr(st, q["scipy"])(*q["args"], **q["kwds"]).ppf(ndtr(w))
-        else:
-            v = {"uniform": lambda w, low, high: low + (high - low) * ndtr(w),
-                 "lognormal": lambda w, mean, sigma: np.exp(mean + sigma * w),
-                 "affine": lambda w, shift, scale: shift + scale * w}[c["map"]](w, **p)
-        if c["out_shape"]:
-            a = np.zeros(c["out_shape"])
-            a[s[f"out{i}_rows"], s[f"out{i}_cols"]] = s[f"out{i}_vals"]
-            v = v @ a.T
-        out.append(v)
+    labels = np.zeros(len(z), dtype=int) if labels is None else np.asarray(labels)
+    nout = meta["laws"][0]["components"]
+    out = [np.zeros((len(z), c["nout"])) for c in nout]
+    for l, law in enumerate(meta["laws"]):
+        a = lambda key: s[f"law{l}/{key}"]  # noqa: E731
+        rows = labels == l
+        zl = np.einsum("ij,njr->nir", a("mix"), z[rows][:, :, :a("factor").shape[1]])
+        for i, c in enumerate(law["components"]):
+            w = a(f"mean{i}") + zl[:, i] @ a("factor").T
+            p = {k: s[v] if isinstance(v, str) else v for k, v in c["params"].items()}
+            if c["map"] == "inversion":
+                q = c["stored"]
+                v = q["loc"] + q["scale"] * getattr(st, q["scipy"])(*q["args"], **q["kwds"]).ppf(ndtr(w))
+            else:
+                v = {"uniform": lambda w, low, high: low + (high - low) * ndtr(w),
+                     "lognormal": lambda w, mean, sigma: np.exp(mean + sigma * w),
+                     "affine": lambda w, shift, scale: shift + scale * w}[c["map"]](w, **p)
+            if c["out_shape"]:
+                m = np.zeros(c["out_shape"])
+                m[a(f"out{i}_rows"), a(f"out{i}_cols")] = a(f"out{i}_vals")
+                v = v @ m.T
+            out[i][rows] = v
     return out
 
 

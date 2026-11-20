@@ -82,16 +82,22 @@ def _private_copy(seq: np.random.SeedSequence) -> np.random.SeedSequence:
 
 class Streams:
     """The random streams of one sampler, all derived from one SeedSequence: a NumPy generator, torch generators
-    (one per device) and the keys of the CPU engine's normal stream (:class:`ngsrng.backend.NormalStream`)."""
+    (one per device), the keys of the CPU engine's normal stream (:class:`ngsrng.backend.NormalStream`) and a NumPy
+    generator for the labels of mixtures (which law each draw follows)."""
 
     def __init__(self, seq: np.random.SeedSequence):
-        self.seq_numpy, self.seq_torch, self.seq_normal = seq.spawn(3)
-        self._numpy, self._torch, self.counter = None, {}, 0
+        self.seq_numpy, self.seq_torch, self.seq_normal, self.seq_labels = seq.spawn(4)
+        self._numpy, self._labels, self._torch, self.counter = None, None, {}, 0
 
     def numpy(self) -> np.random.Generator:
         if self._numpy is None:
             self._numpy = np.random.default_rng(self.seq_numpy)
         return self._numpy
+
+    def labels(self) -> np.random.Generator:
+        if self._labels is None:
+            self._labels = np.random.default_rng(self.seq_labels)
+        return self._labels
 
     def torch(self, device) -> torch.Generator:
         device = torch.device(device)
