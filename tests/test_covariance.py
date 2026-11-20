@@ -489,3 +489,14 @@ def test_weighted_trace():
     assert abs(ngsrng.covariance_trace(g, "hutchinson", weight=w, probes=400).value - want) < 0.2 * want
     with pytest.raises(ValueError, match="randomised method"):
         ngsrng.covariance_trace(g, "exact", weight=w)
+
+
+def test_covariance_function_after_point_variances():
+    """The source's cache also holds point variances (a pointwise family's exact standardisation): the correlation
+    function looks for an exact local covariance among its entries only."""
+    fes = ngs.H1(ngs.Mesh(ngs.unit_square.GenerateMesh(maxh=0.2)), order=2)
+    rng = ngsrng.default_rng(fes, seed=1, correlation=ngsrng.matern_correlation(0.3, nu=1.0))
+    prior = rng.gaussian()
+    rng.uniform(size=2)  # exact pointwise standard deviations: cached point variances
+    gf = ngsrng.covariance_function(prior, (0.3, 0.3), correlation=True)
+    assert gf(fes.mesh(0.3, 0.3)) == pytest.approx(1.0, rel=1e-8)

@@ -953,8 +953,8 @@ def covariance_function(source, point, *, correlation=False, fes=None, conventio
     if not correlation:
         return gf
     v0 = float((row[:, s.free] @ col)[0, 0])
-    exact = [lc for lc in src.cache.values() if lc.exact]  # an exact one if already computed
-    var = (exact[0] if exact else local_covariance(src)).variance()
+    exact = _cached_exact(src)  # an exact local covariance if already computed
+    var = (exact if exact is not None else local_covariance(src)).variance()
     return gf / ngs.sqrt(v0 * ngs.IfPos(var, var, 1e-300))
 
 
