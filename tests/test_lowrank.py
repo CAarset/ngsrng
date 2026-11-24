@@ -85,6 +85,30 @@ def test_operator_kl_reaches_trace_tolerance(convention):
         assert true < 2 * tol and abs(lr.trace_residual - true) < 0.5 * true + 1e-6
 
 
+@pytest.mark.parametrize("convention", ["dual->primal", "primal->dual"])
+def test_operator_kl_smooth_kernel_reaches_small_tolerances(convention):
+    """A Gaussian kernel: its eigenvalues decay faster than exponentially, so the sketch blocks are numerically rank
+    deficient."""
+    from ngsrng.quadrature import QuadratureRule
+    from ngsrng.space import SpaceInfo
+
+    fes = ngs.H1(ngs.Mesh(ngs.unit_square.GenerateMesh(maxh=0.2)), order=2)
+    s = SpaceInfo(fes)
+    q = QuadratureRule(s)
+    b = q.b[s.free].toarray()
+    r = np.linalg.norm(q.points[:, None] - q.points[None], axis=2)
+    kc = b @ np.exp(-(r**2) / (2 * 0.3**2)) @ b.T  # the covariance form E[(f, phi_i)(f, phi_j)]
+    m = s.mass_free.toarray()
+    sigma = np.linalg.solve(m, np.linalg.solve(m, kc).T)
+    op = kc if convention == "primal->dual" else sigma
+    for tol in (1e-6, 1e-10):
+        cov = ngsrng.OperatorCovariance(lambda y: torch.from_numpy(op @ y.numpy()), convention=convention, tol=tol)
+        lr = ngsrng.operator_kl(fes, cov, seed=1)
+        approx = lr.modes[s.free] @ np.diag(lr.eigenvalues) @ lr.modes[s.free].T
+        assert lr.trace_residual <= tol
+        assert np.trace((sigma - approx) @ m) / np.trace(sigma @ m) < 2 * tol
+
+
 def test_karhunen_loeve_warns_when_the_rank_is_not_reached():
     prior = _prior()
     with pytest.warns(UserWarning, match=r"instead of 1000 \(the Gaussian has only"):

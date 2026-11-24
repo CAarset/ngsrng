@@ -304,6 +304,7 @@ def operator_kl(fes, cov, mean=None, seed=None, sketch_seed=0, device="cpu") -> 
     seed of the range finder and the trace probes, so that the modes are deterministic. ``device``: where the
     result samples (the expansion itself is computed with NumPy: the operator acts on NumPy blocks).
     """
+    from .covariance import _stable_orth
     from .noise import DiagonalNoise, LocalGramNoise
 
     s = SpaceInfo(fes)
@@ -314,11 +315,10 @@ def operator_kl(fes, cov, mean=None, seed=None, sketch_seed=0, device="cpu") -> 
     def apply_a(x):  # C_h = Sigma M
         return apply_sigma(mass @ x)
 
-    def m_orth(y):
-        for _ in range(2):
-            r = np.linalg.cholesky(y.T @ (mass @ y) + 1e-300 * np.eye(y.shape[1]))
-            y = sla.solve_triangular(r, y.T, lower=True).T
-        return y
+    # The powered blocks (Sigma M)^q Y are numerically rank deficient for smooth covariances, whose eigenvalues fall
+    # below rounding level within the sketch: a Euclidean QR first, then M-orthonormalisation with a fallback for
+    # dependent directions
+    m_orth = _stable_orth(mass)
 
     noise = DiagonalNoise(mass) if s.mass_is_diagonal else LocalGramNoise(s).explicit()
     noise.setup(torch.device("cpu"), torch.float64)
